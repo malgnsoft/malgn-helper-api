@@ -1,0 +1,27 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+logs/
+
+# Node
+node_modules/
+dist/
+
+# Cloudflare Workers
+.wrangler/
+.dev.vars
+
+# Env / Secrets
+.env
+.env.local
+.env.*.local
