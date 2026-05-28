@@ -5,15 +5,7 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-05-27",
   "compatibility_flags": ["nodejs_compat"],
-  "observability": { "enabled": true },
-
-  "d1_databases": [
-    {
-      "binding": "WBS_DB",
-      "database_name": "malgn-helper-wbs",
-      "database_id": "558d397e-872d-42ac-8d94-c009b103690b"
-    }
-  ]
+  "observability": { "enabled": true }
 
   // 추후 활성화할 바인딩 (실제 ID·이름 채워 넣은 뒤 주석 해제)
   // "hyperdrive": [{ "binding": "HYPERDRIVE", "id": "<HYPERDRIVE_ID>" }],
