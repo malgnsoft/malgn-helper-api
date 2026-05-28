@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json.schemastore.org/wrangler.json",
+  "name": "malgn-helper-api",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-05-27",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true }
+
+  // 추후 활성화할 바인딩 (실제 ID·이름 채워 넣은 뒤 주석 해제)
+  // "hyperdrive": [{ "binding": "HYPERDRIVE", "id": "<HYPERDRIVE_ID>" }],
+  // "r2_buckets": [{ "binding": "R2", "bucket_name": "malgn-helper-files" }],
+  // "ai": { "binding": "AI" },
+  // "vars": { "OPENSEARCH_ENDPOINT": "https://...", "AI_GATEWAY_URL": "https://gateway.ai.cloudflare.com/..." }
+}

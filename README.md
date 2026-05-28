@@ -26,6 +26,17 @@ Malgn Helper **API 서버** — Hono on Cloudflare Workers.
 - LLM 직접 호출 금지 — 반드시 AI Gateway 경유 (캐싱·로깅·rate limit)
 - 답변 생성 시 출처 인용 누락 금지
 
+## 개발·배포
+
+```bash
+pnpm install              # 의존성 설치
+pnpm dev                  # 로컬 개발 (wrangler dev)
+pnpm deploy               # Cloudflare Workers 배포 (wrangler deploy)
+pnpm typecheck            # 타입 체크
+```
+
+최초 배포 시 `wrangler login` 또는 `CLOUDFLARE_API_TOKEN` 환경변수 필요.
+
 ## 참고
 
 - 상위 워크스페이스: [malgn-helper](https://github.com/malgnsoft/malgn-helper)
