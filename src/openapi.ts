@@ -188,6 +188,22 @@ export const openapiSpec = {
       },
     },
 
+    "/pms/projects/{id}": {
+      get: {
+        tags: ["pms"],
+        summary: "프로젝트 단건 메타",
+        description: "`tb_project` + `tb_project_group` JOIN. 이름·발주처·그룹명·기간·누적 포스트·마지막 활동.",
+        parameters: [
+          { name: "id", in: "path", required: true, schema: { type: "integer", minimum: 1 } },
+        ],
+        responses: {
+          "200": { description: "프로젝트 메타" },
+          "400": { description: "invalid id" },
+          "404": { description: "없음" },
+        },
+      },
+    },
+
     "/pms/projects/{id}/briefing": {
       get: {
         tags: ["pms"],

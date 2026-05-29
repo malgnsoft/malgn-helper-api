@@ -138,6 +138,43 @@ function toIso(s: string | null): string | null {
   return `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}T${s.slice(8, 10)}:${s.slice(10, 12)}:${s.slice(12, 14)}+09:00`;
 }
 
+// 프로젝트 단건 메타 (이름·그룹·발주처·상태·기간)
+app.get("/pms/projects/:id", async (c) =>
+  withConn(c, async (conn) => {
+    const id = parseInt(c.req.param("id"), 10);
+    if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
+    const [rows] = await conn.query(
+      `SELECT p.id, p.name, p.description, p.buyer, p.url, p.start_date, p.end_date,
+              p.status, p.site_id, p.group_id, p.reg_date,
+              g.name AS group_name,
+              (SELECT COUNT(*) FROM tb_post WHERE project_id = p.id AND status = 1) AS post_count,
+              (SELECT MAX(reg_date) FROM tb_post WHERE project_id = p.id AND status = 1) AS last_activity
+         FROM tb_project p
+    LEFT JOIN tb_project_group g ON g.id = p.group_id AND g.status = 1
+        WHERE p.id = ?`,
+      [id],
+    );
+    const r = (rows as any[])[0];
+    if (!r) return c.json({ error: "not found" }, 404);
+    return c.json({
+      id: r.id,
+      name: r.name,
+      description: r.description,
+      buyer: r.buyer,
+      url: r.url,
+      startDate: r.start_date, // 'YYYYMMDD'
+      endDate: r.end_date,
+      active: r.status === 1,
+      siteId: r.site_id,
+      groupId: r.group_id,
+      groupName: r.group_name,
+      regDate: toIso(r.reg_date),
+      postCount: Number(r.post_count ?? 0),
+      lastActivity: toIso(r.last_activity),
+    });
+  }),
+);
+
 // 그룹 목록 (셀렉트박스용). site_id 기본 1, 활성만.
 app.get("/pms/groups", async (c) =>
   withConn(c, async (conn) => {
