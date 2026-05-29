@@ -968,6 +968,130 @@ app.delete("/pms/evals/:id", async (c) =>
   }),
 );
 
+// ── /admin/cost — LLM 호출 비용·지연·실패 대시보드 데이터 ───
+app.get("/admin/cost", async (c) =>
+  withConn(c, async (conn) => {
+    const days = Math.min(Math.max(parseInt(c.req.query("days") ?? "30", 10) || 30, 1), 365);
+    const recentLimit = Math.min(parseInt(c.req.query("limit") ?? "50", 10) || 50, 200);
+
+    const since = `DATE_SUB(NOW(), INTERVAL ${days} DAY)`;
+
+    // 전체 요약
+    const [sumRows] = await conn.query(
+      `SELECT COUNT(*) AS calls,
+              SUM(cache_hit) AS cache_hits,
+              SUM(IFNULL(prompt_tokens, 0)) AS prompt_tokens,
+              SUM(IFNULL(completion_tokens, 0)) AS completion_tokens,
+              SUM(IFNULL(cost_usd, 0)) AS cost_usd,
+              AVG(latency_ms) AS avg_latency_ms,
+              SUM(CASE WHEN error IS NOT NULL THEN 1 ELSE 0 END) AS errors
+         FROM hp_llm_log
+        WHERE request_at >= ${since}`,
+    );
+    const s = (sumRows as any[])[0];
+    const summary = {
+      calls: Number(s.calls ?? 0),
+      cacheHits: Number(s.cache_hits ?? 0),
+      promptTokens: Number(s.prompt_tokens ?? 0),
+      completionTokens: Number(s.completion_tokens ?? 0),
+      totalCostUsd: Number(s.cost_usd ?? 0),
+      avgLatencyMs: s.avg_latency_ms != null ? Math.round(Number(s.avg_latency_ms)) : null,
+      errors: Number(s.errors ?? 0),
+    };
+
+    // 모델별
+    const [modelRows] = await conn.query(
+      `SELECT model,
+              COUNT(*) AS calls,
+              SUM(cache_hit) AS cache_hits,
+              SUM(IFNULL(prompt_tokens, 0)) AS prompt_tokens,
+              SUM(IFNULL(completion_tokens, 0)) AS completion_tokens,
+              SUM(IFNULL(cost_usd, 0)) AS cost_usd,
+              AVG(latency_ms) AS avg_latency_ms,
+              SUM(CASE WHEN error IS NOT NULL THEN 1 ELSE 0 END) AS errors
+         FROM hp_llm_log
+        WHERE request_at >= ${since}
+     GROUP BY model
+     ORDER BY calls DESC`,
+    );
+
+    // 엔티티 타입별
+    const [entityRows] = await conn.query(
+      `SELECT entity_type AS entity,
+              COUNT(*) AS calls,
+              SUM(IFNULL(cost_usd, 0)) AS cost_usd
+         FROM hp_llm_log
+        WHERE request_at >= ${since}
+     GROUP BY entity_type
+     ORDER BY calls DESC`,
+    );
+
+    // 일별
+    const [dayRows] = await conn.query(
+      `SELECT DATE(request_at) AS d,
+              COUNT(*) AS calls,
+              SUM(cache_hit) AS cache_hits,
+              SUM(IFNULL(cost_usd, 0)) AS cost_usd,
+              SUM(CASE WHEN error IS NOT NULL THEN 1 ELSE 0 END) AS errors
+         FROM hp_llm_log
+        WHERE request_at >= ${since}
+     GROUP BY DATE(request_at)
+     ORDER BY d ASC`,
+    );
+
+    // 최근 호출 N건
+    const [recentRows] = await conn.query(
+      `SELECT id, request_at, route, entity_type, entity_id, model,
+              prompt_tokens, completion_tokens, latency_ms, cost_usd, cache_hit, error
+         FROM hp_llm_log
+        WHERE request_at >= ${since}
+     ORDER BY id DESC
+        LIMIT ${recentLimit}`,
+    );
+
+    return c.json({
+      range: { days, since: null },
+      summary,
+      byModel: (modelRows as any[]).map((r) => ({
+        model: r.model,
+        calls: Number(r.calls),
+        cacheHits: Number(r.cache_hits ?? 0),
+        promptTokens: Number(r.prompt_tokens ?? 0),
+        completionTokens: Number(r.completion_tokens ?? 0),
+        costUsd: Number(r.cost_usd ?? 0),
+        avgLatencyMs: r.avg_latency_ms != null ? Math.round(Number(r.avg_latency_ms)) : null,
+        errors: Number(r.errors ?? 0),
+      })),
+      byEntity: (entityRows as any[]).map((r) => ({
+        entity: r.entity,
+        calls: Number(r.calls),
+        costUsd: Number(r.cost_usd ?? 0),
+      })),
+      byDay: (dayRows as any[]).map((r) => ({
+        date: String(r.d).slice(0, 10),
+        calls: Number(r.calls),
+        cacheHits: Number(r.cache_hits ?? 0),
+        costUsd: Number(r.cost_usd ?? 0),
+        errors: Number(r.errors ?? 0),
+      })),
+      recent: (recentRows as any[]).map((r) => ({
+        id: Number(r.id),
+        requestAt: r.request_at,
+        route: r.route,
+        entityType: r.entity_type,
+        entityId: r.entity_id,
+        model: r.model,
+        promptTokens: r.prompt_tokens,
+        completionTokens: r.completion_tokens,
+        latencyMs: r.latency_ms,
+        costUsd: r.cost_usd != null ? Number(r.cost_usd) : null,
+        cacheHit: Number(r.cache_hit) === 1,
+        error: r.error,
+      })),
+    });
+  }),
+);
+
 // ── 표준 답변 카탈로그 (hp_standard_answer) ────────────
 // QaEvalCard "표준답변으로 저장" 액션의 destination + 챗봇 응답 1순위 소스.
 

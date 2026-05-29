@@ -37,6 +37,7 @@ export const openapiSpec = {
     { name: "wbs", description: "WBS Live Tracker — R2 단일 JSON 영속화" },
     { name: "pms", description: "PMS 게시판 연동 (Hyperdrive → MySQL)" },
     { name: "standard-answers", description: "표준 답변 카탈로그 — 챗봇 응답 1순위 소스 (hp_standard_answer)" },
+    { name: "admin", description: "운영 도구 (LLM 비용·호출 집계 등)" },
     { name: "db", description: "탐색용 임시 엔드포인트 (안정화 후 제거 예정)" },
   ],
   paths: {
@@ -230,6 +231,40 @@ export const openapiSpec = {
         summary: "저장된 브리핑 soft-delete (status=-1)",
         parameters: [{ name: "id", in: "path", required: true, schema: { type: "integer", minimum: 1 } }],
         responses: { "200": { description: "OK" } },
+      },
+    },
+
+    "/admin/cost": {
+      get: {
+        tags: ["admin"],
+        summary: "LLM 호출 비용·지연·실패 집계",
+        description:
+          "`hp_llm_log`를 일·모델·엔티티 기준으로 집계 + 최근 N건. `/admin/cost` 대시보드 페이지가 호출.\n\n" +
+          "**무인증** — 사내 운영자만 URL을 알도록 운영. Cloudflare Access 보호 권장.",
+        parameters: [
+          { name: "days", in: "query", required: false, schema: { type: "integer", default: 30, minimum: 1, maximum: 365 } },
+          { name: "limit", in: "query", required: false, schema: { type: "integer", default: 50, maximum: 200 }, description: "recent 호출 개수" },
+        ],
+        responses: {
+          "200": {
+            description: "집계",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    range: { type: "object", properties: { days: { type: "integer" } } },
+                    summary: { type: "object" },
+                    byModel: { type: "array", items: { type: "object" } },
+                    byEntity: { type: "array", items: { type: "object" } },
+                    byDay: { type: "array", items: { type: "object" } },
+                    recent: { type: "array", items: { type: "object" } },
+                  },
+                },
+              },
+            },
+          },
+        },
       },
     },
 
