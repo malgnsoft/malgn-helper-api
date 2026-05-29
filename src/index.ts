@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { createConnection } from "mysql2/promise";
+import { openapiSpec, docHtml } from "./openapi";
 
 type Bindings = {
   R2: R2Bucket;
@@ -28,6 +29,10 @@ app.use(
 
 app.get("/", (c) => c.json({ name: "malgn-helper-api", status: "ok" }));
 app.get("/healthz", (c) => c.json({ ok: true }));
+
+// ── API 문서 (Scalar UI + OpenAPI 3.1 JSON) ─────────────
+app.get("/doc", (c) => c.html(docHtml));
+app.get("/doc/openapi.json", (c) => c.json(openapiSpec));
 
 const WBS_KEY = "wbs/wbs.json";
 
