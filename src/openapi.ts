@@ -115,6 +115,18 @@ export const openapiSpec = {
       },
     },
 
+    "/pms/groups": {
+      get: {
+        tags: ["pms"],
+        summary: "프로젝트 그룹 목록 (셀렉트박스용)",
+        description: "`tb_project_group` 활성 그룹 + 각 그룹의 활성 프로젝트 수. site 기본 1.",
+        parameters: [
+          { name: "siteId", in: "query", required: false, schema: { type: "string", default: "1" } },
+        ],
+        responses: { "200": { description: "그룹 목록" } },
+      },
+    },
+
     "/pms/projects": {
       get: {
         tags: ["pms"],
@@ -154,6 +166,13 @@ export const openapiSpec = {
             required: false,
             schema: { type: "string", default: "1" },
             description: "기본 `1` (메인 사이트). `all`로 전체 사이트, 또는 특정 site_id 정수",
+          },
+          {
+            name: "groupId",
+            in: "query",
+            required: false,
+            schema: { type: "integer" },
+            description: "`tb_project_group.id`로 필터. 미지정 시 전체 그룹",
           },
         ],
         responses: {

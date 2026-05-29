@@ -128,6 +128,42 @@ function toIso(s: string | null): string | null {
   return `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}T${s.slice(8, 10)}:${s.slice(10, 12)}:${s.slice(12, 14)}`;
 }
 
+// 그룹 목록 (셀렉트박스용). site_id 기본 1, 활성만.
+app.get("/pms/groups", async (c) =>
+  withConn(c, async (conn) => {
+    const siteParam = c.req.query("siteId");
+    const where: string[] = ["g.status = 1"];
+    const params: any[] = [];
+    if (siteParam !== "all") {
+      const sid = siteParam ? parseInt(siteParam, 10) : 1;
+      if (Number.isFinite(sid)) {
+        where.push("g.site_id = ?");
+        params.push(sid);
+      }
+    }
+    const [rows] = await conn.query(
+      `SELECT g.id, g.name, g.pid, g.depth, g.sort, g.site_id,
+              (SELECT COUNT(*) FROM tb_project p
+                WHERE p.group_id = g.id AND p.status = 1 AND p.id > 0
+                  AND p.site_id = g.site_id) AS project_count
+         FROM tb_project_group g
+        WHERE ${where.join(" AND ")}
+     ORDER BY g.sort ASC, g.id ASC`,
+      params,
+    );
+    return c.json({
+      rows: (rows as any[]).map((r) => ({
+        id: Number(r.id),
+        name: r.name,
+        pid: Number(r.pid ?? 0),
+        depth: Number(r.depth ?? 0),
+        siteId: Number(r.site_id),
+        projectCount: Number(r.project_count ?? 0),
+      })),
+    });
+  }),
+);
+
 // 프로젝트 목록 + 간이 통계 (검색·페이지네이션).
 app.get("/pms/projects", async (c) =>
   withConn(c, async (conn) => {
@@ -148,6 +184,14 @@ app.get("/pms/projects", async (c) =>
       }
     }
     if (onlyActive) where.push("p.status = 1");
+    const groupParam = c.req.query("groupId");
+    if (groupParam) {
+      const gid = parseInt(groupParam, 10);
+      if (Number.isFinite(gid)) {
+        where.push("p.group_id = ?");
+        params.push(gid);
+      }
+    }
     if (q) {
       where.push("(p.name LIKE ? OR p.buyer LIKE ?)");
       params.push(`%${q}%`, `%${q}%`);
@@ -1150,10 +1194,12 @@ app.get("/admin/evals", async (c) =>
       `SELECT e.id, e.post_id, e.project_id, e.generated_at, e.generator, e.llm_model,
               e.overall_score, e.overall_verdict, e.latency_ms,
               p.subject AS post_subject,
-              pj.name AS project_name
+              pj.name AS project_name, pj.group_id,
+              g.name AS group_name
          FROM hp_qa_eval e
     LEFT JOIN tb_post p ON p.id = e.post_id
     LEFT JOIN tb_project pj ON pj.id = e.project_id
+    LEFT JOIN tb_project_group g ON g.id = pj.group_id AND g.status = 1
         ${whereSql}
      ORDER BY ${orderSql}
         LIMIT ${limit} OFFSET ${offset}`,
@@ -1177,6 +1223,8 @@ app.get("/admin/evals", async (c) =>
         latencyMs: r.latency_ms,
         postSubject: r.post_subject,
         projectName: r.project_name,
+        groupId: r.group_id != null ? Number(r.group_id) : null,
+        groupName: r.group_name ?? null,
       })),
     });
   }),
