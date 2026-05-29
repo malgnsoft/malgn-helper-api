@@ -234,6 +234,28 @@ export const openapiSpec = {
       },
     },
 
+    "/admin/evals": {
+      get: {
+        tags: ["admin"],
+        summary: "Q&A 평가 목록·정렬·필터",
+        description: "`hp_qa_eval`에서 활성 평가 조회. `tb_post`/`tb_project` JOIN으로 제목·프로젝트명 포함.",
+        parameters: [
+          { name: "projectId", in: "query", required: false, schema: { type: "integer" } },
+          { name: "minScore", in: "query", required: false, schema: { type: "number", minimum: 0, maximum: 5 } },
+          { name: "maxScore", in: "query", required: false, schema: { type: "number", minimum: 0, maximum: 5 } },
+          { name: "hasScore", in: "query", required: false, schema: { type: "string", enum: ["1"] } },
+          {
+            name: "sort", in: "query", required: false,
+            schema: { type: "string", enum: ["recent", "score_asc", "score_desc", "latency"], default: "recent" },
+            description: "score_asc는 NULL을 뒤로 (취약 응대 우선 발견)",
+          },
+          { name: "limit", in: "query", required: false, schema: { type: "integer", default: 50, maximum: 200 } },
+          { name: "offset", in: "query", required: false, schema: { type: "integer", default: 0 } },
+        ],
+        responses: { "200": { description: "목록" } },
+      },
+    },
+
     "/admin/cost": {
       get: {
         tags: ["admin"],

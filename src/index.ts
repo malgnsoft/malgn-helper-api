@@ -970,6 +970,81 @@ app.delete("/pms/evals/:id", async (c) =>
   }),
 );
 
+// ── /admin/evals — Q&A 평가 목록·정렬·필터 ────────────────
+app.get("/admin/evals", async (c) =>
+  withConn(c, async (conn) => {
+    const limit = Math.min(parseInt(c.req.query("limit") ?? "50", 10) || 50, 200);
+    const offset = Math.max(parseInt(c.req.query("offset") ?? "0", 10) || 0, 0);
+    const projectId = c.req.query("projectId");
+    const minScore = c.req.query("minScore");
+    const maxScore = c.req.query("maxScore");
+    const hasScore = c.req.query("hasScore") === "1";
+    const sort = c.req.query("sort") ?? "recent"; // recent | score_asc | score_desc | latency
+
+    const where: string[] = ["e.status = 1"];
+    const params: any[] = [];
+    if (projectId) {
+      where.push("e.project_id = ?");
+      params.push(parseInt(projectId, 10));
+    }
+    if (minScore) {
+      where.push("e.overall_score >= ?");
+      params.push(parseFloat(minScore));
+    }
+    if (maxScore) {
+      where.push("e.overall_score <= ?");
+      params.push(parseFloat(maxScore));
+    }
+    if (hasScore) where.push("e.overall_score IS NOT NULL");
+    const whereSql = `WHERE ${where.join(" AND ")}`;
+
+    let orderSql = "e.generated_at DESC, e.id DESC";
+    if (sort === "score_asc") orderSql = "IFNULL(e.overall_score, 999) ASC, e.generated_at DESC";
+    else if (sort === "score_desc") orderSql = "e.overall_score DESC, e.generated_at DESC";
+    else if (sort === "latency") orderSql = "e.latency_ms DESC";
+
+    const [countRows] = await conn.query(
+      `SELECT COUNT(*) AS total FROM hp_qa_eval e ${whereSql}`,
+      params,
+    );
+    const total = Number((countRows as any[])[0]?.total ?? 0);
+
+    const [rows] = await conn.query(
+      `SELECT e.id, e.post_id, e.project_id, e.generated_at, e.generator, e.llm_model,
+              e.overall_score, e.overall_verdict, e.latency_ms,
+              p.subject AS post_subject,
+              pj.name AS project_name
+         FROM hp_qa_eval e
+    LEFT JOIN tb_post p ON p.id = e.post_id
+    LEFT JOIN tb_project pj ON pj.id = e.project_id
+        ${whereSql}
+     ORDER BY ${orderSql}
+        LIMIT ${limit} OFFSET ${offset}`,
+      params,
+    );
+
+    return c.json({
+      total,
+      limit,
+      offset,
+      sort,
+      rows: (rows as any[]).map((r) => ({
+        id: Number(r.id),
+        postId: Number(r.post_id),
+        projectId: Number(r.project_id),
+        generatedAt: r.generated_at,
+        generator: r.generator,
+        llmModel: r.llm_model,
+        overallScore: r.overall_score != null ? Number(r.overall_score) : null,
+        overallVerdict: r.overall_verdict,
+        latencyMs: r.latency_ms,
+        postSubject: r.post_subject,
+        projectName: r.project_name,
+      })),
+    });
+  }),
+);
+
 // ── /admin/cost — LLM 호출 비용·지연·실패 대시보드 데이터 ───
 app.get("/admin/cost", async (c) =>
   withConn(c, async (conn) => {
