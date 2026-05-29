@@ -674,17 +674,25 @@ app.post("/pms/projects/:id/briefing/generate", async (c) =>
       );
       const cached = (cacheRows as any[])[0];
       if (cached) {
-        await conn.query(
-          `INSERT INTO hp_llm_log (route, entity_type, entity_id, model, latency_ms, cache_hit)
-           VALUES (?, 'briefing', ?, 'cache', ?, 1)`,
-          [route, cached.id, Date.now() - t0],
-        );
-        return c.json({
-          briefing: JSON.parse(cached.briefing_json),
-          cached: true,
-          id: cached.id,
-          generatedAt: cached.generated_at,
-        });
+        const cachedBrief = JSON.parse(cached.briefing_json);
+        // 옛 schema (persona 도입 전) 캐시는 자동 폐기하고 새로 생성
+        const schemaOk =
+          cachedBrief?.customer?.persona !== undefined ||
+          cachedBrief?.staff?.persona !== undefined;
+        if (schemaOk) {
+          await conn.query(
+            `INSERT INTO hp_llm_log (route, entity_type, entity_id, model, latency_ms, cache_hit)
+             VALUES (?, 'briefing', ?, 'cache', ?, 1)`,
+            [route, cached.id, Date.now() - t0],
+          );
+          return c.json({
+            briefing: cachedBrief,
+            cached: true,
+            id: cached.id,
+            generatedAt: cached.generated_at,
+          });
+        }
+        // schemaOk 가 아니면 fall-through → 아래 buildBriefingDbOnly + LLM 새로
       }
     }
 
@@ -882,7 +890,7 @@ app.post("/pms/projects/:id/briefing/generate", async (c) =>
             "  · urgentCount/customerPersona는 RECENT_180 기준",
             "  · staffPersona는 ALL 기준 (전체 직원 응답 본문 기반)",
             "  · faq/policies는 ALL 기준",
-            "  · RECENT_180이 비어있으면 urgentCount=0, customerPersona는 빈 객체",
+            "  · customerPersona·staffPersona는 절대 빠뜨리지 말 것. 입력이 적어도 추정으로 채울 것 (필요시 tone='데이터 부족' 같이라도)",
             "  · customerPersona = 고객사 평균 문의 톤·태도",
             "  · staffPersona = 상담사(직원) 평균 답변 톤·태도",
           ].join("\n"),
