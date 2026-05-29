@@ -325,6 +325,49 @@ export const openapiSpec = {
       },
     },
 
+    "/pms/posts/{id}/eval/generate": {
+      post: {
+        tags: ["pms"],
+        summary: "Q&A 평가 카드 생성 + 저장 (LLM)",
+        description:
+          "게시글 + 첫 직원 응답을 LLM(`openai/gpt-4o-mini`)이 5축(A~E)으로 평가. `hp_qa_eval`에 저장 + `hp_llm_log` 기록. 같은 input_hash가 있으면 캐시 hit. `?force=1`로 우회.\n\n" +
+          "**비공개 댓글(`private_yn='Y'`)은 LLM 입력에서 제외**되며, 첫 응답이 비공개인 경우 `meta.privateAnswer=true`로 표시.",
+        parameters: [
+          { name: "id", in: "path", required: true, schema: { type: "integer", minimum: 1 } },
+          { name: "force", in: "query", required: false, schema: { type: "string", enum: ["1"] } },
+        ],
+        responses: {
+          "200": { description: "생성/캐시 hit" },
+          "404": { description: "post 없음" },
+        },
+      },
+    },
+    "/pms/posts/{id}/evals": {
+      get: {
+        tags: ["pms"],
+        summary: "게시글에 저장된 평가 목록 (메타만)",
+        parameters: [
+          { name: "id", in: "path", required: true, schema: { type: "integer", minimum: 1 } },
+          { name: "limit", in: "query", required: false, schema: { type: "integer", default: 20, maximum: 100 } },
+        ],
+        responses: { "200": { description: "목록" } },
+      },
+    },
+    "/pms/evals/{id}": {
+      get: {
+        tags: ["pms"],
+        summary: "저장된 평가 단건",
+        parameters: [{ name: "id", in: "path", required: true, schema: { type: "integer", minimum: 1 } }],
+        responses: { "200": { description: "OK" }, "404": { description: "없음" } },
+      },
+      delete: {
+        tags: ["pms"],
+        summary: "평가 soft-delete (status=-1)",
+        parameters: [{ name: "id", in: "path", required: true, schema: { type: "integer", minimum: 1 } }],
+        responses: { "200": { description: "OK" } },
+      },
+    },
+
     "/pms/posts/{id}": {
       get: {
         tags: ["pms"],

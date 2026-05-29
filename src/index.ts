@@ -587,6 +587,303 @@ app.delete("/pms/briefings/:id", async (c) =>
   }),
 );
 
+// ── Q&A 평가 카드 (hp_qa_eval) ───────────────────────────
+// 게시글 1건 + 첫 staff 응답을 LLM이 5축으로 평가하고 JSON 반환.
+
+const QA_SYSTEM_PROMPT = [
+  "You evaluate Korean customer support Q&A interactions.",
+  "Inputs: an inquiry post + its first staff reply (Korean).",
+  "Output strict JSON matching the schema below. Comments in Korean.",
+  "",
+  "Score 5 axes A~E, each 1-5 integer (or string 'warn' if unscorable):",
+  "  A 응답 속도 (FRT 적정성)",
+  "  B 정확성 (질문 의도와 답 내용의 일치)",
+  "  C 명확성 (이해하기 쉬운 문장·구조)",
+  "  D 표준화 가능성 (재사용 가능한 답변인지) + templates 1~3개 제안",
+  "  E 친절도·태도 (어조, 공감)",
+  "",
+  "JSON schema:",
+  '{ "oneLiner":"<한 줄 평>",',
+  '  "axes":[',
+  '    {"letter":"A","title":"응답 속도","score":4,"scoreLabel":"양호","commentary":"...","bullets":[{"text":"...","emphasis":"high|normal"}]},',
+  '    {"letter":"B",...},',
+  '    {"letter":"C",...},',
+  '    {"letter":"D","title":"표준화 가능성","score":3,"commentary":"...","templates":[{"label":"<짧은>","question":"<질문 패턴>","answer":"<답변 본문>"}]},',
+  '    {"letter":"E",...}',
+  '  ],',
+  '  "overallVerdict":"<종합 평 한 줄>",',
+  '  "followups":[{"title":"...","detail":"..."}],',
+  '  "observation":{"title":"...","body":"...","hint":"..."} }',
+  "",
+  "Rules: bullets·templates·followups·observation는 의미 있을 때만 채우고 비어도 됨. templates는 D축에 1~3개. score가 정해지지 않으면 'warn' + scoreLabel='주의'.",
+].join("\n");
+
+app.post("/pms/posts/:id/eval/generate", async (c) =>
+  withConn(c, async (conn) => {
+    const id = parseInt(c.req.param("id"), 10);
+    if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
+    const force = c.req.query("force") === "1";
+    const skipLlm = c.req.query("nollm") === "1";
+    const t0 = Date.now();
+    const route = `POST /pms/posts/${id}/eval/generate`;
+
+    // 1) 게시글 + 문의자
+    const [postRows] = await conn.query(
+      `SELECT p.id, p.subject, p.content, p.project_id, p.reg_date,
+              u.name AS u_name, u.email AS u_email, u.company AS u_company, u.rank AS u_rank,
+              (u.email LIKE '%@malgnsoft.com') AS u_is_staff
+         FROM tb_post p
+    LEFT JOIN tb_user u ON u.id = p.user_id
+        WHERE p.id = ? AND p.status = 1`,
+      [id],
+    );
+    const post = (postRows as any[])[0];
+    if (!post) return c.json({ error: "post not found" }, 404);
+
+    // 2) 첫 staff 응답 (private_yn != 'Y' — 비공개 본문은 LLM에 입력 금지)
+    const [respRows] = await conn.query(
+      `SELECT c.id, c.content, c.reg_date, c.private_yn,
+              u.name AS u_name, u.email AS u_email, u.rank AS u_rank
+         FROM tb_post_comment c
+         JOIN tb_user u ON u.id = c.user_id
+        WHERE c.post_id = ? AND c.status = 1
+          AND u.email LIKE '%@malgnsoft.com'
+        ORDER BY c.reg_date ASC
+        LIMIT 1`,
+      [id],
+    );
+    const resp = (respRows as any[])[0];
+
+    // 3) 프로젝트 이름
+    const [projRows] = await conn.query(
+      `SELECT name FROM tb_project WHERE id = ?`,
+      [post.project_id],
+    );
+    const projectName = (projRows as any[])[0]?.name ?? `프로젝트 #${post.project_id}`;
+
+    // FRT 계산
+    const frt = (() => {
+      if (!resp?.reg_date) return "—";
+      const post14 = post.reg_date as string;
+      const resp14 = resp.reg_date as string;
+      if (!post14 || !resp14 || post14.length !== 14 || resp14.length !== 14) return "—";
+      const toDate = (s: string) =>
+        new Date(`${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}T${s.slice(8, 10)}:${s.slice(10, 12)}:${s.slice(12, 14)}Z`);
+      const diffMin = Math.round((toDate(resp14).getTime() - toDate(post14).getTime()) / 60000);
+      if (diffMin < 60) return `${diffMin}분`;
+      if (diffMin < 60 * 24) return `${Math.round(diffMin / 60)}시간`;
+      return `${Math.round(diffMin / (60 * 24))}일`;
+    })();
+
+    // QaMeta 조립
+    const inquirerKind = post.u_is_staff === 1 ? "직원" : "고객";
+    const meta = {
+      postId: post.id,
+      postTitle: post.subject,
+      projectId: post.project_id,
+      projectName,
+      projectType: "PMS",
+      projectStatus: "활성",
+      inquirer: {
+        name: post.u_name ?? "(미상)",
+        email: post.u_email ?? "",
+        kind: inquirerKind,
+      },
+      responder: resp
+        ? { name: resp.u_name, email: resp.u_email, kind: "직원" }
+        : { name: "(응답 없음)", email: "", kind: "직원" },
+      inquiryAt: toIso(post.reg_date) ?? "",
+      responseAt: toIso(resp?.reg_date ?? null) ?? "",
+      frt,
+      privateAnswer: resp?.private_yn === "Y", // 첫 응답이 비공개였는지 (drop된 경우)
+      privateField: "private_yn = Y",
+      domainRule: "@malgnsoft.com → 직원 / 그 외 → 고객",
+      generatedAt: new Date().toISOString().slice(0, 10),
+    };
+
+    // 캐시 키: 본문 내용 해시 (LLM에 입력하는 것과 동일 범위)
+    const inputForHash = JSON.stringify({
+      postId: id,
+      subject: post.subject,
+      content: post.content?.slice(0, 5000) ?? "",
+      response: resp?.content?.slice(0, 5000) ?? "",
+    });
+    const inputHash = await sha256Hex(inputForHash);
+
+    if (!force) {
+      const [cacheRows] = await conn.query(
+        `SELECT id, eval_json, generated_at FROM hp_qa_eval
+          WHERE post_id = ? AND status = 1 AND llm_input_hash = ?
+          ORDER BY generated_at DESC LIMIT 1`,
+        [id, inputHash],
+      );
+      const cached = (cacheRows as any[])[0];
+      if (cached) {
+        await conn.query(
+          `INSERT INTO hp_llm_log (route, entity_type, entity_id, model, latency_ms, cache_hit)
+           VALUES (?, 'qa_eval', ?, 'cache', ?, 1)`,
+          [route, cached.id, Date.now() - t0],
+        );
+        return c.json({ eval: JSON.parse(cached.eval_json), cached: true, id: cached.id });
+      }
+    }
+
+    // ── LLM 평가 ──────────────────────────────────────────
+    let llmResult: any = {
+      oneLiner: "",
+      axes: [],
+      overallVerdict: "",
+      followups: [],
+      observation: undefined,
+    };
+    let generator: "db_only" | "hybrid" = "db_only";
+    let llmModel: string | null = null;
+    let promptTokens: number | null = null;
+    let completionTokens: number | null = null;
+    let llmLatency: number | null = null;
+    let costUsd: number | null = null;
+    let llmError: string | null = null;
+
+    if (!skipLlm && c.env.OPENAI_API_KEY && resp) {
+      try {
+        const userMsg = [
+          `프로젝트: ${projectName}`,
+          `문의자: ${meta.inquirer.name} (${inquirerKind})`,
+          `응답자: ${meta.responder.name} (직원)`,
+          `문의 시각: ${meta.inquiryAt}`,
+          `응답 시각: ${meta.responseAt}`,
+          `FRT: ${frt}`,
+          "",
+          "=== 문의 제목 ===",
+          post.subject,
+          "",
+          "=== 문의 본문 ===",
+          (post.content ?? "").slice(0, 5000),
+          "",
+          "=== 첫 직원 응답 ===",
+          (resp.content ?? "").slice(0, 5000),
+        ].join("\n");
+        const llm = await callOpenAiJson<typeof llmResult>(c.env, {
+          system: QA_SYSTEM_PROMPT,
+          user: userMsg,
+          maxTokens: 1500,
+          temperature: 0.2,
+        });
+        llmResult = llm.data;
+        generator = "hybrid";
+        llmModel = llm.model;
+        promptTokens = llm.promptTokens;
+        completionTokens = llm.completionTokens;
+        llmLatency = llm.latencyMs;
+        costUsd = llm.costUsd;
+      } catch (e) {
+        llmError = (e as Error).message;
+      }
+    }
+
+    // overallAverage 계산
+    const numericScores = (llmResult.axes ?? [])
+      .map((a: any) => (typeof a.score === "number" ? a.score : null))
+      .filter((s: any) => s !== null) as number[];
+    const overallAverage =
+      numericScores.length > 0
+        ? Math.round((numericScores.reduce((a, b) => a + b, 0) / numericScores.length) * 10) / 10
+        : 0;
+
+    const qaEval = {
+      meta,
+      inquiry: post.content ?? "",
+      response: resp?.content ?? "",
+      oneLiner: llmResult.oneLiner ?? "",
+      axes: llmResult.axes ?? [],
+      overallAverage,
+      overallVerdict: llmResult.overallVerdict ?? "",
+      followups: llmResult.followups ?? [],
+      observation: llmResult.observation,
+    };
+
+    const totalLatency = Date.now() - t0;
+    const [ins] = await conn.query(
+      `INSERT INTO hp_qa_eval
+         (post_id, project_id, generated_at, generator, llm_model, llm_input_hash,
+          prompt_tokens, completion_tokens, latency_ms,
+          eval_json, overall_score, overall_verdict)
+       VALUES (?, ?, NOW(), ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        id,
+        post.project_id,
+        generator,
+        llmModel,
+        inputHash,
+        promptTokens,
+        completionTokens,
+        totalLatency,
+        JSON.stringify(qaEval),
+        overallAverage > 0 ? overallAverage : null,
+        qaEval.overallVerdict ? qaEval.overallVerdict.slice(0, 20) : null, // 컬럼 VARCHAR(20). 전체 verdict는 eval_json 안에 보존
+      ],
+    );
+    const insertId = (ins as any).insertId as number;
+
+    await conn.query(
+      `INSERT INTO hp_llm_log
+         (route, entity_type, entity_id, model, prompt_tokens, completion_tokens, latency_ms, cost_usd, cache_hit, error)
+       VALUES (?, 'qa_eval', ?, ?, ?, ?, ?, ?, 0, ?)`,
+      [route, insertId, llmModel ?? "db_only", promptTokens, completionTokens, llmLatency ?? totalLatency, costUsd, llmError],
+    );
+
+    return c.json({ eval: qaEval, cached: false, id: insertId, generator, llmError });
+  }),
+);
+
+app.get("/pms/posts/:id/evals", async (c) =>
+  withConn(c, async (conn) => {
+    const id = parseInt(c.req.param("id"), 10);
+    if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
+    const limit = Math.min(parseInt(c.req.query("limit") ?? "20", 10) || 20, 100);
+    const [rows] = await conn.query(
+      `SELECT id, generated_at, generator, llm_model, overall_score, overall_verdict, latency_ms
+         FROM hp_qa_eval
+        WHERE post_id = ? AND status = 1
+     ORDER BY generated_at DESC LIMIT ${limit}`,
+      [id],
+    );
+    return c.json({ rows });
+  }),
+);
+
+app.get("/pms/evals/:id", async (c) =>
+  withConn(c, async (conn) => {
+    const id = parseInt(c.req.param("id"), 10);
+    if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
+    const [rows] = await conn.query(
+      `SELECT id, post_id, project_id, generated_at, generator, llm_model, eval_json, overall_score, overall_verdict
+         FROM hp_qa_eval WHERE id = ? AND status = 1`,
+      [id],
+    );
+    const r = (rows as any[])[0];
+    if (!r) return c.json({ error: "not found" }, 404);
+    return c.json({
+      id: r.id,
+      postId: r.post_id,
+      projectId: r.project_id,
+      generatedAt: r.generated_at,
+      generator: r.generator,
+      llmModel: r.llm_model,
+      eval: JSON.parse(r.eval_json),
+    });
+  }),
+);
+
+app.delete("/pms/evals/:id", async (c) =>
+  withConn(c, async (conn) => {
+    const id = parseInt(c.req.param("id"), 10);
+    if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
+    await conn.query(`UPDATE hp_qa_eval SET status = -1 WHERE id = ?`, [id]);
+    return c.json({ ok: true });
+  }),
+);
+
 // ── 표준 답변 카탈로그 (hp_standard_answer) ────────────
 // QaEvalCard "표준답변으로 저장" 액션의 destination + 챗봇 응답 1순위 소스.
 
