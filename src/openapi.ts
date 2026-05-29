@@ -120,7 +120,7 @@ export const openapiSpec = {
         tags: ["pms"],
         summary: "프로젝트 목록 + 간이 통계",
         description:
-          "활성(`status=1`) + `id>0`인 프로젝트 기본 목록. 각 행에 게시글 수·최근 활동 포함.",
+          "활성(`status=1`) + `id>0` + `site_id=1`(기본)인 프로젝트. 각 행에 게시글 수·최근 활동 포함.",
         parameters: [
           {
             name: "q",
@@ -147,6 +147,13 @@ export const openapiSpec = {
             required: false,
             schema: { type: "string", enum: ["active", "all"], default: "active" },
             description: "`all`이면 종료된 프로젝트 포함",
+          },
+          {
+            name: "siteId",
+            in: "query",
+            required: false,
+            schema: { type: "string", default: "1" },
+            description: "기본 `1` (메인 사이트). `all`로 전체 사이트, 또는 특정 site_id 정수",
           },
         ],
         responses: {

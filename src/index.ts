@@ -136,8 +136,17 @@ app.get("/pms/projects", async (c) =>
     const q = (c.req.query("q") ?? "").trim();
     const onlyActive = c.req.query("status") !== "all"; // 기본: 활성만
 
+    const siteParam = c.req.query("siteId");
     const where: string[] = ["p.id > 0"]; // 시스템/임시 row 제외
     const params: any[] = [];
+    if (siteParam !== "all") {
+      // 기본: site_id = 1 (메인 사이트). ?siteId=all 로 우회, ?siteId=N 으로 특정 사이트.
+      const sid = siteParam ? parseInt(siteParam, 10) : 1;
+      if (Number.isFinite(sid)) {
+        where.push("p.site_id = ?");
+        params.push(sid);
+      }
+    }
     if (onlyActive) where.push("p.status = 1");
     if (q) {
       where.push("(p.name LIKE ? OR p.buyer LIKE ?)");
