@@ -1201,14 +1201,21 @@ const QA_SYSTEM_PROMPT = [
   '    {"letter":"A","title":"응답 속도","score":4,"scoreLabel":"양호","commentary":"...","bullets":[{"text":"...","emphasis":"high|normal"}]},',
   '    {"letter":"B",...},',
   '    {"letter":"C",...},',
-  '    {"letter":"D","title":"표준화 가능성","score":3,"commentary":"...","templates":[{"label":"<짧은>","question":"<질문 패턴>","answer":"<답변 본문>"}]},',
+  '    {"letter":"D","title":"표준화 가능성","score":3,"commentary":"...","templates":[{"label":"<짧은>","question":"<질문 패턴>","answer":"<상담사가 그대로 복사·발송 가능한 완성된 답변 본문, 인사+본문+마무리, 200~500자>"}]},',
   '    {"letter":"E",...}',
   '  ],',
   '  "overallVerdict":"<종합 평 한 줄>",',
   '  "followups":[{"title":"...","detail":"..."}],',
   '  "observation":{"title":"...","body":"...","hint":"..."} }',
   "",
-  "Rules: bullets·followups·observation는 의미 있을 때만 채우고 비어도 됨. templates는 D축에 정확히 6개 — 같은 패턴의 다양한 변형(짧은/긴 답변, 톤 차이, 시나리오 분기 등)으로 생성. score가 정해지지 않으면 'warn' + scoreLabel='주의'.",
+  "Rules: bullets·followups·observation는 의미 있을 때만 채우고 비어도 됨.",
+  "templates는 D축에 정확히 6개. 각 항목의 answer는 다음을 모두 포함:",
+  "  · 인사 (안녕하세요/문의 주셔서 감사합니다 등)",
+  "  · 본문 (질문에 대한 구체적인 답변 + 단계·조건·예시 등 맥락)",
+  "  · 마무리 (추가 문의 안내 / 감사 인사 등)",
+  "길이: 변형에 맞춰 — '짧은 답변' 100~200자, '긴 답변' 400~600자, 'FAQ 형식'은 Q/A 줄 분리, '단계별 안내'는 번호 매겨 단계 나열.",
+  "절대 'X입니다.' 같은 1문장 응답 금지. 실제 상담사가 그대로 사용할 수 있는 형태로 작성.",
+  "score가 정해지지 않으면 'warn' + scoreLabel='주의'.",
 ].join("\n");
 
 app.post("/pms/posts/:id/eval/generate", async (c) =>
@@ -1359,7 +1366,7 @@ app.post("/pms/posts/:id/eval/generate", async (c) =>
         const llm = await callOpenAiJson<typeof llmResult>(c.env, {
           system: QA_SYSTEM_PROMPT,
           user: userMsg,
-          maxTokens: 3000, // templates 6개 출력 위해 증가
+          maxTokens: 4500, // templates 6개 + 각 200~500자 본문 + 다른 axes
           temperature: 0.2,
         });
         llmResult = llm.data;
