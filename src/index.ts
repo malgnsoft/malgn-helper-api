@@ -125,14 +125,14 @@ app.get("/pms/projects", async (c) =>
     const q = (c.req.query("q") ?? "").trim();
     const onlyActive = c.req.query("status") !== "all"; // 기본: 활성만
 
-    const where: string[] = [];
+    const where: string[] = ["p.id > 0"]; // 시스템/임시 row 제외
     const params: any[] = [];
     if (onlyActive) where.push("p.status = 1");
     if (q) {
       where.push("(p.name LIKE ? OR p.buyer LIKE ?)");
       params.push(`%${q}%`, `%${q}%`);
     }
-    const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+    const whereSql = `WHERE ${where.join(" AND ")}`;
 
     const [countRows] = await conn.query(
       `SELECT COUNT(*) AS total FROM tb_project p ${whereSql}`,
