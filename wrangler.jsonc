@@ -13,9 +13,15 @@
 
   "hyperdrive": [
     { "binding": "HYPERDRIVE", "id": "aea36082dfd84125a0da2063d5b8e5e0" }
-  ]
+  ],
 
+  "vars": {
+    "AI_GATEWAY_URL": "https://gateway.ai.cloudflare.com/v1/d2b8c5524b7259214fa302f1fecb4ad6/malgn-helper/openai",
+    "LLM_MODEL_DEFAULT": "gpt-4o-mini",
+    "LLM_MODEL_PREMIUM": "gpt-4o"
+  }
+
+  // OPENAI_API_KEY는 wrangler secret으로 등록 (코드·git 노출 금지)
   // 추후 활성화할 바인딩
-  // "ai": { "binding": "AI" },
-  // "vars": { "OPENSEARCH_ENDPOINT": "https://...", "AI_GATEWAY_URL": "https://gateway.ai.cloudflare.com/..." }
+  // "ai": { "binding": "AI" }
 }

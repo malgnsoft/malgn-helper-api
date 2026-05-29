@@ -2,11 +2,15 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { createConnection } from "mysql2/promise";
 import { openapiSpec, docHtml } from "./openapi";
+import { callOpenAiJson } from "./llm";
 
 type Bindings = {
   R2: R2Bucket;
   HYPERDRIVE: Hyperdrive;
-  // AI: Ai;
+  AI_GATEWAY_URL: string;
+  OPENAI_API_KEY: string;
+  LLM_MODEL_DEFAULT: string;
+  LLM_MODEL_PREMIUM: string;
 };
 
 const app = new Hono<{ Bindings: Bindings }>();
@@ -384,19 +388,22 @@ app.get("/pms/projects/:id/briefing", async (c) =>
   }),
 );
 
-// POST: 새 브리핑 카드 생성 — hp_briefing에 저장, 24h 캐시 hit 시 재사용 (?force=1로 우회)
+// POST: 새 브리핑 카드 생성 — hp_briefing 저장 + LLM(hotTopics)
+//   캐시: 동일 input_hash + 24h 이내면 LLM 미호출. ?force=1로 우회.
+//   LLM 실패 시 graceful degrade — DB-only 브리핑은 그대로 저장.
 app.post("/pms/projects/:id/briefing/generate", async (c) =>
   withConn(c, async (conn) => {
     const id = parseInt(c.req.param("id"), 10);
     if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
     const force = c.req.query("force") === "1";
+    const skipLlm = c.req.query("nollm") === "1";
     const t0 = Date.now();
     const route = `POST /pms/projects/${id}/briefing/generate`;
 
     const briefing = await buildBriefingDbOnly(conn, id);
     if (!briefing) return c.json({ error: "not found" }, 404);
 
-    // 캐시 키: 안정적인 입력 부분만(generatedAt 같은 시각 필드 제외)
+    // 캐시 키: 안정적인 DB 집계만 (LLM 결과 제외)
     const hashInput = JSON.stringify({
       stats: briefing.stats,
       customerCount: briefing.customer.others.length + (briefing.customer.primary?.name ? 1 : 0),
@@ -418,7 +425,7 @@ app.post("/pms/projects/:id/briefing/generate", async (c) =>
       if (cached) {
         await conn.query(
           `INSERT INTO hp_llm_log (route, entity_type, entity_id, model, latency_ms, cache_hit)
-           VALUES (?, 'briefing', ?, 'db_only', ?, 1)`,
+           VALUES (?, 'briefing', ?, 'cache', ?, 1)`,
           [route, cached.id, Date.now() - t0],
         );
         return c.json({
@@ -430,22 +437,101 @@ app.post("/pms/projects/:id/briefing/generate", async (c) =>
       }
     }
 
-    const latency = Date.now() - t0;
+    // ── LLM: hotTopics 군집화 ────────────────────────────
+    let generator: "db_only" | "hybrid" = "db_only";
+    let llmModel: string | null = null;
+    let llmPromptTokens: number | null = null;
+    let llmCompletionTokens: number | null = null;
+    let llmLatencyMs: number | null = null;
+    let llmCostUsd: number | null = null;
+    let llmError: string | null = null;
+
+    if (!skipLlm && c.env.OPENAI_API_KEY) {
+      try {
+        const [titleRows] = await conn.query(
+          `SELECT subject FROM tb_post
+            WHERE project_id = ? AND status = 1 AND subject IS NOT NULL AND subject != ''
+         ORDER BY reg_date DESC LIMIT 100`,
+          [id],
+        );
+        const titles = (titleRows as any[])
+          .map((r) => String(r.subject ?? "").trim())
+          .filter((t) => t.length > 0);
+
+        if (titles.length >= 5) {
+          const llm = await callOpenAiJson<{ topics: Array<{ name: string; count: number }> }>(
+            c.env,
+            {
+              system:
+                "You analyze Korean customer support inquiry titles and cluster them into 3 to 7 topics. " +
+                'Reply with JSON: {"topics":[{"name":"<짧은 한국어, 4단어 이내>","count":<int>}, ...]}. ' +
+                "Sort topics by count desc. Counts should approximate how many titles belong to each topic.",
+              user:
+                "다음은 한 프로젝트의 최근 고객 문의 제목 목록입니다. 의미 단위로 3~7개 토픽으로 군집화하고, 각 토픽의 건수를 추정해 주세요.\n\n" +
+                titles.map((t, i) => `${i + 1}. ${t}`).join("\n"),
+              maxTokens: 500,
+              temperature: 0.2,
+            },
+          );
+          briefing.hotTopics = (llm.data.topics ?? []).slice(0, 7);
+          generator = "hybrid";
+          llmModel = llm.model;
+          llmPromptTokens = llm.promptTokens;
+          llmCompletionTokens = llm.completionTokens;
+          llmLatencyMs = llm.latencyMs;
+          llmCostUsd = llm.costUsd;
+        }
+      } catch (e) {
+        llmError = (e as Error).message;
+        // hotTopics는 빈 배열로 두고 generator=db_only 유지 → graceful degrade
+      }
+    }
+
+    const totalLatency = Date.now() - t0;
     const [ins] = await conn.query(
       `INSERT INTO hp_briefing
-         (project_id, generated_at, generator, llm_input_hash, latency_ms, briefing_json)
-       VALUES (?, NOW(), 'db_only', ?, ?, ?)`,
-      [id, inputHash, latency, JSON.stringify(briefing)],
+         (project_id, generated_at, generator, llm_model, llm_input_hash,
+          prompt_tokens, completion_tokens, latency_ms, briefing_json)
+       VALUES (?, NOW(), ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        id,
+        generator,
+        llmModel,
+        inputHash,
+        llmPromptTokens,
+        llmCompletionTokens,
+        totalLatency,
+        JSON.stringify(briefing),
+      ],
     );
     const insertId = (ins as any).insertId as number;
 
     await conn.query(
-      `INSERT INTO hp_llm_log (route, entity_type, entity_id, model, latency_ms, cache_hit)
-       VALUES (?, 'briefing', ?, 'db_only', ?, 0)`,
-      [route, insertId, latency],
+      `INSERT INTO hp_llm_log
+         (route, entity_type, entity_id, model, prompt_tokens, completion_tokens, latency_ms, cost_usd, cache_hit, error)
+       VALUES (?, 'briefing', ?, ?, ?, ?, ?, ?, 0, ?)`,
+      [
+        route,
+        insertId,
+        llmModel ?? "db_only",
+        llmPromptTokens,
+        llmCompletionTokens,
+        llmLatencyMs ?? totalLatency,
+        llmCostUsd,
+        llmError,
+      ],
     );
 
-    return c.json({ briefing, cached: false, id: insertId });
+    return c.json({
+      briefing,
+      cached: false,
+      id: insertId,
+      generator,
+      llm: llmModel
+        ? { model: llmModel, promptTokens: llmPromptTokens, completionTokens: llmCompletionTokens, costUsd: llmCostUsd, latencyMs: llmLatencyMs }
+        : null,
+      llmError,
+    });
   }),
 );
 
