@@ -117,6 +117,56 @@ function toIso(s: string | null): string | null {
   return `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}T${s.slice(8, 10)}:${s.slice(10, 12)}:${s.slice(12, 14)}`;
 }
 
+// 프로젝트 목록 + 간이 통계 (검색·페이지네이션).
+app.get("/pms/projects", async (c) =>
+  withConn(c, async (conn) => {
+    const limit = Math.min(parseInt(c.req.query("limit") ?? "50", 10) || 50, 200);
+    const offset = Math.max(parseInt(c.req.query("offset") ?? "0", 10) || 0, 0);
+    const q = (c.req.query("q") ?? "").trim();
+    const onlyActive = c.req.query("status") !== "all"; // 기본: 활성만
+
+    const where: string[] = [];
+    const params: any[] = [];
+    if (onlyActive) where.push("p.status = 1");
+    if (q) {
+      where.push("(p.name LIKE ? OR p.buyer LIKE ?)");
+      params.push(`%${q}%`, `%${q}%`);
+    }
+    const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+
+    const [countRows] = await conn.query(
+      `SELECT COUNT(*) AS total FROM tb_project p ${whereSql}`,
+      params,
+    );
+    const total = Number((countRows as any[])[0]?.total ?? 0);
+
+    const [rows] = await conn.query(
+      `SELECT p.id, p.name, p.buyer, p.status, p.reg_date,
+              (SELECT COUNT(*) FROM tb_post WHERE project_id = p.id AND status = 1) AS post_count,
+              (SELECT MAX(reg_date) FROM tb_post WHERE project_id = p.id AND status = 1) AS last_activity
+         FROM tb_project p
+         ${whereSql}
+     ORDER BY last_activity DESC, p.id DESC
+        LIMIT ${limit} OFFSET ${offset}`,
+      params,
+    );
+
+    return c.json({
+      total,
+      limit,
+      offset,
+      rows: (rows as any[]).map((r) => ({
+        id: r.id,
+        name: r.name,
+        buyer: r.buyer,
+        active: r.status === 1,
+        postCount: Number(r.post_count ?? 0),
+        lastActivity: toIso(r.last_activity),
+      })),
+    });
+  }),
+);
+
 // 프로젝트 단위 브리핑 (PMS BriefingCard용).
 // DB로 만들 수 있는 통계·멤버·라벨·알림만 채우고, LLM 영역(faq/policies/hotTopics)은 빈 배열.
 app.get("/pms/projects/:id/briefing", async (c) =>
