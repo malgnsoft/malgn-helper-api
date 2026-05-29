@@ -296,7 +296,7 @@ const RECENT_DAYS = 180;
 // reg_date가 varchar(14) 'YYYYMMDDHHMMSS' 포맷이므로 cutoff도 같은 문자열로 비교 (인덱스 활용)
 const SINCE_14_SQL = `DATE_FORMAT(DATE_SUB(NOW(), INTERVAL ${RECENT_DAYS} DAY), '%Y%m%d%H%i%s')`;
 
-async function buildBriefingDbOnly(conn: any, id: number): Promise<any | null> {
+async function buildBriefingDbOnly(conn: any, id: number): Promise<{ briefing: any; staffIds: number[] } | null> {
     const [projRows] = await conn.query(
       `SELECT id, name, description, buyer, start_date, end_date, status
          FROM tb_project WHERE id = ?`,
@@ -305,10 +305,17 @@ async function buildBriefingDbOnly(conn: any, id: number): Promise<any | null> {
     const proj = (projRows as any[])[0];
     if (!proj) return null;
 
+    // staff user id 캐시 (이후 모든 쿼리에서 IN/NOT IN으로 사용 — email LIKE 풀스캔 회피)
+    const [staffUserRows] = await conn.query(
+      `SELECT id FROM tb_user WHERE email LIKE '%@malgnsoft.com' AND status = 1`,
+    );
+    const staffIds = (staffUserRows as any[]).map((r) => Number(r.id));
+    const staffIdsSql = staffIds.length > 0 ? staffIds.join(",") : "0"; // 빈 경우 매치 안 되도록 0
+
     // 멤버: 최근 180일 글 또는 댓글에 참여한 user
     const [memberRows] = await conn.query(
       `SELECT u.id, u.name, u.email, u.company, u.rank,
-              (u.email LIKE '%@malgnsoft.com') AS is_staff
+              (u.id IN (${staffIdsSql})) AS is_staff
          FROM tb_user u
         WHERE u.status = 1 AND u.id IN (
           SELECT user_id FROM tb_post
@@ -343,14 +350,14 @@ async function buildBriefingDbOnly(conn: any, id: number): Promise<any | null> {
       [id],
     );
 
-    // 직원별 응대 건수 — 최근 180일 댓글
+    // 직원별 응대 건수 — 최근 180일 댓글 (staff user IN)
     const [staffRows] = await conn.query(
       `SELECT u.name, u.rank, COUNT(c.id) AS cnt
          FROM tb_post_comment c
          JOIN tb_user u ON u.id = c.user_id
          JOIN tb_post p ON p.id = c.post_id
         WHERE p.project_id = ? AND c.status = 1
-          AND u.email LIKE '%@malgnsoft.com'
+          AND c.user_id IN (${staffIdsSql})
           AND c.reg_date >= ${SINCE_14_SQL}
      GROUP BY u.id, u.name, u.rank
      ORDER BY cnt DESC
@@ -358,19 +365,17 @@ async function buildBriefingDbOnly(conn: any, id: number): Promise<any | null> {
       [id],
     );
 
-    // 미응답: 최근 180일 글 중 직원 댓글 없는 고객 글
+    // 미응답: 최근 180일 글 중 직원 댓글 없는 고객 글 (staff IN, 인덱스 효율)
     const [unansweredRows] = await conn.query(
       `SELECT COUNT(*) AS cnt
          FROM tb_post p
-         JOIN tb_user pu ON pu.id = p.user_id
         WHERE p.project_id = ? AND p.status = 1
           AND p.reg_date >= ${SINCE_14_SQL}
-          AND pu.email NOT LIKE '%@malgnsoft.com'
+          AND p.user_id NOT IN (${staffIdsSql})
           AND NOT EXISTS (
             SELECT 1 FROM tb_post_comment c
-              JOIN tb_user cu ON cu.id = c.user_id
              WHERE c.post_id = p.id AND c.status = 1
-               AND cu.email LIKE '%@malgnsoft.com'
+               AND c.user_id IN (${staffIdsSql})
           )`,
       [id],
     );
@@ -380,15 +385,13 @@ async function buildBriefingDbOnly(conn: any, id: number): Promise<any | null> {
     const [oldestUnansweredRows] = await conn.query(
       `SELECT p.id, p.subject, p.reg_date, p.writer
          FROM tb_post p
-         JOIN tb_user pu ON pu.id = p.user_id
         WHERE p.project_id = ? AND p.status = 1
           AND p.reg_date >= ${SINCE_14_SQL}
-          AND pu.email NOT LIKE '%@malgnsoft.com'
+          AND p.user_id NOT IN (${staffIdsSql})
           AND NOT EXISTS (
             SELECT 1 FROM tb_post_comment c
-              JOIN tb_user cu ON cu.id = c.user_id
              WHERE c.post_id = p.id AND c.status = 1
-               AND cu.email LIKE '%@malgnsoft.com'
+               AND c.user_id IN (${staffIdsSql})
           )
      ORDER BY p.reg_date ASC
         LIMIT 1`,
@@ -402,10 +405,9 @@ async function buildBriefingDbOnly(conn: any, id: number): Promise<any | null> {
       `SELECT p.reg_date AS post_at, MIN(c.reg_date) AS first_at
          FROM tb_post p
          JOIN tb_post_comment c ON c.post_id = p.id
-         JOIN tb_user cu ON cu.id = c.user_id
         WHERE p.project_id = ? AND p.status = 1 AND c.status = 1
           AND p.reg_date >= ${SINCE_14_SQL}
-          AND cu.email LIKE '%@malgnsoft.com'
+          AND c.user_id IN (${staffIdsSql})
      GROUP BY p.id, p.reg_date`,
       [id],
     );
@@ -585,7 +587,7 @@ async function buildBriefingDbOnly(conn: any, id: number): Promise<any | null> {
       policies: [],   // LLM 영역 (전체)
     };
 
-    return briefing;
+    return { briefing, staffIds };
 }
 
 // GET: 즉시 집계 (DB only) — 캐시 사용 안 함, 저장 안 함
@@ -593,9 +595,9 @@ app.get("/pms/projects/:id/briefing", async (c) =>
   withConn(c, async (conn) => {
     const id = parseInt(c.req.param("id"), 10);
     if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
-    const briefing = await buildBriefingDbOnly(conn, id);
-    if (!briefing) return c.json({ error: "not found" }, 404);
-    return c.json({ briefing });
+    const result = await buildBriefingDbOnly(conn, id);
+    if (!result) return c.json({ error: "not found" }, 404);
+    return c.json({ briefing: result.briefing });
   }),
 );
 
@@ -611,26 +613,31 @@ app.post("/pms/projects/:id/briefing/generate", async (c) =>
     const t0 = Date.now();
     const route = `POST /pms/projects/${id}/briefing/generate`;
 
-    const briefing = await buildBriefingDbOnly(conn, id);
-    if (!briefing) return c.json({ error: "not found" }, 404);
-
-    // 캐시 키: 안정적인 DB 집계만 (LLM 결과 제외)
-    const hashInput = JSON.stringify({
-      stats: briefing.stats,
-      customerCount: briefing.customer.others.length + (briefing.customer.primary?.name ? 1 : 0),
-      staffCount: briefing.staff.primary.length + briefing.staff.aux.length,
-      labels: briefing.hotLabels,
-      alertCount: briefing.alerts.length,
-    });
-    const inputHash = await sha256Hex(hashInput);
-
+    // ── 캐시 lookup (quick check 2 쿼리) ──────────────────
+    // tb_post와 tb_post_comment의 최신 reg_date 조합으로 데이터 변동을 감지.
+    // 이 둘이 같으면 13개 SQL을 다 침해서 buildBriefingDbOnly 호출할 필요 없음.
     if (!force) {
+      const [tickPost] = await conn.query(
+        `SELECT MAX(reg_date) AS t FROM tb_post WHERE project_id = ? AND status = 1`,
+        [id],
+      );
+      const [tickComment] = await conn.query(
+        `SELECT MAX(c.reg_date) AS t
+           FROM tb_post_comment c
+           JOIN tb_post p ON p.id = c.post_id
+          WHERE p.project_id = ? AND c.status = 1`,
+        [id],
+      );
+      const tickP = String((tickPost as any[])[0]?.t ?? "");
+      const tickC = String((tickComment as any[])[0]?.t ?? "");
+      const cacheTick = `${tickP}|${tickC}`;
+
       const [cacheRows] = await conn.query(
         `SELECT id, briefing_json, generated_at FROM hp_briefing
           WHERE project_id = ? AND status = 1 AND llm_input_hash = ?
             AND generated_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)
           ORDER BY generated_at DESC LIMIT 1`,
-        [id, inputHash],
+        [id, cacheTick],
       );
       const cached = (cacheRows as any[])[0];
       if (cached) {
@@ -647,6 +654,27 @@ app.post("/pms/projects/:id/briefing/generate", async (c) =>
         });
       }
     }
+
+    // 캐시 miss — buildBriefingDbOnly 실행
+    const built = await buildBriefingDbOnly(conn, id);
+    if (!built) return c.json({ error: "not found" }, 404);
+    const briefing = built.briefing;
+    const staffIds = built.staffIds;
+    const staffIdsSql = staffIds.length > 0 ? staffIds.join(",") : "0";
+
+    // 새 캐시 키: 같은 tick (위 quick check 와 동일 식). force=1이면 위에서 skip 했으므로 다시 계산.
+    const [tickPostNew] = await conn.query(
+      `SELECT MAX(reg_date) AS t FROM tb_post WHERE project_id = ? AND status = 1`,
+      [id],
+    );
+    const [tickCommentNew] = await conn.query(
+      `SELECT MAX(c.reg_date) AS t
+         FROM tb_post_comment c
+         JOIN tb_post p ON p.id = c.post_id
+        WHERE p.project_id = ? AND c.status = 1`,
+      [id],
+    );
+    const inputHash = `${String((tickPostNew as any[])[0]?.t ?? "")}|${String((tickCommentNew as any[])[0]?.t ?? "")}`;
 
     // ── LLM: hotTopics + extras (oneLiner / urgent / faq / policies) ─
     let generator: "db_only" | "hybrid" = "db_only";
@@ -700,7 +728,7 @@ app.post("/pms/projects/:id/briefing/generate", async (c) =>
            JOIN tb_user u ON u.id = p.user_id
           WHERE p.project_id = ? AND p.status = 1
             AND p.reg_date >= ${SINCE_14_SQL}
-            AND u.email NOT LIKE '%@malgnsoft.com'
+            AND p.user_id NOT IN (${staffIdsSql})
             AND p.content IS NOT NULL AND CHAR_LENGTH(p.content) > 10
        ORDER BY p.reg_date DESC LIMIT 30`,
         [id],
@@ -714,7 +742,7 @@ app.post("/pms/projects/:id/briefing/generate", async (c) =>
           WHERE p.project_id = ? AND c.status = 1
             AND c.reg_date >= ${SINCE_14_SQL}
             AND c.private_yn != 'Y'
-            AND u.email NOT LIKE '%@malgnsoft.com'
+            AND c.user_id NOT IN (${staffIdsSql})
             AND c.content IS NOT NULL AND CHAR_LENGTH(c.content) > 10
        ORDER BY c.reg_date DESC LIMIT 30`,
         [id],
@@ -734,9 +762,8 @@ app.post("/pms/projects/:id/briefing/generate", async (c) =>
         `SELECT c.content
            FROM tb_post_comment c
            JOIN tb_post p ON p.id = c.post_id
-           JOIN tb_user u ON u.id = c.user_id
           WHERE p.project_id = ? AND c.status = 1
-            AND u.email LIKE '%@malgnsoft.com'
+            AND c.user_id IN (${staffIdsSql})
             AND c.private_yn != 'Y'
             AND c.content IS NOT NULL AND c.content != ''
        ORDER BY c.reg_date DESC LIMIT 20`,
