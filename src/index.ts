@@ -35,6 +35,7 @@ app.use(
 app.get("/", (c) => c.json({ name: "malgn-helper-api", status: "ok" }));
 app.get("/healthz", (c) => c.json({ ok: true }));
 
+
 // ── API 문서 (Scalar UI + OpenAPI 3.1 JSON) ─────────────
 app.get("/doc", (c) => c.html(docHtml));
 app.get("/doc/openapi.json", (c) => c.json(openapiSpec));
@@ -906,7 +907,7 @@ app.post("/pms/posts/:id/eval/generate", async (c) =>
         totalLatency,
         JSON.stringify(qaEval),
         overallAverage > 0 ? overallAverage : null,
-        qaEval.overallVerdict ? qaEval.overallVerdict.slice(0, 20) : null, // 컬럼 VARCHAR(20). 전체 verdict는 eval_json 안에 보존
+        qaEval.overallVerdict ? qaEval.overallVerdict.slice(0, 100) : null, // 컬럼 VARCHAR(100) 안전 trim
       ],
     );
     const insertId = (ins as any).insertId as number;
