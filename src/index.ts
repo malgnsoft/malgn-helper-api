@@ -313,7 +313,9 @@ async function buildBriefingDbOnly(conn: any, id: number, timings?: Record<strin
     // staff user id 캐시 (이후 모든 쿼리에서 IN/NOT IN으로 사용 — email LIKE 풀스캔 회피)
     t = Date.now();
     const [staffUserRows] = await conn.query(
-      `SELECT id FROM tb_user WHERE email LIKE '%@malgnsoft.com' AND status = 1`,
+      `SELECT id FROM tb_user
+        WHERE status = 1
+          AND (email LIKE '%@malgnsoft.com' OR company = '맑은소프트')`,
     );
     tick("staffIds", t);
     const staffIds = (staffUserRows as any[]).map((r) => Number(r.id));
@@ -1132,7 +1134,7 @@ app.post("/pms/posts/:id/eval/generate", async (c) =>
     const [postRows] = await conn.query(
       `SELECT p.id, p.subject, p.content, p.project_id, p.reg_date,
               u.name AS u_name, u.email AS u_email, u.company AS u_company, u.rank AS u_rank,
-              (u.email LIKE '%@malgnsoft.com') AS u_is_staff
+              (u.email LIKE '%@malgnsoft.com' OR u.company = '맑은소프트') AS u_is_staff
          FROM tb_post p
     LEFT JOIN tb_user u ON u.id = p.user_id
         WHERE p.id = ? AND p.status = 1`,
@@ -1148,7 +1150,7 @@ app.post("/pms/posts/:id/eval/generate", async (c) =>
          FROM tb_post_comment c
          JOIN tb_user u ON u.id = c.user_id
         WHERE c.post_id = ? AND c.status = 1
-          AND u.email LIKE '%@malgnsoft.com'
+          AND (u.email LIKE '%@malgnsoft.com' OR u.company = '맑은소프트')
         ORDER BY c.reg_date ASC
         LIMIT 1`,
       [id],
@@ -1408,7 +1410,7 @@ app.post("/pms/projects/:id/standard-answer-suggestions", async (c) =>
          JOIN tb_post p ON p.id = c.post_id
          JOIN tb_user u ON u.id = c.user_id
         WHERE p.project_id = ? AND c.status = 1
-          AND u.email LIKE '%@malgnsoft.com'
+          AND (u.email LIKE '%@malgnsoft.com' OR u.company = '맑은소프트')
           AND c.private_yn != 'Y'
           AND c.content IS NOT NULL AND CHAR_LENGTH(c.content) >= 30
      ORDER BY c.reg_date DESC LIMIT 50`,
@@ -1882,7 +1884,7 @@ app.get("/pms/posts/:id", async (c) =>
       `SELECT p.id, p.subject, p.content, p.project_id, p.site_id,
               p.writer, p.reg_date, p.comm_cnt,
               u.email AS writer_email, u.company AS writer_company,
-              (u.email LIKE '%@malgnsoft.com') AS writer_is_staff
+              (u.email LIKE '%@malgnsoft.com' OR u.company = '맑은소프트') AS writer_is_staff
          FROM tb_post p
     LEFT JOIN tb_user u ON u.id = p.user_id
         WHERE p.id = ? AND p.status = 1`,
@@ -1894,7 +1896,7 @@ app.get("/pms/posts/:id", async (c) =>
     const [commentRows] = await conn.query(
       `SELECT c.id, c.content, c.writer, c.reg_date, c.private_yn,
               u.email AS writer_email,
-              (u.email LIKE '%@malgnsoft.com') AS writer_is_staff
+              (u.email LIKE '%@malgnsoft.com' OR u.company = '맑은소프트') AS writer_is_staff
          FROM tb_post_comment c
     LEFT JOIN tb_user u ON u.id = c.user_id
         WHERE c.post_id = ? AND c.status = 1
