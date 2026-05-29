@@ -46,7 +46,7 @@ app.get("/wbs", async (c) => {
 });
 
 // ── DB (Hyperdrive → MySQL) ─────────────────────────────
-async function withConn<T>(c: any, fn: (conn: any) => Promise<T>): Promise<T> {
+async function withConn<T>(c: any, fn: (conn: any) => Promise<T>): Promise<T | Response> {
   const hd = c.env.HYPERDRIVE;
   const conn = await createConnection({
     host: hd.host,
@@ -58,6 +58,8 @@ async function withConn<T>(c: any, fn: (conn: any) => Promise<T>): Promise<T> {
   });
   try {
     return await fn(conn);
+  } catch (e) {
+    return c.json({ error: (e as Error).message, stack: (e as Error).stack?.split("\n").slice(0, 5) }, 500);
   } finally {
     c.executionCtx.waitUntil(conn.end());
   }
@@ -114,6 +116,208 @@ function toIso(s: string | null): string | null {
   if (!s || s.length !== 14) return s;
   return `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}T${s.slice(8, 10)}:${s.slice(10, 12)}:${s.slice(12, 14)}`;
 }
+
+// 프로젝트 단위 브리핑 (PMS BriefingCard용).
+// DB로 만들 수 있는 통계·멤버·라벨·알림만 채우고, LLM 영역(faq/policies/hotTopics)은 빈 배열.
+app.get("/pms/projects/:id/briefing", async (c) =>
+  withConn(c, async (conn) => {
+    const id = parseInt(c.req.param("id"), 10);
+    if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
+
+    const [projRows] = await conn.query(
+      `SELECT id, name, description, buyer, start_date, end_date, status
+         FROM tb_project WHERE id = ?`,
+      [id],
+    );
+    const proj = (projRows as any[])[0];
+    if (!proj) return c.json({ error: "not found" }, 404);
+
+    // 멤버: tb_project_user JOIN tb_user (활성 + status=1)
+    const [memberRows] = await conn.query(
+      `SELECT u.id, u.name, u.email, u.company, u.rank, pu.user_level,
+              (u.email LIKE '%@malgnsoft.com') AS is_staff
+         FROM tb_project_user pu
+         JOIN tb_user u ON u.id = pu.user_id
+        WHERE pu.project_id = ? AND pu.status = 1 AND u.status = 1`,
+      [id],
+    );
+
+    // post 통계: 총수 / 첫/마지막 활동
+    const [statsRows] = await conn.query(
+      `SELECT COUNT(*) AS total,
+              MIN(reg_date) AS first_post,
+              MAX(reg_date) AS last_post
+         FROM tb_post WHERE project_id = ? AND status = 1`,
+      [id],
+    );
+    const stats0 = (statsRows as any[])[0];
+
+    // 라벨 분포 (상위 6)
+    const [labelRows] = await conn.query(
+      `SELECT label, COUNT(*) AS cnt
+         FROM tb_post
+        WHERE project_id = ? AND status = 1 AND label IS NOT NULL AND label != ''
+     GROUP BY label
+     ORDER BY cnt DESC
+        LIMIT 6`,
+      [id],
+    );
+
+    // 직원별 응대(댓글) 건수 — staff = email LIKE '%@malgnsoft.com'
+    const [staffRows] = await conn.query(
+      `SELECT u.name, u.rank, COUNT(c.id) AS cnt
+         FROM tb_post_comment c
+         JOIN tb_user u ON u.id = c.user_id
+         JOIN tb_post p ON p.id = c.post_id
+        WHERE p.project_id = ? AND c.status = 1
+          AND u.email LIKE '%@malgnsoft.com'
+     GROUP BY u.id, u.name, u.rank
+     ORDER BY cnt DESC
+        LIMIT 10`,
+      [id],
+    );
+
+    // 미응답: 직원 댓글 없는 고객 글
+    const [unansweredRows] = await conn.query(
+      `SELECT COUNT(*) AS cnt
+         FROM tb_post p
+         JOIN tb_user pu ON pu.id = p.user_id
+        WHERE p.project_id = ? AND p.status = 1
+          AND pu.email NOT LIKE '%@malgnsoft.com'
+          AND NOT EXISTS (
+            SELECT 1 FROM tb_post_comment c
+              JOIN tb_user cu ON cu.id = c.user_id
+             WHERE c.post_id = p.id AND c.status = 1
+               AND cu.email LIKE '%@malgnsoft.com'
+          )`,
+      [id],
+    );
+    const unanswered = (unansweredRows as any[])[0]?.cnt ?? 0;
+
+    // 가장 오래된 미응답 1건(알림용)
+    const [oldestUnansweredRows] = await conn.query(
+      `SELECT p.id, p.subject, p.reg_date, p.writer
+         FROM tb_post p
+         JOIN tb_user pu ON pu.id = p.user_id
+        WHERE p.project_id = ? AND p.status = 1
+          AND pu.email NOT LIKE '%@malgnsoft.com'
+          AND NOT EXISTS (
+            SELECT 1 FROM tb_post_comment c
+              JOIN tb_user cu ON cu.id = c.user_id
+             WHERE c.post_id = p.id AND c.status = 1
+               AND cu.email LIKE '%@malgnsoft.com'
+          )
+     ORDER BY p.reg_date ASC
+        LIMIT 1`,
+      [id],
+    );
+    const oldestUnanswered = (oldestUnansweredRows as any[])[0];
+
+    // 평균 첫 응답 시간(FRT, 분 단위) — staff 댓글까지 걸린 시간 (서브쿼리: post별 first staff comment)
+    const [frtRows] = await conn.query(
+      `SELECT AVG(TIMESTAMPDIFF(MINUTE,
+                STR_TO_DATE(sub.post_at, '%Y%m%d%H%i%s'),
+                STR_TO_DATE(sub.first_at, '%Y%m%d%H%i%s'))) AS avg_minutes
+         FROM (
+           SELECT p.reg_date AS post_at, MIN(c.reg_date) AS first_at
+             FROM tb_post p
+             JOIN tb_post_comment c ON c.post_id = p.id
+             JOIN tb_user cu ON cu.id = c.user_id
+            WHERE p.project_id = ? AND p.status = 1 AND c.status = 1
+              AND cu.email LIKE '%@malgnsoft.com'
+         GROUP BY p.id, p.reg_date
+         ) sub`,
+      [id],
+    );
+    const avgMinutes = Number((frtRows as any[])[0]?.avg_minutes);
+    const avgFRT = !Number.isFinite(avgMinutes)
+      ? "—"
+      : avgMinutes < 60
+        ? `${Math.round(avgMinutes)}m`
+        : `${Math.round(avgMinutes / 60)}h`;
+
+    // ── Briefing 객체 조립 ──────────────────────────────
+    const members = memberRows as any[];
+    const customers = members.filter((m) => m.is_staff !== 1);
+    const staffs = members.filter((m) => m.is_staff === 1);
+
+    const primaryCustomer = customers[0] ?? null;
+    const monthOf = (d: string | null) => (d && d.length >= 6 ? `${d.slice(0, 4)}-${d.slice(4, 6)}` : null);
+
+    const alerts: any[] = [];
+    if (oldestUnanswered) {
+      alerts.push({
+        level: "warn",
+        title: "응답 누락 추정",
+        detail: oldestUnanswered.subject,
+        meta: `${oldestUnanswered.writer} · ${toIso(oldestUnanswered.reg_date)?.slice(0, 10)} · post ${oldestUnanswered.id}`,
+        hint: "우선 확인",
+        postId: oldestUnanswered.id,
+      });
+    }
+    if (unanswered >= 3) {
+      alerts.push({
+        level: "danger",
+        title: `미응답 누적 ${unanswered}건`,
+        hint: "응대 인력 점검 필요",
+      });
+    }
+
+    const briefing = {
+      meta: {
+        projectId: proj.id,
+        projectName: proj.name,
+        active: proj.status === 1,
+        statusLabel: unanswered > 0 ? "주의" : "원활",
+        statusReason: unanswered > 0 ? `직원 응답 없음 ${unanswered}건` : "미응답 없음",
+        subtitle: proj.description?.slice(0, 80) ?? proj.buyer ?? "",
+        lifecycle: proj.status === 1 ? "유지보수 진행" : "종료",
+        builtAt: monthOf(stats0.first_post) ?? "",
+        lastActivity: monthOf(stats0.last_post) ?? "",
+        generatedAt: new Date().toISOString().slice(0, 10),
+        domainRule: "@malgnsoft.com → 직원 / 그 외 → 고객",
+      },
+      customer: {
+        primary: primaryCustomer
+          ? { name: primaryCustomer.name, email: primaryCustomer.email, role: primaryCustomer.rank || primaryCustomer.company }
+          : { name: "(고객 멤버 없음)", email: "", role: "" },
+        others: customers.slice(1, 6).map((m) => ({
+          name: m.name,
+          email: m.email,
+          role: m.rank || m.company,
+        })),
+        note: customers.length > 6 ? `+ ${customers.length - 6}명` : undefined,
+      },
+      staff: {
+        primary: (staffRows as any[]).slice(0, 5).map((r) => ({
+          role: r.rank || "직원",
+          name: r.name,
+          count: Number(r.cnt),
+        })),
+        aux: (staffRows as any[]).slice(5).map((r) => ({
+          name: r.name,
+          count: Number(r.cnt),
+        })),
+      },
+      stats: {
+        total: Number(stats0.total ?? 0),
+        avgFRT,
+        unanswered: Number(unanswered),
+        urgent: 0, // TODO: 라벨 '긴급' 또는 키워드 룰
+      },
+      hotTopics: [], // LLM 영역 (제목 군집화)
+      hotLabels: (labelRows as any[]).map((r) => ({
+        name: r.label,
+        count: Number(r.cnt),
+      })),
+      alerts,
+      faq: [], // LLM 영역
+      policies: [], // LLM 영역
+    };
+
+    return c.json({ briefing });
+  }),
+);
 
 // 게시글(문의) 1건 + 작성자 + (공개) 댓글 흐름.
 // 직원/고객 구분은 email 도메인(@malgnsoft.com) 기준. private_yn='Y' 댓글 본문은 마스킹.
