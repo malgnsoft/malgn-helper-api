@@ -438,7 +438,7 @@ app.post("/pms/projects/:id/briefing/generate", async (c) =>
       }
     }
 
-    // ── LLM: hotTopics 군집화 ────────────────────────────
+    // ── LLM: hotTopics + extras (oneLiner / urgent / faq / policies) ─
     let generator: "db_only" | "hybrid" = "db_only";
     let llmModel: string | null = null;
     let llmPromptTokens: number | null = null;
@@ -447,19 +447,47 @@ app.post("/pms/projects/:id/briefing/generate", async (c) =>
     let llmCostUsd: number | null = null;
     let llmError: string | null = null;
 
-    if (!skipLlm && c.env.OPENAI_API_KEY) {
-      try {
-        const [titleRows] = await conn.query(
-          `SELECT subject FROM tb_post
-            WHERE project_id = ? AND status = 1 AND subject IS NOT NULL AND subject != ''
-         ORDER BY reg_date DESC LIMIT 100`,
-          [id],
-        );
-        const titles = (titleRows as any[])
-          .map((r) => String(r.subject ?? "").trim())
-          .filter((t) => t.length > 0);
+    function accumulate(r: { model: string; promptTokens: number; completionTokens: number; latencyMs: number; costUsd: number }) {
+      llmModel = r.model;
+      llmPromptTokens = (llmPromptTokens ?? 0) + r.promptTokens;
+      llmCompletionTokens = (llmCompletionTokens ?? 0) + r.completionTokens;
+      llmLatencyMs = (llmLatencyMs ?? 0) + r.latencyMs;
+      llmCostUsd = (llmCostUsd ?? 0) + r.costUsd;
+      generator = "hybrid";
+    }
 
-        if (titles.length >= 5) {
+    if (!skipLlm && c.env.OPENAI_API_KEY) {
+      // 입력: 최근 제목 100개 (둘 다 사용)
+      const [titleRows] = await conn.query(
+        `SELECT subject FROM tb_post
+          WHERE project_id = ? AND status = 1 AND subject IS NOT NULL AND subject != ''
+       ORDER BY reg_date DESC LIMIT 100`,
+        [id],
+      );
+      const titles = (titleRows as any[])
+        .map((r) => String(r.subject ?? "").trim())
+        .filter((t) => t.length > 0);
+
+      // 입력: 최근 staff 댓글 본문 20건 (faq/policies 추출용, 비공개 제외)
+      const [staffMsgRows] = await conn.query(
+        `SELECT c.content
+           FROM tb_post_comment c
+           JOIN tb_post p ON p.id = c.post_id
+           JOIN tb_user u ON u.id = c.user_id
+          WHERE p.project_id = ? AND c.status = 1
+            AND u.email LIKE '%@malgnsoft.com'
+            AND c.private_yn != 'Y'
+            AND c.content IS NOT NULL AND c.content != ''
+       ORDER BY c.reg_date DESC LIMIT 20`,
+        [id],
+      );
+      const staffMessages = (staffMsgRows as any[])
+        .map((r) => String(r.content ?? "").replace(/\s+/g, " ").slice(0, 400))
+        .filter((s) => s.length > 0);
+
+      // ── LLM 1: hotTopics 군집화 ───────────────────────
+      if (titles.length >= 5) {
+        try {
           const llm = await callOpenAiJson<{ topics: Array<{ name: string; count: number }> }>(
             c.env,
             {
@@ -475,16 +503,72 @@ app.post("/pms/projects/:id/briefing/generate", async (c) =>
             },
           );
           briefing.hotTopics = (llm.data.topics ?? []).slice(0, 7);
-          generator = "hybrid";
-          llmModel = llm.model;
-          llmPromptTokens = llm.promptTokens;
-          llmCompletionTokens = llm.completionTokens;
-          llmLatencyMs = llm.latencyMs;
-          llmCostUsd = llm.costUsd;
+          accumulate(llm);
+        } catch (e) {
+          llmError = `hotTopics: ${(e as Error).message}`;
         }
-      } catch (e) {
-        llmError = (e as Error).message;
-        // hotTopics는 빈 배열로 두고 generator=db_only 유지 → graceful degrade
+      }
+
+      // ── LLM 2: 추가 분석 (oneLiner / statusReason / urgentCount / faq / policies) ──
+      if (titles.length >= 5) {
+        try {
+          const summary = {
+            projectName: briefing.meta.projectName,
+            total: briefing.stats.total,
+            unanswered: briefing.stats.unanswered,
+            avgFRT: briefing.stats.avgFRT,
+            lastActivity: briefing.meta.lastActivity,
+            staffCount: briefing.staff.primary.length + briefing.staff.aux.length,
+            customerPrimary: briefing.customer.primary?.name,
+          };
+
+          const llm = await callOpenAiJson<{
+            statusLabel: string;
+            statusReason: string;
+            urgentCount: number;
+            faq: string[];
+            policies: Array<{ title: string; detail: string; source: string }>;
+          }>(c.env, {
+            system: [
+              "You analyze a Korean customer support project and produce a concise briefing.",
+              "Inputs: project stats summary + recent inquiry titles + recent staff replies.",
+              "Output strict JSON:",
+              '{ "statusLabel":"<짧은 한국어 라벨, 예: 주의/원활/긴급, 4글자 이내>",',
+              '  "statusReason":"<한 줄 사유, 30자 이내>",',
+              '  "urgentCount":<제목 100개 중 긴급/장애/오류성 추정 건수, int>,',
+              '  "faq":["<자주 묻는 질문 패턴 1>","<2>","<3>", ...]   // 3~6개, 각 30자 이내,',
+              '  "policies":[{"title":"<짧은 정책명>","detail":"<2~3문장>","source":"<출처 요약, 예: 직원 응답 패턴>"}, ...]  // 0~3개, 직원 응답에서 일관되게 관찰되는 응답 규칙만',
+              "}",
+              "FAQ는 실제 제목들에서 반복 패턴이 보일 때만. POLICIES는 staff 응답에서 명확한 규칙이 보일 때만(없으면 빈 배열).",
+            ].join("\n"),
+            user: [
+              `프로젝트 통계: ${JSON.stringify(summary)}`,
+              "",
+              "=== 최근 문의 제목 (최대 100건) ===",
+              titles.slice(0, 100).map((t, i) => `${i + 1}. ${t}`).join("\n"),
+              "",
+              "=== 최근 직원 응답 본문 (최대 20건, 비공개 제외) ===",
+              staffMessages.map((m, i) => `${i + 1}. ${m}`).join("\n"),
+            ].join("\n"),
+            maxTokens: 900,
+            temperature: 0.2,
+          });
+
+          // 메타 업데이트 (DB-only 룰 결과 위에 덮어쓰기)
+          if (llm.data.statusLabel) briefing.meta.statusLabel = llm.data.statusLabel.slice(0, 10);
+          if (llm.data.statusReason) briefing.meta.statusReason = llm.data.statusReason.slice(0, 60);
+          if (typeof llm.data.urgentCount === "number") briefing.stats.urgent = llm.data.urgentCount;
+          briefing.faq = (llm.data.faq ?? []).filter((s) => typeof s === "string").slice(0, 6);
+          briefing.policies = (llm.data.policies ?? []).slice(0, 3).map((p) => ({
+            title: String(p.title ?? "").slice(0, 50),
+            detail: String(p.detail ?? "").slice(0, 300),
+            source: String(p.source ?? "").slice(0, 80),
+          }));
+          accumulate(llm);
+        } catch (e) {
+          const prev = llmError ? `${llmError}; ` : "";
+          llmError = `${prev}extras: ${(e as Error).message}`;
+        }
       }
     }
 
