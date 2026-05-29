@@ -16,6 +16,8 @@ export const STAFF_COMPANY = "맑은소프트";
 export const PARTNER_WHITELIST = new Set<string>([
   "플로즈",
   "옐로우윈",
+  "오케어",  // 송한나 등 — 회사명 매칭
+  "송한나",  // 안전망: 회사명 컬럼이 비어있어도 이름으로 매칭
 ]);
 
 function norm(s: unknown): string {
