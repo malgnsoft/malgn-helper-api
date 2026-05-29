@@ -381,6 +381,15 @@ async function buildBriefingDbOnly(conn: any, id: number): Promise<any | null> {
         ? businessMinutes.reduce((acc, x) => acc + x, 0) / businessMinutes.length
         : NaN;
     const avgFRT = formatBusinessFrt(Number.isFinite(avgMinutes) ? avgMinutes : null);
+    // 영업시간 분 기준 등급 (1영업일 = 480min)
+    const avgFRTGrade = (() => {
+      if (!Number.isFinite(avgMinutes)) return "데이터 없음";
+      if (avgMinutes < 60) return "매우 빠름";
+      if (avgMinutes < 240) return "빠른 편"; // 4h 이내
+      if (avgMinutes < 480) return "보통";    // 1영업일 이내
+      if (avgMinutes < 1440) return "느린 편"; // 3영업일 이내
+      return "응답 지연";
+    })();
 
     // ── Briefing 객체 조립 ──────────────────────────────
     const members = memberRows as any[];
@@ -465,7 +474,8 @@ async function buildBriefingDbOnly(conn: any, id: number): Promise<any | null> {
       stats: {
         total: Number(stats0.total ?? 0), // 전체 누적
         avgFRT,                            // 180일 이내 영업시간
-        avgFRTNote: `영업시간 기준 (평일 ${BUSINESS_START_HOUR}:00~${BUSINESS_END_HOUR}:00, 공휴일 제외)`,
+        avgFRTGrade,                       // 매우 빠름 / 빠른 편 / 보통 / 느린 편 / 응답 지연
+        avgFRTNote: `${avgFRTGrade} · 영업시간 기준 (평일 ${BUSINESS_START_HOUR}:00~${BUSINESS_END_HOUR}:00, 공휴일 제외)`,
         avgFRTSampleSize: businessMinutes.length,
         unanswered: Number(unanswered),    // 180일 이내
         urgent: 0,                          // LLM (180일 이내)
