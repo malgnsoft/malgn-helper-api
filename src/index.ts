@@ -1209,13 +1209,15 @@ const QA_SYSTEM_PROMPT = [
   '  "observation":{"title":"...","body":"...","hint":"..."} }',
   "",
   "Rules: bullets·followups·observation는 의미 있을 때만 채우고 비어도 됨.",
-  "templates는 D축에 정확히 6개. 각 답변(answer)에 대한 가이드:",
-  "  · 형식: HTML. <p>·<ol>/<ul>·<li>·<strong>·<a>·<img> 등 자유롭게 사용. 단순 텍스트도 <p>로 감쌀 것.",
-  "  · 내용 우선: 글자 수가 아니라 '실제 응대에 필요한 정보'를 모두 담는다. 인사·본문·마무리는 어색하지 않은 흐름이면 자유.",
-  "  · 원본 보존: 원본 응답에 <img src=...> 나 다운로드 링크(<a href=...>) 가 있으면 같은 src/href를 그대로 answer에 포함. 새로 만들지 말고 원본 그대로.",
-  "  · 일반화: 특정 고객명·계약번호·이메일 등 개인 정보는 빼고, 누구에게나 적용 가능한 형태로 다듬는다.",
-  "  · 6개 변형: 짧은 답변(요약형) / 긴 답변(전체 맥락) / 친절한 톤 / 비즈니스 톤 / FAQ 형식(Q&A 줄 분리) / 단계별 안내(<ol><li>...).",
-  "  · 1문장 단편 응답 금지. 'X입니다.' 같은 한 줄로 끝내지 말 것.",
+  "templates는 D축에 정확히 6개. answer 작성 규칙(엄수):",
+  "  ◈ 형식: 반드시 HTML. 최소 <p>...</p>로 모든 문단 감싸고, 목록은 <ol><li>...</li></ol>, 강조는 <strong>...</strong>.",
+  "  ◈ 이미지: 원본에 <img>가 있고 해당 답변 맥락에 적합하면, 같은 src를 그대로 <img src=\"...\"> 로 본문 사이에 넣어 시각 자료를 보존한다. 단계별 안내는 단계마다 해당 화면 이미지를 함께 배치.",
+  "  ◈ 링크: 원본의 <a href=\"...\"> 다운로드/외부 링크도 같은 href로 보존.",
+  "  ◈ 내용 우선: 글자 수가 아니라 '실제 응대에 필요한 정보'를 모두 담는다. 짧다고 좋고 길다고 나쁘지 않음 — 자연스러운 흐름이 우선.",
+  "  ◈ 일반화: 특정 고객명·계약번호·이메일 등 개인 정보는 빼고 누구에게나 적용 가능한 형태로.",
+  "  ◈ 6개 변형: 짧은 답변(요약형) / 긴 답변(전체 맥락) / 친절한 톤 / 비즈니스 톤 / FAQ 형식 / 단계별 안내.",
+  "    단계별 안내는 <ol> 안에 각 <li>마다 단계 설명 + 해당 단계의 이미지(있으면)를 같이 배치.",
+  "  ◈ 1문장 단편 응답 금지. 'X입니다.' 같은 한 줄로 끝내지 말 것.",
   "score가 정해지지 않으면 'warn' + scoreLabel='주의'.",
 ].join("\n");
 
@@ -1347,6 +1349,10 @@ app.post("/pms/posts/:id/eval/generate", async (c) =>
 
     if (!skipLlm && c.env.OPENAI_API_KEY && resp) {
       try {
+        // 원본 HTML에서 이미지 src 추출 — LLM이 놓치지 않도록 별도로 명시
+        const imgPattern = /<img\s[^>]*src\s*=\s*["']([^"']+)["'][^>]*>/gi;
+        const respContent = String(resp.content ?? "");
+        const imgs = [...respContent.matchAll(imgPattern)].map((m) => m[1]);
         const userMsg = [
           `프로젝트: ${projectName}`,
           `문의자: ${meta.inquirer.name} (${inquirerKind})`,
@@ -1359,15 +1365,19 @@ app.post("/pms/posts/:id/eval/generate", async (c) =>
           post.subject,
           "",
           "=== 문의 본문 ===",
-          (post.content ?? "").slice(0, 5000),
+          (post.content ?? "").slice(0, 6000),
           "",
-          "=== 첫 직원 응답 ===",
-          (resp.content ?? "").slice(0, 5000),
+          "=== 첫 직원 응답 (HTML 원본) ===",
+          respContent.slice(0, 10000),
+          "",
+          imgs.length > 0
+            ? `=== 원본 응답에 포함된 이미지 (총 ${imgs.length}장) — 각 표준답변 변형에 적절히 배치할 것 ===\n${imgs.map((s, i) => `[${i + 1}] ${s}`).join("\n")}`
+            : "(원본에 이미지 없음)",
         ].join("\n");
         const llm = await callOpenAiJson<typeof llmResult>(c.env, {
           system: QA_SYSTEM_PROMPT,
           user: userMsg,
-          maxTokens: 4500, // templates 6개 + 각 200~500자 본문 + 다른 axes
+          maxTokens: 6000, // templates 6개 HTML + 이미지 + 다른 axes
           temperature: 0.2,
         });
         llmResult = llm.data;
