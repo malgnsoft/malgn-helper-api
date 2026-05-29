@@ -34,7 +34,7 @@ app.use(
       if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) return origin;
       return null;
     },
-    allowMethods: ["GET", "PUT", "POST", "OPTIONS"],
+    allowMethods: ["GET", "PUT", "POST", "PATCH", "DELETE", "OPTIONS"],
     allowHeaders: ["Content-Type"],
     maxAge: 86400,
   }),
