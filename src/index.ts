@@ -36,7 +36,7 @@ app.use(
     },
     allowMethods: ["GET", "PUT", "POST", "PATCH", "DELETE", "OPTIONS"],
     allowHeaders: ["Content-Type"],
-    maxAge: 86400,
+    maxAge: 600, // 10분 — 룰 변경 시 빠르게 전파
   }),
 );
 

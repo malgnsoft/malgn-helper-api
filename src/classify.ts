@@ -15,6 +15,7 @@ export const STAFF_COMPANY = "맑은소프트";
 // (향후 hp_partner_company 테이블로 이관 가능)
 export const PARTNER_WHITELIST = new Set<string>([
   "플로즈",
+  "옐로우윈",
 ]);
 
 function norm(s: unknown): string {
