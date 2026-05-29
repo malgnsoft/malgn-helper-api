@@ -3,6 +3,13 @@ import { cors } from "hono/cors";
 import { createConnection } from "mysql2/promise";
 import { openapiSpec, docHtml } from "./openapi";
 import { callOpenAiJson } from "./llm";
+import {
+  parseKst14ToMs,
+  businessMinutesBetween,
+  formatBusinessFrt,
+  BUSINESS_START_HOUR,
+  BUSINESS_END_HOUR,
+} from "./business-hours";
 
 type Bindings = {
   R2: R2Bucket;
@@ -348,29 +355,32 @@ async function buildBriefingDbOnly(conn: any, id: number): Promise<any | null> {
     );
     const oldestUnanswered = (oldestUnansweredRows as any[])[0];
 
-    // 평균 첫 응답 시간(FRT, 분) — 180일 이내 글 중 staff 댓글 있는 것
+    // 평균 첫 응답 시간 — raw pair 만 가져와서 JS에서 영업시간 계산
+    // (월~금 09:00~17:00 KST, 한국 공휴일 제외, 180일 이내 글만)
     const [frtRows] = await conn.query(
-      `SELECT AVG(TIMESTAMPDIFF(MINUTE,
-                STR_TO_DATE(sub.post_at, '%Y%m%d%H%i%s'),
-                STR_TO_DATE(sub.first_at, '%Y%m%d%H%i%s'))) AS avg_minutes
-         FROM (
-           SELECT p.reg_date AS post_at, MIN(c.reg_date) AS first_at
-             FROM tb_post p
-             JOIN tb_post_comment c ON c.post_id = p.id
-             JOIN tb_user cu ON cu.id = c.user_id
-            WHERE p.project_id = ? AND p.status = 1 AND c.status = 1
-              AND p.reg_date >= ${SINCE_14_SQL}
-              AND cu.email LIKE '%@malgnsoft.com'
-         GROUP BY p.id, p.reg_date
-         ) sub`,
+      `SELECT p.reg_date AS post_at, MIN(c.reg_date) AS first_at
+         FROM tb_post p
+         JOIN tb_post_comment c ON c.post_id = p.id
+         JOIN tb_user cu ON cu.id = c.user_id
+        WHERE p.project_id = ? AND p.status = 1 AND c.status = 1
+          AND p.reg_date >= ${SINCE_14_SQL}
+          AND cu.email LIKE '%@malgnsoft.com'
+     GROUP BY p.id, p.reg_date`,
       [id],
     );
-    const avgMinutes = Number((frtRows as any[])[0]?.avg_minutes);
-    const avgFRT = !Number.isFinite(avgMinutes)
-      ? "—"
-      : avgMinutes < 60
-        ? `${Math.round(avgMinutes)}m`
-        : `${Math.round(avgMinutes / 60)}h`;
+    const businessMinutes = (frtRows as any[])
+      .map((r) => {
+        const a = parseKst14ToMs(r.post_at);
+        const b = parseKst14ToMs(r.first_at);
+        if (a == null || b == null) return null;
+        return businessMinutesBetween(a, b);
+      })
+      .filter((m): m is number => m != null);
+    const avgMinutes =
+      businessMinutes.length > 0
+        ? businessMinutes.reduce((acc, x) => acc + x, 0) / businessMinutes.length
+        : NaN;
+    const avgFRT = formatBusinessFrt(Number.isFinite(avgMinutes) ? avgMinutes : null);
 
     // ── Briefing 객체 조립 ──────────────────────────────
     const members = memberRows as any[];
@@ -454,7 +464,9 @@ async function buildBriefingDbOnly(conn: any, id: number): Promise<any | null> {
       },
       stats: {
         total: Number(stats0.total ?? 0), // 전체 누적
-        avgFRT,                            // 180일 이내
+        avgFRT,                            // 180일 이내 영업시간
+        avgFRTNote: `영업시간 기준 (평일 ${BUSINESS_START_HOUR}:00~${BUSINESS_END_HOUR}:00, 공휴일 제외)`,
+        avgFRTSampleSize: businessMinutes.length,
         unanswered: Number(unanswered),    // 180일 이내
         urgent: 0,                          // LLM (180일 이내)
       },
