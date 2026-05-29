@@ -8,6 +8,7 @@ type Bindings = {
   R2: R2Bucket;
   HYPERDRIVE: Hyperdrive;
   AI_GATEWAY_URL: string;
+  AI_GATEWAY_TOKEN?: string;
   OPENAI_API_KEY: string;
   LLM_MODEL_DEFAULT: string;
   LLM_MODEL_PREMIUM: string;

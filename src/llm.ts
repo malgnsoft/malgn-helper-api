@@ -2,7 +2,8 @@
 // OpenAI 호출 (Cloudflare AI Gateway 경유). JSON-mode 응답 강제.
 
 export type LlmEnv = {
-  AI_GATEWAY_URL: string; // https://gateway.ai.cloudflare.com/v1/<acc>/<gw>/openai
+  AI_GATEWAY_URL: string; // https://gateway.ai.cloudflare.com/v1/<acc>/<gw>/compat
+  AI_GATEWAY_TOKEN?: string; // Authenticated Gateway 사용 시 cf-aig-authorization
   OPENAI_API_KEY: string;
   LLM_MODEL_DEFAULT: string;
   LLM_MODEL_PREMIUM: string;
@@ -24,7 +25,9 @@ const PRICING: Record<string, { input: number; output: number }> = {
 };
 
 function estimateCost(model: string, pin: number, pout: number): number {
-  const p = PRICING[model];
+  // model이 "openai/gpt-4o-mini" 같은 prefix 형식일 수 있음
+  const base = model.includes("/") ? model.split("/").slice(-1)[0] : model;
+  const p = PRICING[base];
   if (!p) return 0;
   return ((pin * p.input) + (pout * p.output)) / 1_000_000;
 }
@@ -48,12 +51,16 @@ export async function callOpenAiJson<T>(
   const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? 25_000);
 
   try {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${env.OPENAI_API_KEY}`,
+    };
+    if (env.AI_GATEWAY_TOKEN) {
+      headers["cf-aig-authorization"] = `Bearer ${env.AI_GATEWAY_TOKEN}`;
+    }
     const res = await fetch(url, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${env.OPENAI_API_KEY}`,
-      },
+      headers,
       body: JSON.stringify({
         model,
         messages: [

@@ -16,9 +16,10 @@
   ],
 
   "vars": {
-    "AI_GATEWAY_URL": "https://gateway.ai.cloudflare.com/v1/d2b8c5524b7259214fa302f1fecb4ad6/malgn-helper/openai",
-    "LLM_MODEL_DEFAULT": "gpt-4o-mini",
-    "LLM_MODEL_PREMIUM": "gpt-4o"
+    // Universal Endpoint (compat mode). model에 "openai/" 등 공급자 prefix 필요.
+    "AI_GATEWAY_URL": "https://gateway.ai.cloudflare.com/v1/d2b8c5524b7259214fa302f1fecb4ad6/malgn-helper/compat",
+    "LLM_MODEL_DEFAULT": "openai/gpt-4o-mini",
+    "LLM_MODEL_PREMIUM": "openai/gpt-4o"
   }
 
   // OPENAI_API_KEY는 wrangler secret으로 등록 (코드·git 노출 금지)
