@@ -500,6 +500,166 @@ app.delete("/pms/briefings/:id", async (c) =>
   }),
 );
 
+// ── 표준 답변 카탈로그 (hp_standard_answer) ────────────
+// QaEvalCard "표준답변으로 저장" 액션의 destination + 챗봇 응답 1순위 소스.
+
+app.post("/standard-answers", async (c) =>
+  withConn(c, async (conn) => {
+    const body = await c.req.json<{
+      label?: string;
+      question?: string;
+      answer?: string;
+      projectId?: number | null;
+      sourcePostId?: number | null;
+      sourceAxis?: string | null;
+      createdBy?: string | null;
+    }>();
+    const label = (body.label ?? "").trim();
+    const question = (body.question ?? "").trim();
+    const answer = (body.answer ?? "").trim();
+    if (!label || !question || !answer) {
+      return c.json({ error: "label, question, answer required" }, 400);
+    }
+    if (label.length > 100) return c.json({ error: "label too long (<=100)" }, 400);
+    if (question.length > 10000 || answer.length > 10000) {
+      return c.json({ error: "question/answer too long (<=10000)" }, 400);
+    }
+
+    const [ins] = await conn.query(
+      `INSERT INTO hp_standard_answer
+         (label, question, answer, project_id, source_post_id, source_axis, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        label,
+        question,
+        answer,
+        body.projectId ?? null,
+        body.sourcePostId ?? null,
+        body.sourceAxis ?? null,
+        body.createdBy ?? null,
+      ],
+    );
+    return c.json({ ok: true, id: (ins as any).insertId }, 201);
+  }),
+);
+
+// 목록 + 검색 (LIKE 기반 — 한국어 짧은 키워드 호환). FULLTEXT는 향후 ngram parser 도입 시 전환.
+app.get("/standard-answers", async (c) =>
+  withConn(c, async (conn) => {
+    const q = (c.req.query("q") ?? "").trim();
+    const projectId = c.req.query("projectId");
+    const limit = Math.min(parseInt(c.req.query("limit") ?? "20", 10) || 20, 100);
+    const offset = Math.max(parseInt(c.req.query("offset") ?? "0", 10) || 0, 0);
+
+    const where: string[] = ["status = 1"];
+    const params: any[] = [];
+    if (projectId) {
+      // 해당 프로젝트 전용 + 전사 공통(NULL) 모두 포함
+      where.push("(project_id = ? OR project_id IS NULL)");
+      params.push(parseInt(projectId, 10));
+    }
+    if (q) {
+      where.push("(label LIKE ? OR question LIKE ? OR answer LIKE ?)");
+      const like = `%${q}%`;
+      params.push(like, like, like);
+    }
+    const whereSql = `WHERE ${where.join(" AND ")}`;
+
+    const [countRows] = await conn.query(
+      `SELECT COUNT(*) AS total FROM hp_standard_answer ${whereSql}`,
+      params,
+    );
+    const total = Number((countRows as any[])[0]?.total ?? 0);
+
+    // 정렬: 해당 프로젝트 전용 우선 → 사용량 많은 순 → 최신
+    const order = projectId
+      ? "(project_id IS NOT NULL) DESC, usage_count DESC, created_at DESC"
+      : "usage_count DESC, created_at DESC";
+
+    const [rows] = await conn.query(
+      `SELECT id, label, question, answer, project_id, source_post_id, source_axis,
+              created_by, usage_count, last_used_at, created_at, updated_at
+         FROM hp_standard_answer ${whereSql}
+     ORDER BY ${order}
+        LIMIT ${limit} OFFSET ${offset}`,
+      params,
+    );
+
+    return c.json({ total, limit, offset, rows });
+  }),
+);
+
+app.get("/standard-answers/:id", async (c) =>
+  withConn(c, async (conn) => {
+    const id = parseInt(c.req.param("id"), 10);
+    if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
+    const [rows] = await conn.query(
+      `SELECT * FROM hp_standard_answer WHERE id = ? AND status = 1`,
+      [id],
+    );
+    const r = (rows as any[])[0];
+    if (!r) return c.json({ error: "not found" }, 404);
+    return c.json(r);
+  }),
+);
+
+app.patch("/standard-answers/:id", async (c) =>
+  withConn(c, async (conn) => {
+    const id = parseInt(c.req.param("id"), 10);
+    if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
+    const body = await c.req.json<{
+      label?: string;
+      question?: string;
+      answer?: string;
+    }>();
+    const sets: string[] = [];
+    const params: any[] = [];
+    for (const k of ["label", "question", "answer"] as const) {
+      const v = body[k];
+      if (v !== undefined) {
+        const trimmed = String(v).trim();
+        if (!trimmed) return c.json({ error: `${k} empty` }, 400);
+        sets.push(`${k} = ?`);
+        params.push(trimmed);
+      }
+    }
+    if (!sets.length) return c.json({ error: "no fields" }, 400);
+    params.push(id);
+    const [result] = await conn.query(
+      `UPDATE hp_standard_answer SET ${sets.join(", ")} WHERE id = ? AND status = 1`,
+      params,
+    );
+    return c.json({ ok: true, affected: (result as any).affectedRows, changed: (result as any).changedRows });
+  }),
+);
+
+app.delete("/standard-answers/:id", async (c) =>
+  withConn(c, async (conn) => {
+    const id = parseInt(c.req.param("id"), 10);
+    if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
+    await conn.query(
+      `UPDATE hp_standard_answer SET status = -1 WHERE id = ?`,
+      [id],
+    );
+    return c.json({ ok: true });
+  }),
+);
+
+// 챗봇이 답변을 사용했을 때 usage_count 증가용 (Phase 2 챗봇 도입 시 호출)
+app.post("/standard-answers/:id/use", async (c) =>
+  withConn(c, async (conn) => {
+    const id = parseInt(c.req.param("id"), 10);
+    if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
+    await conn.query(
+      `UPDATE hp_standard_answer
+          SET usage_count = usage_count + 1, last_used_at = NOW()
+        WHERE id = ? AND status = 1`,
+      [id],
+    );
+    return c.json({ ok: true });
+  }),
+);
+
 // 게시글(문의) 1건 + 작성자 + (공개) 댓글 흐름.
 // 직원/고객 구분은 email 도메인(@malgnsoft.com) 기준. private_yn='Y' 댓글 본문은 마스킹.
 app.get("/pms/posts/:id", async (c) =>

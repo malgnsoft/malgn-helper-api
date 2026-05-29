@@ -36,6 +36,7 @@ export const openapiSpec = {
     { name: "health", description: "헬스체크" },
     { name: "wbs", description: "WBS Live Tracker — R2 단일 JSON 영속화" },
     { name: "pms", description: "PMS 게시판 연동 (Hyperdrive → MySQL)" },
+    { name: "standard-answers", description: "표준 답변 카탈로그 — 챗봇 응답 1순위 소스 (hp_standard_answer)" },
     { name: "db", description: "탐색용 임시 엔드포인트 (안정화 후 제거 예정)" },
   ],
   paths: {
@@ -227,6 +228,98 @@ export const openapiSpec = {
       delete: {
         tags: ["pms"],
         summary: "저장된 브리핑 soft-delete (status=-1)",
+        parameters: [{ name: "id", in: "path", required: true, schema: { type: "integer", minimum: 1 } }],
+        responses: { "200": { description: "OK" } },
+      },
+    },
+
+    "/standard-answers": {
+      post: {
+        tags: ["standard-answers"],
+        summary: "표준 답변 저장",
+        description: "QaEvalCard 'Save as standard answer' 액션의 destination. `hp_standard_answer` INSERT.",
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                required: ["label", "question", "answer"],
+                properties: {
+                  label: { type: "string", maxLength: 100 },
+                  question: { type: "string", maxLength: 10000 },
+                  answer: { type: "string", maxLength: 10000 },
+                  projectId: { type: ["integer", "null"], description: "NULL = 전사 공통" },
+                  sourcePostId: { type: ["integer", "null"] },
+                  sourceAxis: { type: ["string", "null"], description: "QaEval A~E" },
+                  createdBy: { type: ["string", "null"], description: "직원 email (인증 도입 후)" },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          "201": { description: "생성", content: { "application/json": { example: { ok: true, id: 1 } } } },
+          "400": { description: "필수 필드 누락 / 길이 초과" },
+        },
+      },
+      get: {
+        tags: ["standard-answers"],
+        summary: "표준 답변 목록·검색",
+        description:
+          "활성(status=1) 표준 답변. `projectId` 지정 시 해당 프로젝트 전용 + 전사 공통(NULL) 모두 포함. 검색은 LIKE (한국어 짧은 키워드 호환). FULLTEXT는 향후 ngram parser 도입 시 전환.",
+        parameters: [
+          { name: "q", in: "query", required: false, schema: { type: "string" }, description: "label/question/answer LIKE" },
+          { name: "projectId", in: "query", required: false, schema: { type: "integer" } },
+          { name: "limit", in: "query", required: false, schema: { type: "integer", default: 20, maximum: 100 } },
+          { name: "offset", in: "query", required: false, schema: { type: "integer", default: 0 } },
+        ],
+        responses: { "200": { description: "목록" } },
+      },
+    },
+
+    "/standard-answers/{id}": {
+      get: {
+        tags: ["standard-answers"],
+        summary: "표준 답변 단건",
+        parameters: [{ name: "id", in: "path", required: true, schema: { type: "integer", minimum: 1 } }],
+        responses: { "200": { description: "OK" }, "404": { description: "없음" } },
+      },
+      patch: {
+        tags: ["standard-answers"],
+        summary: "표준 답변 부분 수정",
+        description: "label/question/answer 중 보낸 필드만 갱신.",
+        parameters: [{ name: "id", in: "path", required: true, schema: { type: "integer", minimum: 1 } }],
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                properties: {
+                  label: { type: "string", maxLength: 100 },
+                  question: { type: "string", maxLength: 10000 },
+                  answer: { type: "string", maxLength: 10000 },
+                },
+              },
+            },
+          },
+        },
+        responses: { "200": { description: "OK" }, "400": { description: "필드 없음/빈 값" } },
+      },
+      delete: {
+        tags: ["standard-answers"],
+        summary: "표준 답변 soft-delete (status=-1)",
+        parameters: [{ name: "id", in: "path", required: true, schema: { type: "integer", minimum: 1 } }],
+        responses: { "200": { description: "OK" } },
+      },
+    },
+
+    "/standard-answers/{id}/use": {
+      post: {
+        tags: ["standard-answers"],
+        summary: "사용 카운트 증가 (챗봇 호출용)",
+        description: "Phase 2 챗봇이 답변을 사용할 때마다 호출. `usage_count` +1, `last_used_at` 갱신.",
         parameters: [{ name: "id", in: "path", required: true, schema: { type: "integer", minimum: 1 } }],
         responses: { "200": { description: "OK" } },
       },
