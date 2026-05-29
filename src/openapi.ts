@@ -179,6 +179,54 @@ export const openapiSpec = {
       },
     },
 
+    "/pms/projects/{id}/standard-answer-suggestions": {
+      post: {
+        tags: ["pms"],
+        summary: "표준답변 후보 자동 추출 (LLM)",
+        description:
+          "프로젝트의 직원(`@malgnsoft.com`) 응답 본문 50건을 모아 LLM이 반복 패턴을 분석. " +
+          "각 후보는 `label/question/answer/frequency`로 반환. 저장은 사용자가 `POST /standard-answers`로 별도 호출.\n\n" +
+          "**비공개 댓글(`private_yn='Y'`) 제외**. 30자 미만 짧은 응답 제외.\n\n" +
+          "캐시: 미적용 (가끔 트리거되는 액션). `?force=1`로 향후 캐시 도입 시 우회.\n" +
+          "비용 가이드: 1회당 약 $0.002 (≈ ₩3).",
+        parameters: [
+          { name: "id", in: "path", required: true, schema: { type: "integer", minimum: 1 } },
+          { name: "force", in: "query", required: false, schema: { type: "string", enum: ["1"] } },
+        ],
+        responses: {
+          "200": {
+            description: "후보 목록",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    suggestions: {
+                      type: "array",
+                      items: {
+                        type: "object",
+                        properties: {
+                          label: { type: "string" },
+                          question: { type: "string" },
+                          answer: { type: "string" },
+                          frequency: { type: "integer" },
+                        },
+                      },
+                    },
+                    sampleSize: { type: "integer" },
+                    llm: { type: "object" },
+                    note: { type: "string" },
+                  },
+                },
+              },
+            },
+          },
+          "502": { description: "LLM 호출 실패" },
+          "503": { description: "OPENAI_API_KEY 미설정" },
+        },
+      },
+    },
+
     "/pms/projects/{id}/briefing/generate": {
       post: {
         tags: ["pms"],

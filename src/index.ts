@@ -971,6 +971,129 @@ app.delete("/pms/evals/:id", async (c) =>
   }),
 );
 
+// ── 표준답변 후보 자동 추출 (LLM) ────────────────────────
+// 프로젝트의 직원 응답 본문을 모아 LLM이 반복 패턴을 표준답변 후보로 정리.
+// 저장은 별도 — UI에서 후보 검토 후 POST /standard-answers 호출.
+
+app.post("/pms/projects/:id/standard-answer-suggestions", async (c) =>
+  withConn(c, async (conn) => {
+    const id = parseInt(c.req.param("id"), 10);
+    if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
+    const force = c.req.query("force") === "1";
+    const t0 = Date.now();
+    const route = `POST /pms/projects/${id}/standard-answer-suggestions`;
+
+    if (!c.env.OPENAI_API_KEY) {
+      return c.json({ error: "LLM not configured" }, 503);
+    }
+
+    // 입력: 비공개 제외 staff 응답 본문 (최근, 짧은 것 제외)
+    const [rows] = await conn.query(
+      `SELECT c.content, p.subject AS post_subject
+         FROM tb_post_comment c
+         JOIN tb_post p ON p.id = c.post_id
+         JOIN tb_user u ON u.id = c.user_id
+        WHERE p.project_id = ? AND c.status = 1
+          AND u.email LIKE '%@malgnsoft.com'
+          AND c.private_yn != 'Y'
+          AND c.content IS NOT NULL AND CHAR_LENGTH(c.content) >= 30
+     ORDER BY c.reg_date DESC LIMIT 50`,
+      [id],
+    );
+    const messages = (rows as any[])
+      .map((r) => ({
+        subject: String(r.post_subject ?? "").trim(),
+        content: String(r.content ?? "").replace(/\s+/g, " ").slice(0, 600),
+      }))
+      .filter((m) => m.content.length >= 30);
+
+    if (messages.length < 5) {
+      return c.json({
+        suggestions: [],
+        sampleSize: messages.length,
+        note: "직원 응답이 5건 미만 — 표준답변 후보를 추출하기 어렵습니다.",
+      });
+    }
+
+    // 캐시 키: messages 본문 해시
+    const hashInput = JSON.stringify(messages.map((m) => m.content.slice(0, 200)));
+    const inputHash = await sha256Hex(hashInput);
+
+    if (!force) {
+      // hp_briefing/hp_qa_eval 캐시와 분리 — entity_type = 'sa_suggest'로 hp_llm_log 검색.
+      // 단순화: hp_briefing/qa_eval처럼 별도 테이블 없이, hp_llm_log에 결과 저장은 안 함.
+      // 캐시는 in-flight 미적용 — 후보 추출은 가끔 트리거되므로 매번 새로 호출.
+      // (필요 시 hp_sa_suggestion 신설하여 캐싱·재사용 가능)
+    }
+
+    let llm;
+    try {
+      llm = await callOpenAiJson<{
+        suggestions: Array<{
+          label: string;
+          question: string;
+          answer: string;
+          frequency: number;
+        }>;
+      }>(c.env, {
+        system: [
+          "You analyze Korean customer support staff replies and extract recurring answer patterns as standard answer candidates.",
+          "Inputs: an array of staff reply messages.",
+          "Output strict JSON:",
+          '{ "suggestions": [',
+          '    { "label": "<짧은 한국어 라벨, 4단어 이내>",',
+          '      "question": "<고객 입장에서 예상 질문, 1문장>",',
+          '      "answer": "<직원 응답들의 공통 패턴을 일반화한 답변, 100~300자>",',
+          '      "frequency": <이 패턴에 해당하는 추정 건수, int> }, ...',
+          "]}",
+          "규칙: 3~8개 후보. 진짜 반복되는 패턴만 (1~2건이면 제외).",
+          "answer는 특정 회사명·고객명·날짜 등 인스턴스 정보 제외, 일반화. label은 의미 분류용.",
+        ].join("\n"),
+        user: [
+          "다음은 한 프로젝트의 직원 응답 본문 목록입니다. 자주 반복되는 답변 패턴을 표준답변 후보로 추출해 주세요.",
+          "",
+          ...messages.map((m, i) => `[${i + 1}] (${m.subject})\n${m.content}`),
+        ].join("\n\n"),
+        maxTokens: 1500,
+        temperature: 0.3,
+      });
+    } catch (e) {
+      await conn.query(
+        `INSERT INTO hp_llm_log (route, entity_type, entity_id, model, latency_ms, cache_hit, error)
+         VALUES (?, 'sa_suggest', ?, 'openai/gpt-4o-mini', ?, 0, ?)`,
+        [route, id, Date.now() - t0, (e as Error).message],
+      );
+      return c.json({ error: (e as Error).message }, 502);
+    }
+
+    const totalLatency = Date.now() - t0;
+    await conn.query(
+      `INSERT INTO hp_llm_log
+         (route, entity_type, entity_id, model, prompt_tokens, completion_tokens, latency_ms, cost_usd, cache_hit)
+       VALUES (?, 'sa_suggest', ?, ?, ?, ?, ?, ?, 0)`,
+      [route, id, llm.model, llm.promptTokens, llm.completionTokens, llm.latencyMs, llm.costUsd],
+    );
+
+    return c.json({
+      suggestions: (llm.data.suggestions ?? []).slice(0, 8).map((s) => ({
+        label: String(s.label ?? "").slice(0, 100),
+        question: String(s.question ?? "").slice(0, 500),
+        answer: String(s.answer ?? "").slice(0, 1500),
+        frequency: Number(s.frequency ?? 0),
+      })),
+      sampleSize: messages.length,
+      inputHash,
+      llm: {
+        model: llm.model,
+        promptTokens: llm.promptTokens,
+        completionTokens: llm.completionTokens,
+        latencyMs: llm.latencyMs,
+        costUsd: llm.costUsd,
+      },
+    });
+  }),
+);
+
 // ── /admin/evals — Q&A 평가 목록·정렬·필터 ────────────────
 app.get("/admin/evals", async (c) =>
   withConn(c, async (conn) => {
