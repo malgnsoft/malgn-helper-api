@@ -645,6 +645,43 @@ app.post("/pms/projects/:id/briefing/generate", async (c) =>
         .map((r) => String(r.subject ?? "").trim())
         .filter((t) => t.length > 0);
 
+      // 입력 4: 180일 이내 고객 메시지 본문 (글+댓글, 비공개·직원·협력사 제외 → JS 필터)
+      const [customerVoiceRows] = await conn.query(
+        `SELECT 'post' AS kind, p.subject AS subject, p.content AS body,
+                u.name AS u_name, u.email AS u_email, u.company AS u_company, p.reg_date
+           FROM tb_post p
+           JOIN tb_user u ON u.id = p.user_id
+          WHERE p.project_id = ? AND p.status = 1
+            AND p.reg_date >= ${SINCE_14_SQL}
+            AND u.email NOT LIKE '%@malgnsoft.com'
+            AND p.content IS NOT NULL AND CHAR_LENGTH(p.content) > 10
+       ORDER BY p.reg_date DESC LIMIT 30`,
+        [id],
+      );
+      const [customerCommentRows] = await conn.query(
+        `SELECT 'comment' AS kind, '' AS subject, c.content AS body,
+                u.name AS u_name, u.email AS u_email, u.company AS u_company, c.reg_date
+           FROM tb_post_comment c
+           JOIN tb_user u ON u.id = c.user_id
+           JOIN tb_post p ON p.id = c.post_id
+          WHERE p.project_id = ? AND c.status = 1
+            AND c.reg_date >= ${SINCE_14_SQL}
+            AND c.private_yn != 'Y'
+            AND u.email NOT LIKE '%@malgnsoft.com'
+            AND c.content IS NOT NULL AND CHAR_LENGTH(c.content) > 10
+       ORDER BY c.reg_date DESC LIMIT 30`,
+        [id],
+      );
+      const customerVoices = ([...(customerVoiceRows as any[]), ...(customerCommentRows as any[])])
+        .filter((r) => !isPartner({ name: r.u_name, company: r.u_company }))
+        .slice(0, 30)
+        .map((r) => ({
+          kind: r.kind as "post" | "comment",
+          subject: String(r.subject ?? "").trim(),
+          body: String(r.body ?? "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").slice(0, 500),
+        }))
+        .filter((v) => v.body.length > 0);
+
       // 입력 3: 최근 staff 댓글 본문 20건 (policies 추출용, 비공개 제외, 전체 기간)
       const [staffMsgRows] = await conn.query(
         `SELECT c.content
@@ -695,11 +732,17 @@ app.post("/pms/projects/:id/briefing/generate", async (c) =>
           urgentCount: number;
           faq: string[];
           policies: Array<{ title: string; detail: string; source: string }>;
+          customerPersona?: {
+            tone: string;
+            communicationStyle: string;
+            traits: string[];
+            summary: string;
+          };
         }>(c.env, {
           system: [
             "You analyze a Korean customer support project and produce a concise briefing.",
             "Inputs have TWO distinct time windows — be careful which window each output uses:",
-            "  · RECENT_180 = 최근 180일 문의 (긴급도·운영 상태 신호용)",
+            "  · RECENT_180 = 최근 180일 문의 (긴급도·운영 상태·고객 톤 신호용)",
             "  · ALL = 전체 누적 문의 (반복 패턴·운영 정책 추출용)",
             "",
             "Output strict JSON:",
@@ -707,10 +750,19 @@ app.post("/pms/projects/:id/briefing/generate", async (c) =>
             '  "statusReason":"<최근 180일 기준 한 줄 사유, 30자 이내>",',
             '  "urgentCount":<RECENT_180 제목 중 긴급/장애/오류성 추정 건수, int>,',
             '  "faq":["<ALL 기준 자주 묻는 질문 패턴 1>","<2>","<3>", ...]   // 3~6개, 각 30자 이내,',
-            '  "policies":[{"title":"<짧은 정책명>","detail":"<2~3문장>","source":"<출처 요약, 예: 직원 응답 패턴>"}, ...]  // 0~3개, 직원 응답(ALL)에서 일관되게 관찰되는 응답 규칙만',
+            '  "policies":[{"title":"<짧은 정책명>","detail":"<2~3문장>","source":"<출처 요약, 예: 직원 응답 패턴>"}, ...]  // 0~3개, 직원 응답(ALL)에서 일관되게 관찰되는 응답 규칙만,',
+            '  "customerPersona":{',
+            '    "tone":"<짧은 한국어 형용사 1~2개, 예: 정중·차분 / 긴급·짜증 / 사무적>",',
+            '    "communicationStyle":"<한 줄, 30자 이내>",',
+            '    "traits":["<형용사/특징 1>","<2>","<3>", ...3~5개],',
+            '    "summary":"<1~2문장, 자연어 묘사>"',
+            "  }",
             "}",
-            "규칙: statusLabel/statusReason/urgentCount는 RECENT_180만. faq/policies는 ALL.",
-            "RECENT_180이 비어있으면 statusLabel='휴면', urgentCount=0.",
+            "규칙:",
+            "  · statusLabel/statusReason/urgentCount/customerPersona는 RECENT_180 고객 메시지 기준",
+            "  · faq/policies는 ALL 기준",
+            "  · RECENT_180이 비어있으면 statusLabel='휴면', urgentCount=0, customerPersona는 빈 객체",
+            "  · customerPersona는 개별 사용자 한 명이 아니라 고객사 전체의 평균적 응대 톤·태도",
           ].join("\n"),
           user: [
             `프로젝트 통계 (RECENT_180): ${JSON.stringify(summary)}`,
@@ -720,13 +772,20 @@ app.post("/pms/projects/:id/briefing/generate", async (c) =>
               ? recentTitles.slice(0, 100).map((t, i) => `${i + 1}. ${t}`).join("\n")
               : "(없음)",
             "",
+            `=== RECENT_180 — 고객 메시지 본문 (${customerVoices.length}건, 비공개·직원·협력사 제외, 최신순) ===`,
+            customerVoices.length > 0
+              ? customerVoices
+                  .map((v, i) => `${i + 1}. [${v.kind}]${v.subject ? ` (${v.subject})` : ""} ${v.body}`)
+                  .join("\n")
+              : "(없음)",
+            "",
             `=== ALL — 전체 누적 문의 제목 (최대 100건, 최신순) ===`,
             titles.slice(0, 100).map((t, i) => `${i + 1}. ${t}`).join("\n"),
             "",
             `=== ALL — 직원 응답 본문 (최대 20건, 비공개 제외) ===`,
             staffMessages.map((m, i) => `${i + 1}. ${m}`).join("\n"),
           ].join("\n"),
-          maxTokens: 900,
+          maxTokens: 1200,
           temperature: 0.2,
         });
 
@@ -751,6 +810,20 @@ app.post("/pms/projects/:id/briefing/generate", async (c) =>
             detail: String(p.detail ?? "").slice(0, 300),
             source: String(p.source ?? "").slice(0, 80),
           }));
+          // 고객 톤·태도·특징 (RECENT_180 고객 메시지 기반)
+          const persona = v.data.customerPersona;
+          if (persona && (persona.tone || persona.summary || (persona.traits && persona.traits.length))) {
+            briefing.customer.persona = {
+              tone: String(persona.tone ?? "").slice(0, 30),
+              communicationStyle: String(persona.communicationStyle ?? "").slice(0, 80),
+              traits: (persona.traits ?? [])
+                .filter((s: unknown) => typeof s === "string")
+                .slice(0, 6)
+                .map((s: string) => s.slice(0, 30)),
+              summary: String(persona.summary ?? "").slice(0, 300),
+              sampleSize: customerVoices.length,
+            };
+          }
           accumulate(v);
         } else {
           const prev = llmError ? `${llmError}; ` : "";
