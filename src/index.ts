@@ -451,7 +451,8 @@ app.post("/pms/projects/:id/briefing/generate", async (c) =>
       llmModel = r.model;
       llmPromptTokens = (llmPromptTokens ?? 0) + r.promptTokens;
       llmCompletionTokens = (llmCompletionTokens ?? 0) + r.completionTokens;
-      llmLatencyMs = (llmLatencyMs ?? 0) + r.latencyMs;
+      // 병렬 호출이므로 wall-clock은 max
+      llmLatencyMs = Math.max(llmLatencyMs ?? 0, r.latencyMs);
       llmCostUsd = (llmCostUsd ?? 0) + r.costUsd;
       generator = "hybrid";
     }
@@ -485,89 +486,90 @@ app.post("/pms/projects/:id/briefing/generate", async (c) =>
         .map((r) => String(r.content ?? "").replace(/\s+/g, " ").slice(0, 400))
         .filter((s) => s.length > 0);
 
-      // ── LLM 1: hotTopics 군집화 ───────────────────────
       if (titles.length >= 5) {
-        try {
-          const llm = await callOpenAiJson<{ topics: Array<{ name: string; count: number }> }>(
-            c.env,
-            {
-              system:
-                "You analyze Korean customer support inquiry titles and cluster them into 3 to 7 topics. " +
-                'Reply with JSON: {"topics":[{"name":"<짧은 한국어, 4단어 이내>","count":<int>}, ...]}. ' +
-                "Sort topics by count desc. Counts should approximate how many titles belong to each topic.",
-              user:
-                "다음은 한 프로젝트의 최근 고객 문의 제목 목록입니다. 의미 단위로 3~7개 토픽으로 군집화하고, 각 토픽의 건수를 추정해 주세요.\n\n" +
-                titles.map((t, i) => `${i + 1}. ${t}`).join("\n"),
-              maxTokens: 500,
-              temperature: 0.2,
-            },
-          );
-          briefing.hotTopics = (llm.data.topics ?? []).slice(0, 7);
-          accumulate(llm);
-        } catch (e) {
-          llmError = `hotTopics: ${(e as Error).message}`;
-        }
-      }
+        // ── LLM 1·2 병렬 호출 ─────────────────────────────
+        const summary = {
+          projectName: briefing.meta.projectName,
+          total: briefing.stats.total,
+          unanswered: briefing.stats.unanswered,
+          avgFRT: briefing.stats.avgFRT,
+          lastActivity: briefing.meta.lastActivity,
+          staffCount: briefing.staff.primary.length + briefing.staff.aux.length,
+          customerPrimary: briefing.customer.primary?.name,
+        };
 
-      // ── LLM 2: 추가 분석 (oneLiner / statusReason / urgentCount / faq / policies) ──
-      if (titles.length >= 5) {
-        try {
-          const summary = {
-            projectName: briefing.meta.projectName,
-            total: briefing.stats.total,
-            unanswered: briefing.stats.unanswered,
-            avgFRT: briefing.stats.avgFRT,
-            lastActivity: briefing.meta.lastActivity,
-            staffCount: briefing.staff.primary.length + briefing.staff.aux.length,
-            customerPrimary: briefing.customer.primary?.name,
-          };
-
-          const llm = await callOpenAiJson<{
-            statusLabel: string;
-            statusReason: string;
-            urgentCount: number;
-            faq: string[];
-            policies: Array<{ title: string; detail: string; source: string }>;
-          }>(c.env, {
-            system: [
-              "You analyze a Korean customer support project and produce a concise briefing.",
-              "Inputs: project stats summary + recent inquiry titles + recent staff replies.",
-              "Output strict JSON:",
-              '{ "statusLabel":"<짧은 한국어 라벨, 예: 주의/원활/긴급, 4글자 이내>",',
-              '  "statusReason":"<한 줄 사유, 30자 이내>",',
-              '  "urgentCount":<제목 100개 중 긴급/장애/오류성 추정 건수, int>,',
-              '  "faq":["<자주 묻는 질문 패턴 1>","<2>","<3>", ...]   // 3~6개, 각 30자 이내,',
-              '  "policies":[{"title":"<짧은 정책명>","detail":"<2~3문장>","source":"<출처 요약, 예: 직원 응답 패턴>"}, ...]  // 0~3개, 직원 응답에서 일관되게 관찰되는 응답 규칙만',
-              "}",
-              "FAQ는 실제 제목들에서 반복 패턴이 보일 때만. POLICIES는 staff 응답에서 명확한 규칙이 보일 때만(없으면 빈 배열).",
-            ].join("\n"),
-            user: [
-              `프로젝트 통계: ${JSON.stringify(summary)}`,
-              "",
-              "=== 최근 문의 제목 (최대 100건) ===",
-              titles.slice(0, 100).map((t, i) => `${i + 1}. ${t}`).join("\n"),
-              "",
-              "=== 최근 직원 응답 본문 (최대 20건, 비공개 제외) ===",
-              staffMessages.map((m, i) => `${i + 1}. ${m}`).join("\n"),
-            ].join("\n"),
-            maxTokens: 900,
+        const topicsPromise = callOpenAiJson<{ topics: Array<{ name: string; count: number }> }>(
+          c.env,
+          {
+            system:
+              "You analyze Korean customer support inquiry titles and cluster them into 3 to 7 topics. " +
+              'Reply with JSON: {"topics":[{"name":"<짧은 한국어, 4단어 이내>","count":<int>}, ...]}. ' +
+              "Sort topics by count desc. Counts should approximate how many titles belong to each topic.",
+            user:
+              "다음은 한 프로젝트의 최근 고객 문의 제목 목록입니다. 의미 단위로 3~7개 토픽으로 군집화하고, 각 토픽의 건수를 추정해 주세요.\n\n" +
+              titles.map((t, i) => `${i + 1}. ${t}`).join("\n"),
+            maxTokens: 500,
             temperature: 0.2,
-          });
+          },
+        );
 
-          // 메타 업데이트 (DB-only 룰 결과 위에 덮어쓰기)
-          if (llm.data.statusLabel) briefing.meta.statusLabel = llm.data.statusLabel.slice(0, 10);
-          if (llm.data.statusReason) briefing.meta.statusReason = llm.data.statusReason.slice(0, 60);
-          if (typeof llm.data.urgentCount === "number") briefing.stats.urgent = llm.data.urgentCount;
-          briefing.faq = (llm.data.faq ?? []).filter((s) => typeof s === "string").slice(0, 6);
-          briefing.policies = (llm.data.policies ?? []).slice(0, 3).map((p) => ({
+        const extrasPromise = callOpenAiJson<{
+          statusLabel: string;
+          statusReason: string;
+          urgentCount: number;
+          faq: string[];
+          policies: Array<{ title: string; detail: string; source: string }>;
+        }>(c.env, {
+          system: [
+            "You analyze a Korean customer support project and produce a concise briefing.",
+            "Inputs: project stats summary + recent inquiry titles + recent staff replies.",
+            "Output strict JSON:",
+            '{ "statusLabel":"<짧은 한국어 라벨, 예: 주의/원활/긴급, 4글자 이내>",',
+            '  "statusReason":"<한 줄 사유, 30자 이내>",',
+            '  "urgentCount":<제목 100개 중 긴급/장애/오류성 추정 건수, int>,',
+            '  "faq":["<자주 묻는 질문 패턴 1>","<2>","<3>", ...]   // 3~6개, 각 30자 이내,',
+            '  "policies":[{"title":"<짧은 정책명>","detail":"<2~3문장>","source":"<출처 요약, 예: 직원 응답 패턴>"}, ...]  // 0~3개, 직원 응답에서 일관되게 관찰되는 응답 규칙만',
+            "}",
+            "FAQ는 실제 제목들에서 반복 패턴이 보일 때만. POLICIES는 staff 응답에서 명확한 규칙이 보일 때만(없으면 빈 배열).",
+          ].join("\n"),
+          user: [
+            `프로젝트 통계: ${JSON.stringify(summary)}`,
+            "",
+            "=== 최근 문의 제목 (최대 100건) ===",
+            titles.slice(0, 100).map((t, i) => `${i + 1}. ${t}`).join("\n"),
+            "",
+            "=== 최근 직원 응답 본문 (최대 20건, 비공개 제외) ===",
+            staffMessages.map((m, i) => `${i + 1}. ${m}`).join("\n"),
+          ].join("\n"),
+          maxTokens: 900,
+          temperature: 0.2,
+        });
+
+        // 한쪽 실패해도 나머지는 유지 — allSettled
+        const [topicsR, extrasR] = await Promise.allSettled([topicsPromise, extrasPromise]);
+
+        if (topicsR.status === "fulfilled") {
+          briefing.hotTopics = (topicsR.value.data.topics ?? []).slice(0, 7);
+          accumulate(topicsR.value);
+        } else {
+          llmError = `hotTopics: ${(topicsR.reason as Error).message}`;
+        }
+
+        if (extrasR.status === "fulfilled") {
+          const v = extrasR.value;
+          if (v.data.statusLabel) briefing.meta.statusLabel = v.data.statusLabel.slice(0, 10);
+          if (v.data.statusReason) briefing.meta.statusReason = v.data.statusReason.slice(0, 60);
+          if (typeof v.data.urgentCount === "number") briefing.stats.urgent = v.data.urgentCount;
+          briefing.faq = (v.data.faq ?? []).filter((s) => typeof s === "string").slice(0, 6);
+          briefing.policies = (v.data.policies ?? []).slice(0, 3).map((p) => ({
             title: String(p.title ?? "").slice(0, 50),
             detail: String(p.detail ?? "").slice(0, 300),
             source: String(p.source ?? "").slice(0, 80),
           }));
-          accumulate(llm);
-        } catch (e) {
+          accumulate(v);
+        } else {
           const prev = llmError ? `${llmError}; ` : "";
-          llmError = `${prev}extras: ${(e as Error).message}`;
+          llmError = `${prev}extras: ${(extrasR.reason as Error).message}`;
         }
       }
     }
