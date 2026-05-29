@@ -161,10 +161,12 @@ app.get("/pms/projects", async (c) =>
     const total = Number((countRows as any[])[0]?.total ?? 0);
 
     const [rows] = await conn.query(
-      `SELECT p.id, p.name, p.buyer, p.status, p.reg_date,
+      `SELECT p.id, p.name, p.buyer, p.status, p.reg_date, p.group_id,
+              g.name AS group_name,
               (SELECT COUNT(*) FROM tb_post WHERE project_id = p.id AND status = 1) AS post_count,
               (SELECT MAX(reg_date) FROM tb_post WHERE project_id = p.id AND status = 1) AS last_activity
          FROM tb_project p
+    LEFT JOIN tb_project_group g ON g.id = p.group_id AND g.status = 1
          ${whereSql}
      ORDER BY last_activity DESC, p.id DESC
         LIMIT ${limit} OFFSET ${offset}`,
@@ -180,6 +182,8 @@ app.get("/pms/projects", async (c) =>
         name: r.name,
         buyer: r.buyer,
         active: r.status === 1,
+        groupId: r.group_id,
+        groupName: r.group_name ?? null,
         postCount: Number(r.post_count ?? 0),
         lastActivity: toIso(r.last_activity),
       })),
