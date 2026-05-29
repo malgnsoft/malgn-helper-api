@@ -283,9 +283,10 @@ async function buildBriefingDbOnly(conn: any, id: number): Promise<any | null> {
       [id, id],
     );
 
-    // post 통계: 누적 총수(전체) / 첫·마지막 활동(전체)
+    // post 통계: 누적 총수(전체) + 180일 / 첫·마지막 활동(전체)
     const [statsRows] = await conn.query(
       `SELECT COUNT(*) AS total,
+              SUM(CASE WHEN reg_date >= ${SINCE_14_SQL} THEN 1 ELSE 0 END) AS recent_total,
               MIN(reg_date) AS first_post,
               MAX(reg_date) AS last_post
          FROM tb_post WHERE project_id = ? AND status = 1`,
@@ -399,7 +400,21 @@ async function buildBriefingDbOnly(conn: any, id: number): Promise<any | null> {
     const staffs = members.filter((m) => m.is_staff === 1);
     const hasRecentActivity = members.length > 0;
 
-    const primaryCustomer = customers[0] ?? null;
+    // 이름 없는 user는 email 로컬파트로 fallback
+    const displayName = (m: any): string => {
+      const n = String(m?.name ?? "").trim();
+      if (n) return n;
+      const e = String(m?.email ?? "");
+      const local = e.includes("@") ? e.split("@")[0] : e;
+      return local || "(이름 미상)";
+    };
+    // name이 있는 고객 우선 정렬
+    const sortedCustomers = [...customers].sort((a, b) => {
+      const an = String(a?.name ?? "").trim() ? 1 : 0;
+      const bn = String(b?.name ?? "").trim() ? 1 : 0;
+      return bn - an;
+    });
+    const primaryCustomer = sortedCustomers[0] ?? null;
     const monthOf = (d: string | null) => (d && d.length >= 6 ? `${d.slice(0, 4)}-${d.slice(4, 6)}` : null);
 
     const alerts: any[] = [];
@@ -453,10 +468,10 @@ async function buildBriefingDbOnly(conn: any, id: number): Promise<any | null> {
       },
       customer: {
         primary: primaryCustomer
-          ? { name: primaryCustomer.name, email: primaryCustomer.email, role: primaryCustomer.rank || primaryCustomer.company }
+          ? { name: displayName(primaryCustomer), email: primaryCustomer.email, role: primaryCustomer.rank || primaryCustomer.company }
           : { name: hasRecentActivity ? "(최근 고객 멤버 없음)" : `(최근 ${RECENT_DAYS}일 문의 없음)`, email: "", role: "" },
-        others: customers.slice(1, 6).map((m) => ({
-          name: m.name,
+        others: sortedCustomers.slice(1, 6).map((m) => ({
+          name: displayName(m),
           email: m.email,
           role: m.rank || m.company,
         })),
@@ -474,7 +489,9 @@ async function buildBriefingDbOnly(conn: any, id: number): Promise<any | null> {
         })),
       },
       stats: {
-        total: Number(stats0.total ?? 0), // 전체 누적
+        total: Number(stats0.total ?? 0),  // 전체 누적
+        recent: Number(stats0.recent_total ?? 0), // 180일 문의수
+        recentDays: RECENT_DAYS,
         avgFRT,                            // 180일 이내 영업시간
         avgFRTGrade,                       // 매우 빠름 / 빠른 편 / 보통 / 느린 편 / 응답 지연
         avgFRTNote: `${avgFRTGrade} · 영업시간 기준 (평일 ${BUSINESS_START_HOUR}:00~${BUSINESS_END_HOUR}:00, 공휴일 제외)`,
