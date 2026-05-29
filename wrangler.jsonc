@@ -9,10 +9,13 @@
 
   "r2_buckets": [
     { "binding": "R2", "bucket_name": "malgn-helper-files" }
+  ],
+
+  "hyperdrive": [
+    { "binding": "HYPERDRIVE", "id": "aea36082dfd84125a0da2063d5b8e5e0" }
   ]
 
   // 추후 활성화할 바인딩
-  // "hyperdrive": [{ "binding": "HYPERDRIVE", "id": "<HYPERDRIVE_ID>" }],
   // "ai": { "binding": "AI" },
   // "vars": { "OPENSEARCH_ENDPOINT": "https://...", "AI_GATEWAY_URL": "https://gateway.ai.cloudflare.com/..." }
 }

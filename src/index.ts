@@ -1,9 +1,10 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
+import { createConnection } from "mysql2/promise";
 
 type Bindings = {
   R2: R2Bucket;
-  // HYPERDRIVE: Hyperdrive;
+  HYPERDRIVE: Hyperdrive;
   // AI: Ai;
 };
 
@@ -42,6 +43,27 @@ app.get("/wbs", async (c) => {
       ETag: etag,
     },
   });
+});
+
+// ── DB (Hyperdrive → MySQL) ─────────────────────────────
+app.get("/db/ping", async (c) => {
+  const hd = c.env.HYPERDRIVE;
+  const conn = await createConnection({
+    host: hd.host,
+    user: hd.user,
+    password: hd.password,
+    database: hd.database,
+    port: hd.port,
+    disableEval: true, // Workers는 eval 불가
+  });
+  try {
+    const [rows] = await conn.query("SELECT 1 AS ok, NOW() AS now, VERSION() AS version");
+    return c.json({ ok: true, rows });
+  } catch (e) {
+    return c.json({ ok: false, error: (e as Error).message }, 500);
+  } finally {
+    c.executionCtx.waitUntil(conn.end());
+  }
 });
 
 app.put("/wbs", async (c) => {
