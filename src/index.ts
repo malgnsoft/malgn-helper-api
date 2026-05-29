@@ -296,39 +296,59 @@ const RECENT_DAYS = 180;
 // reg_date가 varchar(14) 'YYYYMMDDHHMMSS' 포맷이므로 cutoff도 같은 문자열로 비교 (인덱스 활용)
 const SINCE_14_SQL = `DATE_FORMAT(DATE_SUB(NOW(), INTERVAL ${RECENT_DAYS} DAY), '%Y%m%d%H%i%s')`;
 
-async function buildBriefingDbOnly(conn: any, id: number): Promise<{ briefing: any; staffIds: number[] } | null> {
+async function buildBriefingDbOnly(conn: any, id: number, timings?: Record<string, number>): Promise<{ briefing: any; staffIds: number[] } | null> {
+    const tick = (label: string, started: number) => {
+      if (timings) timings[label] = Date.now() - started;
+    };
+    let t = Date.now();
     const [projRows] = await conn.query(
       `SELECT id, name, description, buyer, start_date, end_date, status
          FROM tb_project WHERE id = ?`,
       [id],
     );
+    tick("project", t);
     const proj = (projRows as any[])[0];
     if (!proj) return null;
 
     // staff user id 캐시 (이후 모든 쿼리에서 IN/NOT IN으로 사용 — email LIKE 풀스캔 회피)
+    t = Date.now();
     const [staffUserRows] = await conn.query(
       `SELECT id FROM tb_user WHERE email LIKE '%@malgnsoft.com' AND status = 1`,
     );
+    tick("staffIds", t);
     const staffIds = (staffUserRows as any[]).map((r) => Number(r.id));
     const staffIdsSql = staffIds.length > 0 ? staffIds.join(",") : "0"; // 빈 경우 매치 안 되도록 0
 
-    // 멤버: 최근 180일 글 또는 댓글에 참여한 user
-    const [memberRows] = await conn.query(
+    // 멤버: 최근 180일 글 또는 댓글에 참여한 user.
+    // 한 쿼리(IN UNION 서브쿼리)가 매우 느렸음 — 3단계로 분리해 각 인덱스를 살린다.
+    t = Date.now();
+    const [postUserRows] = await conn.query(
+      `SELECT DISTINCT user_id FROM tb_post
+        WHERE project_id = ? AND status = 1 AND reg_date >= ${SINCE_14_SQL}`,
+      [id],
+    );
+    const [commentUserRows] = await conn.query(
+      `SELECT DISTINCT c.user_id FROM tb_post_comment c
+         JOIN tb_post p ON p.id = c.post_id
+        WHERE p.project_id = ? AND c.status = 1 AND c.reg_date >= ${SINCE_14_SQL}`,
+      [id],
+    );
+    const memberUserIds = Array.from(
+      new Set([
+        ...(postUserRows as any[]).map((r) => Number(r.user_id)),
+        ...(commentUserRows as any[]).map((r) => Number(r.user_id)),
+      ]),
+    ).filter((n) => Number.isFinite(n) && n > 0);
+    const memberRows: any[] = memberUserIds.length > 0 ? ((await conn.query(
       `SELECT u.id, u.name, u.email, u.company, u.rank,
               (u.id IN (${staffIdsSql})) AS is_staff
          FROM tb_user u
-        WHERE u.status = 1 AND u.id IN (
-          SELECT user_id FROM tb_post
-           WHERE project_id = ? AND status = 1 AND reg_date >= ${SINCE_14_SQL}
-          UNION
-          SELECT c.user_id FROM tb_post_comment c
-            JOIN tb_post p ON p.id = c.post_id
-           WHERE p.project_id = ? AND c.status = 1 AND c.reg_date >= ${SINCE_14_SQL}
-        )`,
-      [id, id],
-    );
+        WHERE u.status = 1 AND u.id IN (${memberUserIds.join(",")})`
+    ))[0] as any[]) : [];
+    tick("members", t);
 
     // post 통계: 누적 총수(전체) + 180일 / 첫·마지막 활동(전체)
+    t = Date.now();
     const [statsRows] = await conn.query(
       `SELECT COUNT(*) AS total,
               SUM(CASE WHEN reg_date >= ${SINCE_14_SQL} THEN 1 ELSE 0 END) AS recent_total,
@@ -337,9 +357,11 @@ async function buildBriefingDbOnly(conn: any, id: number): Promise<{ briefing: a
          FROM tb_post WHERE project_id = ? AND status = 1`,
       [id],
     );
+    tick("stats", t);
     const stats0 = (statsRows as any[])[0];
 
     // 라벨 분포 (전체, 상위 6)
+    t = Date.now();
     const [labelRows] = await conn.query(
       `SELECT label, COUNT(*) AS cnt
          FROM tb_post
@@ -350,7 +372,10 @@ async function buildBriefingDbOnly(conn: any, id: number): Promise<{ briefing: a
       [id],
     );
 
+    tick("labels", t);
+
     // 직원별 응대 건수 — 최근 180일 댓글 (staff user IN)
+    t = Date.now();
     const [staffRows] = await conn.query(
       `SELECT u.name, u.rank, COUNT(c.id) AS cnt
          FROM tb_post_comment c
@@ -365,7 +390,10 @@ async function buildBriefingDbOnly(conn: any, id: number): Promise<{ briefing: a
       [id],
     );
 
+    tick("staffRanking", t);
+
     // 미응답: 최근 180일 글 중 직원 댓글 없는 고객 글 (staff IN, 인덱스 효율)
+    t = Date.now();
     const [unansweredRows] = await conn.query(
       `SELECT COUNT(*) AS cnt
          FROM tb_post p
@@ -379,9 +407,11 @@ async function buildBriefingDbOnly(conn: any, id: number): Promise<{ briefing: a
           )`,
       [id],
     );
+    tick("unanswered", t);
     const unanswered = (unansweredRows as any[])[0]?.cnt ?? 0;
 
     // 가장 오래된 미응답 1건 (180일 이내, 알림용)
+    t = Date.now();
     const [oldestUnansweredRows] = await conn.query(
       `SELECT p.id, p.subject, p.reg_date, p.writer
          FROM tb_post p
@@ -397,10 +427,12 @@ async function buildBriefingDbOnly(conn: any, id: number): Promise<{ briefing: a
         LIMIT 1`,
       [id],
     );
+    tick("oldestUnanswered", t);
     const oldestUnanswered = (oldestUnansweredRows as any[])[0];
 
     // 평균 첫 응답 시간 — raw pair 만 가져와서 JS에서 영업시간 계산
     // (월~금 09:00~17:00 KST, 한국 공휴일 제외, 180일 이내 글만)
+    t = Date.now();
     const [frtRows] = await conn.query(
       `SELECT p.reg_date AS post_at, MIN(c.reg_date) AS first_at
          FROM tb_post p
@@ -423,6 +455,7 @@ async function buildBriefingDbOnly(conn: any, id: number): Promise<{ briefing: a
       businessMinutes.length > 0
         ? businessMinutes.reduce((acc, x) => acc + x, 0) / businessMinutes.length
         : NaN;
+    tick("frt", t);
     const avgFRT = formatBusinessFrt(Number.isFinite(avgMinutes) ? avgMinutes : null);
     // 영업시간 분 기준 등급 (1영업일 = 480min)
     const avgFRTGrade = (() => {
@@ -656,7 +689,10 @@ app.post("/pms/projects/:id/briefing/generate", async (c) =>
     }
 
     // 캐시 miss — buildBriefingDbOnly 실행
-    const built = await buildBriefingDbOnly(conn, id);
+    const dbTimings: Record<string, number> = {};
+    const tBuildStart = Date.now();
+    const built = await buildBriefingDbOnly(conn, id, dbTimings);
+    dbTimings.buildTotal = Date.now() - tBuildStart;
     if (!built) return c.json({ error: "not found" }, 404);
     const briefing = built.briefing;
     const staffIds = built.staffIds;
@@ -696,6 +732,7 @@ app.post("/pms/projects/:id/briefing/generate", async (c) =>
     }
 
     if (!skipLlm && c.env.OPENAI_API_KEY) {
+      const tLlmInputStart = Date.now();
       // 입력 1: 전체 최근 제목 100개 (hotTopics/faq용)
       const [titleRows] = await conn.query(
         `SELECT subject FROM tb_post
@@ -722,7 +759,7 @@ app.post("/pms/projects/:id/briefing/generate", async (c) =>
 
       // 입력 4: 180일 이내 고객 메시지 본문 (글+댓글, 비공개·직원·협력사 제외 → JS 필터)
       const [customerVoiceRows] = await conn.query(
-        `SELECT 'post' AS kind, p.subject AS subject, p.content AS body,
+        `SELECT 'post' AS kind, p.subject AS subject, SUBSTRING(p.content, 1, 1000) AS body,
                 u.name AS u_name, u.email AS u_email, u.company AS u_company, p.reg_date
            FROM tb_post p
            JOIN tb_user u ON u.id = p.user_id
@@ -734,7 +771,7 @@ app.post("/pms/projects/:id/briefing/generate", async (c) =>
         [id],
       );
       const [customerCommentRows] = await conn.query(
-        `SELECT 'comment' AS kind, '' AS subject, c.content AS body,
+        `SELECT 'comment' AS kind, '' AS subject, SUBSTRING(c.content, 1, 1000) AS body,
                 u.name AS u_name, u.email AS u_email, u.company AS u_company, c.reg_date
            FROM tb_post_comment c
            JOIN tb_user u ON u.id = c.user_id
@@ -759,7 +796,7 @@ app.post("/pms/projects/:id/briefing/generate", async (c) =>
 
       // 입력 3: 최근 staff 댓글 본문 20건 (policies 추출용, 비공개 제외, 전체 기간)
       const [staffMsgRows] = await conn.query(
-        `SELECT c.content
+        `SELECT SUBSTRING(c.content, 1, 800) AS content
            FROM tb_post_comment c
            JOIN tb_post p ON p.id = c.post_id
           WHERE p.project_id = ? AND c.status = 1
@@ -769,6 +806,7 @@ app.post("/pms/projects/:id/briefing/generate", async (c) =>
        ORDER BY c.reg_date DESC LIMIT 20`,
         [id],
       );
+      dbTimings.llmInputs = Date.now() - tLlmInputStart;
       const staffMessages = (staffMsgRows as any[])
         .map((r) => String(r.content ?? "").replace(/\s+/g, " ").slice(0, 400))
         .filter((s) => s.length > 0);
@@ -986,6 +1024,7 @@ app.post("/pms/projects/:id/briefing/generate", async (c) =>
         ? { model: llmModel, promptTokens: llmPromptTokens, completionTokens: llmCompletionTokens, costUsd: llmCostUsd, latencyMs: llmLatencyMs }
         : null,
       llmError,
+      timings: dbTimings,
     });
   }),
 );
