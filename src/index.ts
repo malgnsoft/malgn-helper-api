@@ -498,20 +498,16 @@ async function buildBriefingDbOnly(conn: any, id: number): Promise<any | null> {
                 : (primaryCustomer.rank || primaryCustomer.company || "담당"),
             }
           : { name: hasRecentActivity ? "(최근 고객 멤버 없음)" : `(최근 ${RECENT_DAYS}일 문의 없음)`, email: "", role: "" },
-        others: [
-          ...sortedCustomers.filter((m) => m !== primaryCustomer).slice(0, 6).map((m) => ({
+        others: sortedCustomers
+          .filter((m) => m !== primaryCustomer)
+          .slice(0, 8)
+          .map((m) => ({
             name: displayName(m),
             email: m.email,
             role: m.rank || m.company || "고객",
           })),
-          ...sortedPartners.filter((m) => m !== primaryCustomer).slice(0, 6).map((m) => ({
-            name: displayName(m),
-            email: m.email,
-            role: `협력사${m.rank ? ` · ${m.rank}` : ""}`,
-          })),
-        ].slice(0, 8),
-        note: pureCustomers.length + partners.length > 8
-          ? `+ ${pureCustomers.length + partners.length - 8}명`
+        note: pureCustomers.length > 9
+          ? `+ ${pureCustomers.length - 9}명`
           : undefined,
       },
       partners: sortedPartners.map((m) => ({
@@ -750,6 +746,12 @@ app.post("/pms/projects/:id/briefing/generate", async (c) =>
             traits: string[];
             summary: string;
           };
+          staffPersona?: {
+            tone: string;
+            communicationStyle: string;
+            traits: string[];
+            summary: string;
+          };
         }>(c.env, {
           system: [
             "You analyze a Korean customer support project and extract additional briefing fields.",
@@ -766,13 +768,21 @@ app.post("/pms/projects/:id/briefing/generate", async (c) =>
             '    "communicationStyle":"<한 줄, 30자 이내>",',
             '    "traits":["<형용사/특징 1>","<2>","<3>", ...3~5개],',
             '    "summary":"<1~2문장, 자연어 묘사>"',
+            "  },",
+            '  "staffPersona":{',
+            '    "tone":"<상담사 답변의 짧은 한국어 형용사 1~2개, 예: 신속·친절 / 사무적·정확 / 격식>",',
+            '    "communicationStyle":"<한 줄, 30자 이내>",',
+            '    "traits":["<형용사/특징 1>","<2>","<3>", ...3~5개],',
+            '    "summary":"<1~2문장, 자연어 묘사>"',
             "  }",
             "}",
             "규칙:",
             "  · urgentCount/customerPersona는 RECENT_180 기준",
+            "  · staffPersona는 ALL 기준 (전체 직원 응답 본문 기반)",
             "  · faq/policies는 ALL 기준",
             "  · RECENT_180이 비어있으면 urgentCount=0, customerPersona는 빈 객체",
-            "  · customerPersona는 개별 사용자 한 명이 아니라 고객사 전체의 평균적 응대 톤·태도",
+            "  · customerPersona = 고객사 평균 문의 톤·태도",
+            "  · staffPersona = 상담사(직원) 평균 답변 톤·태도",
           ].join("\n"),
           user: [
             `프로젝트 통계 (RECENT_180): ${JSON.stringify(summary)}`,
@@ -844,6 +854,20 @@ app.post("/pms/projects/:id/briefing/generate", async (c) =>
                 .map((s: string) => s.slice(0, 30)),
               summary: String(persona.summary ?? "").slice(0, 300),
               sampleSize: customerVoices.length,
+            };
+          }
+          // 상담사 답변 톤·태도·특징 (ALL 직원 응답 본문 기반)
+          const sp = v.data.staffPersona;
+          if (sp && (sp.tone || sp.summary || (sp.traits && sp.traits.length))) {
+            briefing.staff.persona = {
+              tone: String(sp.tone ?? "").slice(0, 30),
+              communicationStyle: String(sp.communicationStyle ?? "").slice(0, 80),
+              traits: (sp.traits ?? [])
+                .filter((s: unknown) => typeof s === "string")
+                .slice(0, 6)
+                .map((s: string) => s.slice(0, 30)),
+              summary: String(sp.summary ?? "").slice(0, 300),
+              sampleSize: staffMessages.length,
             };
           }
           accumulate(v);
