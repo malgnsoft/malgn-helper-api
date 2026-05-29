@@ -204,6 +204,22 @@ export const openapiSpec = {
       },
     },
 
+    "/pms/projects/{id}/posts": {
+      get: {
+        tags: ["pms"],
+        summary: "프로젝트의 게시글 목록 (검색·필터·페이지네이션)",
+        description: "각 행에 작성자 분류(staff/partner/customer) + 미응답 표기. 협력사 화이트리스트는 응답 단계에서 매칭.",
+        parameters: [
+          { name: "id", in: "path", required: true, schema: { type: "integer", minimum: 1 } },
+          { name: "q", in: "query", required: false, schema: { type: "string" }, description: "제목/작성자 LIKE" },
+          { name: "filter", in: "query", required: false, schema: { type: "string", enum: ["", "customer", "unanswered"] } },
+          { name: "limit", in: "query", required: false, schema: { type: "integer", default: 50, maximum: 200 } },
+          { name: "offset", in: "query", required: false, schema: { type: "integer", default: 0 } },
+        ],
+        responses: { "200": { description: "목록" } },
+      },
+    },
+
     "/pms/projects/{id}/briefing": {
       get: {
         tags: ["pms"],

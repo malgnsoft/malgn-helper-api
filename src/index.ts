@@ -138,6 +138,96 @@ function toIso(s: string | null): string | null {
   return `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}T${s.slice(8, 10)}:${s.slice(10, 12)}:${s.slice(12, 14)}+09:00`;
 }
 
+// 프로젝트의 게시글 목록 (검색·필터·페이지네이션). 작성자 분류 칩 포함.
+app.get("/pms/projects/:id/posts", async (c) =>
+  withConn(c, async (conn) => {
+    const id = parseInt(c.req.param("id"), 10);
+    if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
+    const limit = Math.min(parseInt(c.req.query("limit") ?? "50", 10) || 50, 200);
+    const offset = Math.max(parseInt(c.req.query("offset") ?? "0", 10) || 0, 0);
+    const q = (c.req.query("q") ?? "").trim();
+    const filter = c.req.query("filter") ?? ""; // 'unanswered' | 'customer' | ''
+
+    // staff user id 캐시 (이메일 + 회사명)
+    const [staffUserRows] = await conn.query(
+      `SELECT id FROM tb_user
+        WHERE status = 1
+          AND (email LIKE '%@malgnsoft.com' OR company = '맑은소프트')`,
+    );
+    const staffIds = (staffUserRows as any[]).map((r) => Number(r.id));
+    const staffIdsSql = staffIds.length > 0 ? staffIds.join(",") : "0";
+
+    const where: string[] = ["p.project_id = ?", "p.status = 1"];
+    const params: any[] = [id];
+    if (q) {
+      where.push("(p.subject LIKE ? OR p.writer LIKE ?)");
+      params.push(`%${q}%`, `%${q}%`);
+    }
+    if (filter === "customer") {
+      where.push(`p.user_id NOT IN (${staffIdsSql})`);
+    } else if (filter === "unanswered") {
+      where.push(`p.user_id NOT IN (${staffIdsSql})`);
+      where.push(`NOT EXISTS (
+        SELECT 1 FROM tb_post_comment c
+         WHERE c.post_id = p.id AND c.status = 1
+           AND c.user_id IN (${staffIdsSql})
+      )`);
+    }
+    const whereSql = `WHERE ${where.join(" AND ")}`;
+
+    const [countRows] = await conn.query(
+      `SELECT COUNT(*) AS total FROM tb_post p ${whereSql}`,
+      params,
+    );
+    const total = Number((countRows as any[])[0]?.total ?? 0);
+
+    const [rows] = await conn.query(
+      `SELECT p.id, p.subject, p.writer, p.reg_date, p.comm_cnt, p.label, p.label_color, p.label_background,
+              u.email AS u_email, u.name AS u_name, u.company AS u_company,
+              (p.user_id IN (${staffIdsSql})) AS writer_is_staff,
+              EXISTS (
+                SELECT 1 FROM tb_post_comment c
+                 WHERE c.post_id = p.id AND c.status = 1
+                   AND c.user_id IN (${staffIdsSql})
+              ) AS has_staff_reply
+         FROM tb_post p
+    LEFT JOIN tb_user u ON u.id = p.user_id
+         ${whereSql}
+     ORDER BY p.reg_date DESC
+        LIMIT ${limit} OFFSET ${offset}`,
+      params,
+    );
+
+    return c.json({
+      total,
+      limit,
+      offset,
+      rows: (rows as any[]).map((r) => {
+        const isStaff = Number(r.writer_is_staff) === 1;
+        const isPartner = !isStaff && (
+          (r.u_name && /^(플로즈|옐로우윈|온케어|송한나)$/.test(String(r.u_name).trim())) ||
+          (r.u_company && /^(플로즈|옐로우윈|온케어)$/.test(String(r.u_company).trim()))
+        );
+        return {
+          id: r.id,
+          subject: r.subject,
+          writer: r.writer,
+          writerEmail: r.u_email,
+          writerCompany: r.u_company,
+          writerKind: isStaff ? "staff" : isPartner ? "partner" : "customer",
+          regDate: toIso(r.reg_date),
+          commCount: Number(r.comm_cnt ?? 0),
+          label: r.label || null,
+          labelColor: r.label_color || null,
+          labelBackground: r.label_background || null,
+          hasStaffReply: Number(r.has_staff_reply) === 1,
+          unanswered: !isStaff && Number(r.has_staff_reply) === 0,
+        };
+      }),
+    });
+  }),
+);
+
 // 프로젝트 단건 메타 (이름·그룹·발주처·상태·기간)
 app.get("/pms/projects/:id", async (c) =>
   withConn(c, async (conn) => {
