@@ -241,6 +241,14 @@ async function sha256Hex(s: string): Promise<string> {
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+// 집계 기준:
+//   - 누적·핫카테고리·FAQ·Policies → 전체 status=1 문의
+//   - 사람·평균FRT·미응답·긴급·알림 → 최근 180일
+//   - 사람 0명 → 화면에 "최근 180일 문의 없음" 표시
+const RECENT_DAYS = 180;
+// reg_date가 varchar(14) 'YYYYMMDDHHMMSS' 포맷이므로 cutoff도 같은 문자열로 비교 (인덱스 활용)
+const SINCE_14_SQL = `DATE_FORMAT(DATE_SUB(NOW(), INTERVAL ${RECENT_DAYS} DAY), '%Y%m%d%H%i%s')`;
+
 async function buildBriefingDbOnly(conn: any, id: number): Promise<any | null> {
     const [projRows] = await conn.query(
       `SELECT id, name, description, buyer, start_date, end_date, status
@@ -250,17 +258,23 @@ async function buildBriefingDbOnly(conn: any, id: number): Promise<any | null> {
     const proj = (projRows as any[])[0];
     if (!proj) return null;
 
-    // 멤버: tb_project_user JOIN tb_user (활성 + status=1)
+    // 멤버: 최근 180일 글 또는 댓글에 참여한 user
     const [memberRows] = await conn.query(
-      `SELECT u.id, u.name, u.email, u.company, u.rank, pu.user_level,
+      `SELECT u.id, u.name, u.email, u.company, u.rank,
               (u.email LIKE '%@malgnsoft.com') AS is_staff
-         FROM tb_project_user pu
-         JOIN tb_user u ON u.id = pu.user_id
-        WHERE pu.project_id = ? AND pu.status = 1 AND u.status = 1`,
-      [id],
+         FROM tb_user u
+        WHERE u.status = 1 AND u.id IN (
+          SELECT user_id FROM tb_post
+           WHERE project_id = ? AND status = 1 AND reg_date >= ${SINCE_14_SQL}
+          UNION
+          SELECT c.user_id FROM tb_post_comment c
+            JOIN tb_post p ON p.id = c.post_id
+           WHERE p.project_id = ? AND c.status = 1 AND c.reg_date >= ${SINCE_14_SQL}
+        )`,
+      [id, id],
     );
 
-    // post 통계: 총수 / 첫/마지막 활동
+    // post 통계: 누적 총수(전체) / 첫·마지막 활동(전체)
     const [statsRows] = await conn.query(
       `SELECT COUNT(*) AS total,
               MIN(reg_date) AS first_post,
@@ -270,7 +284,7 @@ async function buildBriefingDbOnly(conn: any, id: number): Promise<any | null> {
     );
     const stats0 = (statsRows as any[])[0];
 
-    // 라벨 분포 (상위 6)
+    // 라벨 분포 (전체, 상위 6)
     const [labelRows] = await conn.query(
       `SELECT label, COUNT(*) AS cnt
          FROM tb_post
@@ -281,7 +295,7 @@ async function buildBriefingDbOnly(conn: any, id: number): Promise<any | null> {
       [id],
     );
 
-    // 직원별 응대(댓글) 건수 — staff = email LIKE '%@malgnsoft.com'
+    // 직원별 응대 건수 — 최근 180일 댓글
     const [staffRows] = await conn.query(
       `SELECT u.name, u.rank, COUNT(c.id) AS cnt
          FROM tb_post_comment c
@@ -289,18 +303,20 @@ async function buildBriefingDbOnly(conn: any, id: number): Promise<any | null> {
          JOIN tb_post p ON p.id = c.post_id
         WHERE p.project_id = ? AND c.status = 1
           AND u.email LIKE '%@malgnsoft.com'
+          AND c.reg_date >= ${SINCE_14_SQL}
      GROUP BY u.id, u.name, u.rank
      ORDER BY cnt DESC
         LIMIT 10`,
       [id],
     );
 
-    // 미응답: 직원 댓글 없는 고객 글
+    // 미응답: 최근 180일 글 중 직원 댓글 없는 고객 글
     const [unansweredRows] = await conn.query(
       `SELECT COUNT(*) AS cnt
          FROM tb_post p
          JOIN tb_user pu ON pu.id = p.user_id
         WHERE p.project_id = ? AND p.status = 1
+          AND p.reg_date >= ${SINCE_14_SQL}
           AND pu.email NOT LIKE '%@malgnsoft.com'
           AND NOT EXISTS (
             SELECT 1 FROM tb_post_comment c
@@ -312,12 +328,13 @@ async function buildBriefingDbOnly(conn: any, id: number): Promise<any | null> {
     );
     const unanswered = (unansweredRows as any[])[0]?.cnt ?? 0;
 
-    // 가장 오래된 미응답 1건(알림용)
+    // 가장 오래된 미응답 1건 (180일 이내, 알림용)
     const [oldestUnansweredRows] = await conn.query(
       `SELECT p.id, p.subject, p.reg_date, p.writer
          FROM tb_post p
          JOIN tb_user pu ON pu.id = p.user_id
         WHERE p.project_id = ? AND p.status = 1
+          AND p.reg_date >= ${SINCE_14_SQL}
           AND pu.email NOT LIKE '%@malgnsoft.com'
           AND NOT EXISTS (
             SELECT 1 FROM tb_post_comment c
@@ -331,7 +348,7 @@ async function buildBriefingDbOnly(conn: any, id: number): Promise<any | null> {
     );
     const oldestUnanswered = (oldestUnansweredRows as any[])[0];
 
-    // 평균 첫 응답 시간(FRT, 분 단위) — staff 댓글까지 걸린 시간 (서브쿼리: post별 first staff comment)
+    // 평균 첫 응답 시간(FRT, 분) — 180일 이내 글 중 staff 댓글 있는 것
     const [frtRows] = await conn.query(
       `SELECT AVG(TIMESTAMPDIFF(MINUTE,
                 STR_TO_DATE(sub.post_at, '%Y%m%d%H%i%s'),
@@ -342,6 +359,7 @@ async function buildBriefingDbOnly(conn: any, id: number): Promise<any | null> {
              JOIN tb_post_comment c ON c.post_id = p.id
              JOIN tb_user cu ON cu.id = c.user_id
             WHERE p.project_id = ? AND p.status = 1 AND c.status = 1
+              AND p.reg_date >= ${SINCE_14_SQL}
               AND cu.email LIKE '%@malgnsoft.com'
          GROUP BY p.id, p.reg_date
          ) sub`,
@@ -358,6 +376,7 @@ async function buildBriefingDbOnly(conn: any, id: number): Promise<any | null> {
     const members = memberRows as any[];
     const customers = members.filter((m) => m.is_staff !== 1);
     const staffs = members.filter((m) => m.is_staff === 1);
+    const hasRecentActivity = members.length > 0;
 
     const primaryCustomer = customers[0] ?? null;
     const monthOf = (d: string | null) => (d && d.length >= 6 ? `${d.slice(0, 4)}-${d.slice(4, 6)}` : null);
@@ -381,24 +400,40 @@ async function buildBriefingDbOnly(conn: any, id: number): Promise<any | null> {
       });
     }
 
+    // 상태 라벨/사유 (최근 180일 기준)
+    let statusLabel: string;
+    let statusReason: string;
+    if (!hasRecentActivity) {
+      statusLabel = "휴면";
+      statusReason = `최근 ${RECENT_DAYS}일 문의 없음`;
+    } else if (unanswered > 0) {
+      statusLabel = "주의";
+      statusReason = `최근 ${RECENT_DAYS}일 미응답 ${unanswered}건`;
+    } else {
+      statusLabel = "원활";
+      statusReason = `최근 ${RECENT_DAYS}일 미응답 없음`;
+    }
+
     const briefing = {
       meta: {
         projectId: proj.id,
         projectName: proj.name,
         active: proj.status === 1,
-        statusLabel: unanswered > 0 ? "주의" : "원활",
-        statusReason: unanswered > 0 ? `직원 응답 없음 ${unanswered}건` : "미응답 없음",
+        statusLabel,
+        statusReason,
         subtitle: proj.description?.slice(0, 80) ?? proj.buyer ?? "",
         lifecycle: proj.status === 1 ? "유지보수 진행" : "종료",
         builtAt: monthOf(stats0.first_post) ?? "",
         lastActivity: monthOf(stats0.last_post) ?? "",
         generatedAt: new Date().toISOString().slice(0, 10),
         domainRule: "@malgnsoft.com → 직원 / 그 외 → 고객",
+        recentDays: RECENT_DAYS,
+        hasRecentActivity,
       },
       customer: {
         primary: primaryCustomer
           ? { name: primaryCustomer.name, email: primaryCustomer.email, role: primaryCustomer.rank || primaryCustomer.company }
-          : { name: "(고객 멤버 없음)", email: "", role: "" },
+          : { name: hasRecentActivity ? "(최근 고객 멤버 없음)" : `(최근 ${RECENT_DAYS}일 문의 없음)`, email: "", role: "" },
         others: customers.slice(1, 6).map((m) => ({
           name: m.name,
           email: m.email,
@@ -418,19 +453,19 @@ async function buildBriefingDbOnly(conn: any, id: number): Promise<any | null> {
         })),
       },
       stats: {
-        total: Number(stats0.total ?? 0),
-        avgFRT,
-        unanswered: Number(unanswered),
-        urgent: 0, // TODO: 라벨 '긴급' 또는 키워드 룰
+        total: Number(stats0.total ?? 0), // 전체 누적
+        avgFRT,                            // 180일 이내
+        unanswered: Number(unanswered),    // 180일 이내
+        urgent: 0,                          // LLM (180일 이내)
       },
-      hotTopics: [], // LLM 영역 (제목 군집화)
+      hotTopics: [], // LLM 영역 (전체)
       hotLabels: (labelRows as any[]).map((r) => ({
         name: r.label,
         count: Number(r.cnt),
       })),
-      alerts,
-      faq: [], // LLM 영역
-      policies: [], // LLM 영역
+      alerts,         // 180일 이내 기반
+      faq: [],        // LLM 영역 (전체)
+      policies: [],   // LLM 영역 (전체)
     };
 
     return briefing;
@@ -516,7 +551,7 @@ app.post("/pms/projects/:id/briefing/generate", async (c) =>
     }
 
     if (!skipLlm && c.env.OPENAI_API_KEY) {
-      // 입력: 최근 제목 100개 (둘 다 사용)
+      // 입력 1: 전체 최근 제목 100개 (hotTopics/faq용)
       const [titleRows] = await conn.query(
         `SELECT subject FROM tb_post
           WHERE project_id = ? AND status = 1 AND subject IS NOT NULL AND subject != ''
@@ -527,7 +562,20 @@ app.post("/pms/projects/:id/briefing/generate", async (c) =>
         .map((r) => String(r.subject ?? "").trim())
         .filter((t) => t.length > 0);
 
-      // 입력: 최근 staff 댓글 본문 20건 (faq/policies 추출용, 비공개 제외)
+      // 입력 2: 180일 이내 제목 (urgent 추정용)
+      const [recentTitleRows] = await conn.query(
+        `SELECT subject FROM tb_post
+          WHERE project_id = ? AND status = 1
+            AND subject IS NOT NULL AND subject != ''
+            AND reg_date >= ${SINCE_14_SQL}
+       ORDER BY reg_date DESC LIMIT 100`,
+        [id],
+      );
+      const recentTitles = (recentTitleRows as any[])
+        .map((r) => String(r.subject ?? "").trim())
+        .filter((t) => t.length > 0);
+
+      // 입력 3: 최근 staff 댓글 본문 20건 (policies 추출용, 비공개 제외, 전체 기간)
       const [staffMsgRows] = await conn.query(
         `SELECT c.content
            FROM tb_post_comment c
@@ -580,23 +628,32 @@ app.post("/pms/projects/:id/briefing/generate", async (c) =>
         }>(c.env, {
           system: [
             "You analyze a Korean customer support project and produce a concise briefing.",
-            "Inputs: project stats summary + recent inquiry titles + recent staff replies.",
+            "Inputs have TWO distinct time windows — be careful which window each output uses:",
+            "  · RECENT_180 = 최근 180일 문의 (긴급도·운영 상태 신호용)",
+            "  · ALL = 전체 누적 문의 (반복 패턴·운영 정책 추출용)",
+            "",
             "Output strict JSON:",
             '{ "statusLabel":"<짧은 한국어 라벨, 예: 주의/원활/긴급, 4글자 이내>",',
-            '  "statusReason":"<한 줄 사유, 30자 이내>",',
-            '  "urgentCount":<제목 100개 중 긴급/장애/오류성 추정 건수, int>,',
-            '  "faq":["<자주 묻는 질문 패턴 1>","<2>","<3>", ...]   // 3~6개, 각 30자 이내,',
-            '  "policies":[{"title":"<짧은 정책명>","detail":"<2~3문장>","source":"<출처 요약, 예: 직원 응답 패턴>"}, ...]  // 0~3개, 직원 응답에서 일관되게 관찰되는 응답 규칙만',
+            '  "statusReason":"<최근 180일 기준 한 줄 사유, 30자 이내>",',
+            '  "urgentCount":<RECENT_180 제목 중 긴급/장애/오류성 추정 건수, int>,',
+            '  "faq":["<ALL 기준 자주 묻는 질문 패턴 1>","<2>","<3>", ...]   // 3~6개, 각 30자 이내,',
+            '  "policies":[{"title":"<짧은 정책명>","detail":"<2~3문장>","source":"<출처 요약, 예: 직원 응답 패턴>"}, ...]  // 0~3개, 직원 응답(ALL)에서 일관되게 관찰되는 응답 규칙만',
             "}",
-            "FAQ는 실제 제목들에서 반복 패턴이 보일 때만. POLICIES는 staff 응답에서 명확한 규칙이 보일 때만(없으면 빈 배열).",
+            "규칙: statusLabel/statusReason/urgentCount는 RECENT_180만. faq/policies는 ALL.",
+            "RECENT_180이 비어있으면 statusLabel='휴면', urgentCount=0.",
           ].join("\n"),
           user: [
-            `프로젝트 통계: ${JSON.stringify(summary)}`,
+            `프로젝트 통계 (RECENT_180): ${JSON.stringify(summary)}`,
             "",
-            "=== 최근 문의 제목 (최대 100건) ===",
+            `=== RECENT_180 — 최근 180일 문의 제목 (${recentTitles.length}건) ===`,
+            recentTitles.length > 0
+              ? recentTitles.slice(0, 100).map((t, i) => `${i + 1}. ${t}`).join("\n")
+              : "(없음)",
+            "",
+            `=== ALL — 전체 누적 문의 제목 (최대 100건, 최신순) ===`,
             titles.slice(0, 100).map((t, i) => `${i + 1}. ${t}`).join("\n"),
             "",
-            "=== 최근 직원 응답 본문 (최대 20건, 비공개 제외) ===",
+            `=== ALL — 직원 응답 본문 (최대 20건, 비공개 제외) ===`,
             staffMessages.map((m, i) => `${i + 1}. ${m}`).join("\n"),
           ].join("\n"),
           maxTokens: 900,
