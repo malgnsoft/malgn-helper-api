@@ -1192,7 +1192,7 @@ const QA_SYSTEM_PROMPT = [
   "  A 응답 속도 (FRT 적정성)",
   "  B 정확성 (질문 의도와 답 내용의 일치)",
   "  C 명확성 (이해하기 쉬운 문장·구조)",
-  "  D 표준화 가능성 (재사용 가능한 답변인지) + templates 1~3개 제안",
+  "  D 표준화 가능성 (재사용 가능한 답변인지) + templates 6개 제안",
   "  E 친절도·태도 (어조, 공감)",
   "",
   "JSON schema:",
@@ -1208,7 +1208,7 @@ const QA_SYSTEM_PROMPT = [
   '  "followups":[{"title":"...","detail":"..."}],',
   '  "observation":{"title":"...","body":"...","hint":"..."} }',
   "",
-  "Rules: bullets·templates·followups·observation는 의미 있을 때만 채우고 비어도 됨. templates는 D축에 1~3개. score가 정해지지 않으면 'warn' + scoreLabel='주의'.",
+  "Rules: bullets·followups·observation는 의미 있을 때만 채우고 비어도 됨. templates는 D축에 정확히 6개 — 같은 패턴의 다양한 변형(짧은/긴 답변, 톤 차이, 시나리오 분기 등)으로 생성. score가 정해지지 않으면 'warn' + scoreLabel='주의'.",
 ].join("\n");
 
 app.post("/pms/posts/:id/eval/generate", async (c) =>
@@ -1359,7 +1359,7 @@ app.post("/pms/posts/:id/eval/generate", async (c) =>
         const llm = await callOpenAiJson<typeof llmResult>(c.env, {
           system: QA_SYSTEM_PROMPT,
           user: userMsg,
-          maxTokens: 1500,
+          maxTokens: 3000, // templates 6개 출력 위해 증가
           temperature: 0.2,
         });
         llmResult = llm.data;
