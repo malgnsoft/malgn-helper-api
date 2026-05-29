@@ -1205,19 +1205,40 @@ const QA_SYSTEM_PROMPT = [
   '    {"letter":"E",...}',
   '  ],',
   '  "overallVerdict":"<종합 평 한 줄>",',
-  '  "followups":[{"title":"...","detail":"..."}],',
   '  "observation":{"title":"...","body":"...","hint":"..."} }',
   "",
-  "Rules: bullets·followups·observation는 의미 있을 때만 채우고 비어도 됨.",
-  "templates는 D축에 정확히 6개. answer 작성 규칙(엄수):",
-  "  ◈ 형식: 반드시 HTML. 최소 <p>...</p>로 모든 문단 감싸고, 목록은 <ol><li>...</li></ol>, 강조는 <strong>...</strong>.",
-  "  ◈ 이미지: 원본에 <img>가 있고 해당 답변 맥락에 적합하면, 같은 src를 그대로 <img src=\"...\"> 로 본문 사이에 넣어 시각 자료를 보존한다. 단계별 안내는 단계마다 해당 화면 이미지를 함께 배치.",
+  "Rules: bullets·observation는 의미 있을 때만 채우고 비어도 됨.",
+  "",
+  "── 이미지 처리 (중요) ──",
+  "user 메시지에 image_url로 원본 응답의 스크린샷 이미지가 첨부될 수 있다. 첨부 순서대로 [이미지1], [이미지2] … 로 지칭.",
+  "각 이미지가 무엇을 보여주는지(메뉴 위치/입력 화면/버튼/결과 등) 시각적으로 분석하고, 답변에 이미지를 배치할 때 다음 규칙 엄수:",
+  "  ◈ 단순 <img src=\"...\"> 만 넣지 말고, 이미지 앞에 1~2줄 안내(예: <p><strong>1단계 — 좌측 메뉴에서 [SMS 신청] 선택</strong></p>) + 이미지 + 이미지 아래 짧은 캡션(<figcaption> 또는 작은 <p>)을 함께 배치.",
+  "  ◈ 캡션은 추측 금지. 이미지에 실제 보이는 메뉴명·버튼명·필드명을 그대로 옮긴다.",
+  "  ◈ 단계별 안내(6번 변형)의 각 <li>에는 [그 단계에 해당하는 이미지 1장 + 캡션]을 반드시 포함.",
+  "  ◈ 긴 답변·FAQ 변형에도 핵심 화면 이미지가 있으면 적절히 배치(과하지 않게 1~2장).",
+  "  ◈ 이미지가 0장이면 본문만 작성하면 됨.",
+  "",
+  "── templates 6개 작성 규칙(엄수) ──",
+  "  ◈ 형식: 반드시 HTML. 모든 문장은 <p>...</p>로 감싸고, 목록은 <ol>/<ul>, 강조는 <strong>.",
+  "  ◈ ★문단 분리(매우 중요): 한 <p>에 모든 내용을 몰아넣지 말 것. 의미 단위마다 <p>를 끊는다.",
+  "      [인사] → <p>안녕하세요, 고객님.</p>",
+  "      [공감/상황 확인] → <p>OO 관련 문제로 불편을 드려 죄송합니다.</p>",
+  "      [핵심 답/절차] → <p>...</p>  또는 <ol><li>...</li></ol>",
+  "      [보조 정보·예외·링크] → 별도 <p> 또는 <ul>",
+  "      [마무리/추가 안내] → <p>추가로 궁금한 점 있으시면 언제든 문의 부탁드립니다.</p>",
+  "      → 짧은 답변이라도 최소 3개의 <p>로 분리. 한 덩어리 텍스트 금지.",
+  "  ◈ 절차가 2단계 이상이면 반드시 <ol><li>...</li></ol>로 시각화. 인라인 '먼저 X하고 그다음 Y하고'식 금지.",
   "  ◈ 링크: 원본의 <a href=\"...\"> 다운로드/외부 링크도 같은 href로 보존.",
-  "  ◈ 내용 우선: 글자 수가 아니라 '실제 응대에 필요한 정보'를 모두 담는다. 짧다고 좋고 길다고 나쁘지 않음 — 자연스러운 흐름이 우선.",
+  "  ◈ 내용 풍부화: '안녕하세요. X입니다.' 같은 1줄 답변 절대 금지. 최소한 ① 인사 ② 핵심 답 ③ 보조 정보 ④ 마무리 4파트.",
+  "  ◈ 컨텍스트 활용: user 메시지에 '관련 표준답변' 섹션이 있으면, 표현·문장 구조를 참고해 일관된 톤으로 작성. 본문 복붙은 금지, 재구성.",
   "  ◈ 일반화: 특정 고객명·계약번호·이메일 등 개인 정보는 빼고 누구에게나 적용 가능한 형태로.",
-  "  ◈ 6개 변형: 짧은 답변(요약형) / 긴 답변(전체 맥락) / 친절한 톤 / 비즈니스 톤 / FAQ 형식 / 단계별 안내.",
-  "    단계별 안내는 <ol> 안에 각 <li>마다 단계 설명 + 해당 단계의 이미지(있으면)를 같이 배치.",
-  "  ◈ 1문장 단편 응답 금지. 'X입니다.' 같은 한 줄로 끝내지 말 것.",
+  "  ◈ 6개 변형 (label 정확히 일치): '짧은 답변' / '긴 답변' / '친절한 톤' / '비즈니스 톤' / 'FAQ 형식' / '단계별 안내'.",
+  "    - 짧은 답변: 3~4개 <p>, 핵심만. 이미지 0~1장.",
+  "    - 긴 답변: 5~7개 <p> + 절차는 <ol>. 조건·예외·관련 정책 모두 포함. 이미지 1~2장.",
+  "    - 친절한 톤: 4~5개 <p>, 공감·격려 ('걱정 마세요', '도움이 되었으면 합니다'). 이미지 0~1장.",
+  "    - 비즈니스 톤: 4~5개 <p>, 격식·정중 ('확인 후 회신드리겠습니다'). 이미지 1장.",
+  "    - FAQ 형식: <p><strong>Q.</strong> ...</p><p><strong>A.</strong> ...</p> 2~3쌍 — Q와 A는 각각 별도 <p>.",
+  "    - 단계별 안내: 인사 <p> + <ol> (각 <li>에 단계 설명 + 이미지 + 캡션) + 마무리 <p>. 인사·마무리를 <ol> 안에 넣지 말 것.",
   "score가 정해지지 않으면 'warn' + scoreLabel='주의'.",
 ].join("\n");
 
@@ -1336,7 +1357,6 @@ app.post("/pms/posts/:id/eval/generate", async (c) =>
       oneLiner: "",
       axes: [],
       overallVerdict: "",
-      followups: [],
       observation: undefined,
     };
     let generator: "db_only" | "hybrid" = "db_only";
@@ -1349,11 +1369,34 @@ app.post("/pms/posts/:id/eval/generate", async (c) =>
 
     if (!skipLlm && c.env.OPENAI_API_KEY && resp) {
       try {
-        // 원본 HTML에서 이미지 src 추출 — LLM이 놓치지 않도록 별도로 명시
+        // 1) 원본 HTML에서 이미지 src 추출 + 절대 URL 변환 (Vision이 fetch할 수 있도록)
         const imgPattern = /<img\s[^>]*src\s*=\s*["']([^"']+)["'][^>]*>/gi;
         const respContent = String(resp.content ?? "");
-        const imgs = [...respContent.matchAll(imgPattern)].map((m) => m[1]);
-        const userMsg = [
+        const rawImgs = [...respContent.matchAll(imgPattern)].map((m) => m[1]);
+        const toAbsolute = (u: string): string => {
+          if (/^https?:\/\//i.test(u)) return u;
+          if (u.startsWith("/data/")) return `https://ppm.malgn.co.kr${u}`;
+          if (u.startsWith("/")) return `https://ppm.malgn.co.kr${u}`;
+          return u;
+        };
+        const visionImgs = rawImgs.map(toAbsolute).slice(0, 8); // 비용/시간 보호 — 최대 8장
+
+        // 2) 같은 프로젝트의 활성 표준답변 일부를 컨텍스트로 첨부
+        const [saRows] = await conn.query(
+          `SELECT label, question, answer
+             FROM hp_standard_answer
+            WHERE status = 1 AND project_id = ?
+            ORDER BY updated_at DESC, id DESC
+            LIMIT 5`,
+          [post.project_id],
+        );
+        const standardAnswers = (saRows as any[]).map((r) => ({
+          label: r.label ?? "",
+          question: r.question ?? "",
+          answer: String(r.answer ?? "").slice(0, 2000),
+        }));
+
+        const userMsgParts = [
           `프로젝트: ${projectName}`,
           `문의자: ${meta.inquirer.name} (${inquirerKind})`,
           `응답자: ${meta.responder.name} (직원)`,
@@ -1370,15 +1413,31 @@ app.post("/pms/posts/:id/eval/generate", async (c) =>
           "=== 첫 직원 응답 (HTML 원본) ===",
           respContent.slice(0, 10000),
           "",
-          imgs.length > 0
-            ? `=== 원본 응답에 포함된 이미지 (총 ${imgs.length}장) — 각 표준답변 변형에 적절히 배치할 것 ===\n${imgs.map((s, i) => `[${i + 1}] ${s}`).join("\n")}`
-            : "(원본에 이미지 없음)",
-        ].join("\n");
+          visionImgs.length > 0
+            ? `=== 첨부 이미지 (${visionImgs.length}장) ===\n아래 image_url로 같이 첨부됨. 첨부 순서대로 [이미지1], [이미지2] … 로 지칭.\n각 이미지의 실제 화면 내용(메뉴/버튼/필드명)을 시각적으로 파악하고, templates 답변에 캡션과 함께 배치하라.\n${visionImgs.map((s, i) => `[이미지${i + 1}] ${s}`).join("\n")}`
+            : "(원본에 이미지 없음 — templates에 <img> 넣지 말 것)",
+        ];
+
+        if (standardAnswers.length > 0) {
+          userMsgParts.push(
+            "",
+            `=== 관련 표준답변 (${standardAnswers.length}건, 이 프로젝트의 활성 표준답변) — 톤·구조 참고용. 본문 복붙 금지 ===`,
+            ...standardAnswers.map((sa, i) =>
+              `[표준답변${i + 1}] ${sa.label}${sa.question ? ` / Q: ${sa.question}` : ""}\n${sa.answer}`,
+            ),
+          );
+        }
+
+        const userMsg = userMsgParts.join("\n");
         const llm = await callOpenAiJson<typeof llmResult>(c.env, {
+          // 이미지 없으면 gpt-4o-mini, 이미지 있으면 llm.ts가 gpt-4o로 자동 업그레이드
+          model: visionImgs.length > 0 ? c.env.LLM_MODEL_PREMIUM : c.env.LLM_MODEL_DEFAULT,
           system: QA_SYSTEM_PROMPT,
           user: userMsg,
-          maxTokens: 6000, // templates 6개 HTML + 이미지 + 다른 axes
-          temperature: 0.2,
+          images: visionImgs,
+          maxTokens: 8000, // 보강된 templates 6개 + 이미지 캡션 + 다른 axes
+          temperature: 0.3,
+          timeoutMs: 60_000, // Vision은 더 오래 걸림
         });
         llmResult = llm.data;
         generator = "hybrid";
@@ -1409,7 +1468,6 @@ app.post("/pms/posts/:id/eval/generate", async (c) =>
       axes: llmResult.axes ?? [],
       overallAverage,
       overallVerdict: llmResult.overallVerdict ?? "",
-      followups: llmResult.followups ?? [],
       observation: llmResult.observation,
     };
 
@@ -1629,8 +1687,15 @@ app.get("/admin/evals", async (c) =>
     const hasScore = c.req.query("hasScore") === "1";
     const sort = c.req.query("sort") ?? "recent"; // recent | score_asc | score_desc | latency
 
+    // 기본: LLM 성공한 평가만 노출 (db_only 폴백·빈 결과는 카드를 못 열어서 무의미).
+    // 명시적으로 includeEmpty=1 주면 전체 노출 (디버그·운영용).
+    const includeEmpty = c.req.query("includeEmpty") === "1";
     const where: string[] = ["e.status = 1"];
     const params: any[] = [];
+    if (!includeEmpty) {
+      where.push("e.generator = 'hybrid'");
+      where.push("e.overall_score IS NOT NULL");
+    }
     if (projectId) {
       where.push("e.project_id = ?");
       params.push(parseInt(projectId, 10));

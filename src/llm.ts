@@ -38,12 +38,19 @@ export async function callOpenAiJson<T>(
     model?: string;
     system: string;
     user: string;
+    /** Image URLs to attach to the user message (GPT-4o Vision). When provided, model auto-upgrades to gpt-4o if caller still passes mini. */
+    images?: string[];
     maxTokens?: number;
     temperature?: number;
     timeoutMs?: number;
   },
 ): Promise<LlmResult<T>> {
-  const model = opts.model ?? env.LLM_MODEL_DEFAULT;
+  const hasImages = !!(opts.images && opts.images.length > 0);
+  // Vision requires gpt-4o (mini doesn't support image_url). Auto-upgrade.
+  const requestedModel = opts.model ?? env.LLM_MODEL_DEFAULT;
+  const model = hasImages && requestedModel.includes("mini")
+    ? (env.LLM_MODEL_PREMIUM || "gpt-4o")
+    : requestedModel;
   const url = `${env.AI_GATEWAY_URL}/chat/completions`;
   const t0 = Date.now();
 
@@ -58,6 +65,15 @@ export async function callOpenAiJson<T>(
     if (env.AI_GATEWAY_TOKEN) {
       headers["cf-aig-authorization"] = `Bearer ${env.AI_GATEWAY_TOKEN}`;
     }
+    const userContent: any = hasImages
+      ? [
+          { type: "text", text: opts.user },
+          ...opts.images!.map((u) => ({
+            type: "image_url",
+            image_url: { url: u, detail: "low" }, // low = ~85 tokens/이미지
+          })),
+        ]
+      : opts.user;
     const res = await fetch(url, {
       method: "POST",
       headers,
@@ -65,7 +81,7 @@ export async function callOpenAiJson<T>(
         model,
         messages: [
           { role: "system", content: opts.system },
-          { role: "user", content: opts.user },
+          { role: "user", content: userContent },
         ],
         response_format: { type: "json_object" },
         max_tokens: opts.maxTokens ?? 800,
