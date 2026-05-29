@@ -172,20 +172,20 @@ app.get("/pms/projects", async (c) =>
   }),
 );
 
-// 프로젝트 단위 브리핑 (PMS BriefingCard용).
-// DB로 만들 수 있는 통계·멤버·라벨·알림만 채우고, LLM 영역(faq/policies/hotTopics)은 빈 배열.
-app.get("/pms/projects/:id/briefing", async (c) =>
-  withConn(c, async (conn) => {
-    const id = parseInt(c.req.param("id"), 10);
-    if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
+// ── Briefing 빌더 (GET + POST 공통) ──────────────────────
+async function sha256Hex(s: string): Promise<string> {
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
 
+async function buildBriefingDbOnly(conn: any, id: number): Promise<any | null> {
     const [projRows] = await conn.query(
       `SELECT id, name, description, buyer, start_date, end_date, status
          FROM tb_project WHERE id = ?`,
       [id],
     );
     const proj = (projRows as any[])[0];
-    if (!proj) return c.json({ error: "not found" }, 404);
+    if (!proj) return null;
 
     // 멤버: tb_project_user JOIN tb_user (활성 + status=1)
     const [memberRows] = await conn.query(
@@ -370,7 +370,133 @@ app.get("/pms/projects/:id/briefing", async (c) =>
       policies: [], // LLM 영역
     };
 
+    return briefing;
+}
+
+// GET: 즉시 집계 (DB only) — 캐시 사용 안 함, 저장 안 함
+app.get("/pms/projects/:id/briefing", async (c) =>
+  withConn(c, async (conn) => {
+    const id = parseInt(c.req.param("id"), 10);
+    if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
+    const briefing = await buildBriefingDbOnly(conn, id);
+    if (!briefing) return c.json({ error: "not found" }, 404);
     return c.json({ briefing });
+  }),
+);
+
+// POST: 새 브리핑 카드 생성 — hp_briefing에 저장, 24h 캐시 hit 시 재사용 (?force=1로 우회)
+app.post("/pms/projects/:id/briefing/generate", async (c) =>
+  withConn(c, async (conn) => {
+    const id = parseInt(c.req.param("id"), 10);
+    if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
+    const force = c.req.query("force") === "1";
+    const t0 = Date.now();
+    const route = `POST /pms/projects/${id}/briefing/generate`;
+
+    const briefing = await buildBriefingDbOnly(conn, id);
+    if (!briefing) return c.json({ error: "not found" }, 404);
+
+    // 캐시 키: 안정적인 입력 부분만(generatedAt 같은 시각 필드 제외)
+    const hashInput = JSON.stringify({
+      stats: briefing.stats,
+      customerCount: briefing.customer.others.length + (briefing.customer.primary?.name ? 1 : 0),
+      staffCount: briefing.staff.primary.length + briefing.staff.aux.length,
+      labels: briefing.hotLabels,
+      alertCount: briefing.alerts.length,
+    });
+    const inputHash = await sha256Hex(hashInput);
+
+    if (!force) {
+      const [cacheRows] = await conn.query(
+        `SELECT id, briefing_json, generated_at FROM hp_briefing
+          WHERE project_id = ? AND status = 1 AND llm_input_hash = ?
+            AND generated_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)
+          ORDER BY generated_at DESC LIMIT 1`,
+        [id, inputHash],
+      );
+      const cached = (cacheRows as any[])[0];
+      if (cached) {
+        await conn.query(
+          `INSERT INTO hp_llm_log (route, entity_type, entity_id, model, latency_ms, cache_hit)
+           VALUES (?, 'briefing', ?, 'db_only', ?, 1)`,
+          [route, cached.id, Date.now() - t0],
+        );
+        return c.json({
+          briefing: JSON.parse(cached.briefing_json),
+          cached: true,
+          id: cached.id,
+          generatedAt: cached.generated_at,
+        });
+      }
+    }
+
+    const latency = Date.now() - t0;
+    const [ins] = await conn.query(
+      `INSERT INTO hp_briefing
+         (project_id, generated_at, generator, llm_input_hash, latency_ms, briefing_json)
+       VALUES (?, NOW(), 'db_only', ?, ?, ?)`,
+      [id, inputHash, latency, JSON.stringify(briefing)],
+    );
+    const insertId = (ins as any).insertId as number;
+
+    await conn.query(
+      `INSERT INTO hp_llm_log (route, entity_type, entity_id, model, latency_ms, cache_hit)
+       VALUES (?, 'briefing', ?, 'db_only', ?, 0)`,
+      [route, insertId, latency],
+    );
+
+    return c.json({ briefing, cached: false, id: insertId });
+  }),
+);
+
+// GET: 프로젝트의 저장된 브리핑 목록 (히스토리 selectbox용, 메타만)
+app.get("/pms/projects/:id/briefings", async (c) =>
+  withConn(c, async (conn) => {
+    const id = parseInt(c.req.param("id"), 10);
+    if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
+    const limit = Math.min(parseInt(c.req.query("limit") ?? "20", 10) || 20, 100);
+    const [rows] = await conn.query(
+      `SELECT id, generated_at, generator, llm_model, llm_input_hash, latency_ms
+         FROM hp_briefing
+        WHERE project_id = ? AND status = 1
+     ORDER BY generated_at DESC
+        LIMIT ${limit}`,
+      [id],
+    );
+    return c.json({ rows });
+  }),
+);
+
+// GET: 저장된 브리핑 단건 (briefing_json 파싱)
+app.get("/pms/briefings/:id", async (c) =>
+  withConn(c, async (conn) => {
+    const id = parseInt(c.req.param("id"), 10);
+    if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
+    const [rows] = await conn.query(
+      `SELECT id, project_id, generated_at, generator, llm_model, briefing_json
+         FROM hp_briefing WHERE id = ? AND status = 1`,
+      [id],
+    );
+    const r = (rows as any[])[0];
+    if (!r) return c.json({ error: "not found" }, 404);
+    return c.json({
+      id: r.id,
+      projectId: r.project_id,
+      generatedAt: r.generated_at,
+      generator: r.generator,
+      llmModel: r.llm_model,
+      briefing: JSON.parse(r.briefing_json),
+    });
+  }),
+);
+
+// DELETE: 저장된 브리핑 soft-delete
+app.delete("/pms/briefings/:id", async (c) =>
+  withConn(c, async (conn) => {
+    const id = parseInt(c.req.param("id"), 10);
+    if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
+    await conn.query(`UPDATE hp_briefing SET status = -1 WHERE id = ?`, [id]);
+    return c.json({ ok: true });
   }),
 );
 

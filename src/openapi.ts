@@ -163,25 +163,72 @@ export const openapiSpec = {
     "/pms/projects/{id}/briefing": {
       get: {
         tags: ["pms"],
-        summary: "프로젝트 단위 브리핑",
+        summary: "프로젝트 단위 브리핑 (즉시 집계)",
         description:
-          "PMS BriefingCard용 집계. DB로 산출 가능한 통계·멤버·라벨·알림을 채움.\n\n" +
-          "**LLM 필요 항목은 빈 배열**: `hotTopics`, `faq`, `policies`, `stats.urgent=0`.",
+          "캐시·저장 없이 매번 DB 집계. 빠른 미리보기·디버깅용. **운영 화면은 POST .../generate 사용 권장**.",
         parameters: [
           { name: "id", in: "path", required: true, schema: { type: "integer", minimum: 1 } },
         ],
         responses: {
-          "200": {
-            description: "브리핑",
-            content: {
-              "application/json": {
-                schema: { $ref: "#/components/schemas/BriefingEnvelope" },
-              },
-            },
-          },
+          "200": { description: "브리핑", content: { "application/json": { schema: { $ref: "#/components/schemas/BriefingEnvelope" } } } },
           "400": { description: "invalid id" },
           "404": { description: "프로젝트 없음" },
         },
+      },
+    },
+
+    "/pms/projects/{id}/briefing/generate": {
+      post: {
+        tags: ["pms"],
+        summary: "브리핑 카드 생성 + 저장",
+        description:
+          "DB 집계 → `hp_briefing`에 새 row 저장. 같은 `llm_input_hash`가 **24시간 이내**에 있으면 캐시 hit으로 기존 row 재사용. `?force=1`로 우회. 모든 호출은 `hp_llm_log`에 기록됨.",
+        parameters: [
+          { name: "id", in: "path", required: true, schema: { type: "integer", minimum: 1 } },
+          { name: "force", in: "query", required: false, schema: { type: "string", enum: ["1"] } },
+        ],
+        responses: {
+          "200": {
+            description: "생성/캐시 hit",
+            content: {
+              "application/json": {
+                example: { briefing: "...", cached: false, id: 42 },
+              },
+            },
+          },
+          "404": { description: "프로젝트 없음" },
+        },
+      },
+    },
+
+    "/pms/projects/{id}/briefings": {
+      get: {
+        tags: ["pms"],
+        summary: "저장된 브리핑 목록 (메타만)",
+        description: "히스토리 selectbox용. `briefing_json`은 제외하고 메타만 반환.",
+        parameters: [
+          { name: "id", in: "path", required: true, schema: { type: "integer", minimum: 1 } },
+          { name: "limit", in: "query", required: false, schema: { type: "integer", default: 20, maximum: 100 } },
+        ],
+        responses: { "200": { description: "목록" } },
+      },
+    },
+
+    "/pms/briefings/{id}": {
+      get: {
+        tags: ["pms"],
+        summary: "저장된 브리핑 단건 (full json)",
+        parameters: [{ name: "id", in: "path", required: true, schema: { type: "integer", minimum: 1 } }],
+        responses: {
+          "200": { description: "단건", content: { "application/json": { schema: { $ref: "#/components/schemas/BriefingEnvelope" } } } },
+          "404": { description: "없음" },
+        },
+      },
+      delete: {
+        tags: ["pms"],
+        summary: "저장된 브리핑 soft-delete (status=-1)",
+        parameters: [{ name: "id", in: "path", required: true, schema: { type: "integer", minimum: 1 } }],
+        responses: { "200": { description: "OK" } },
       },
     },
 
