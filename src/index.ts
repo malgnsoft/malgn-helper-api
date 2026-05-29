@@ -444,18 +444,31 @@ async function buildBriefingDbOnly(conn: any, id: number): Promise<any | null> {
       });
     }
 
-    // 상태 라벨/사유 (최근 180일 기준)
-    let statusLabel: string;
+    // 상태 라벨 — 5단계 enum, DB 임계값으로 고정 (LLM이 덮어쓰지 않음)
+    //   휴면: 180일 활동 없음
+    //   원활: 미응답 0
+    //   주의: 미응답 1~5
+    //   경고: 미응답 6~15
+    //   긴급: 미응답 > 15
+    // (LLM이 추정한 urgent ≥ 5 도 긴급 후보 — extras 응답 받은 후 후처리에서 격상)
+    let statusLabel: "휴면" | "원활" | "주의" | "경고" | "긴급";
     let statusReason: string;
+    const unansweredNum = Number(unanswered);
     if (!hasRecentActivity) {
       statusLabel = "휴면";
       statusReason = `최근 ${RECENT_DAYS}일 문의 없음`;
-    } else if (unanswered > 0) {
-      statusLabel = "주의";
-      statusReason = `최근 ${RECENT_DAYS}일 미응답 ${unanswered}건`;
-    } else {
+    } else if (unansweredNum === 0) {
       statusLabel = "원활";
       statusReason = `최근 ${RECENT_DAYS}일 미응답 없음`;
+    } else if (unansweredNum <= 5) {
+      statusLabel = "주의";
+      statusReason = `최근 ${RECENT_DAYS}일 미응답 ${unansweredNum}건`;
+    } else if (unansweredNum <= 15) {
+      statusLabel = "경고";
+      statusReason = `최근 ${RECENT_DAYS}일 미응답 ${unansweredNum}건 누적`;
+    } else {
+      statusLabel = "긴급";
+      statusReason = `최근 ${RECENT_DAYS}일 미응답 ${unansweredNum}건 — 응대 인력 점검 필요`;
     }
 
     const briefing = {
@@ -473,6 +486,7 @@ async function buildBriefingDbOnly(conn: any, id: number): Promise<any | null> {
         domainRule: "@malgnsoft.com → 직원 / 그 외 → 고객",
         recentDays: RECENT_DAYS,
         hasRecentActivity,
+        statusRule: "휴면(180일 0건) / 원활(미응답 0) / 주의(1~5) / 경고(6~15) / 긴급(>15 또는 LLM urgent≥5)",
       },
       customer: {
         primary: primaryCustomer
@@ -727,8 +741,6 @@ app.post("/pms/projects/:id/briefing/generate", async (c) =>
         );
 
         const extrasPromise = callOpenAiJson<{
-          statusLabel: string;
-          statusReason: string;
           urgentCount: number;
           faq: string[];
           policies: Array<{ title: string; detail: string; source: string }>;
@@ -740,15 +752,13 @@ app.post("/pms/projects/:id/briefing/generate", async (c) =>
           };
         }>(c.env, {
           system: [
-            "You analyze a Korean customer support project and produce a concise briefing.",
+            "You analyze a Korean customer support project and extract additional briefing fields.",
             "Inputs have TWO distinct time windows — be careful which window each output uses:",
-            "  · RECENT_180 = 최근 180일 문의 (긴급도·운영 상태·고객 톤 신호용)",
+            "  · RECENT_180 = 최근 180일 문의 (긴급도·고객 톤 신호용)",
             "  · ALL = 전체 누적 문의 (반복 패턴·운영 정책 추출용)",
             "",
-            "Output strict JSON:",
-            '{ "statusLabel":"<짧은 한국어 라벨, 예: 주의/원활/긴급, 4글자 이내>",',
-            '  "statusReason":"<최근 180일 기준 한 줄 사유, 30자 이내>",',
-            '  "urgentCount":<RECENT_180 제목 중 긴급/장애/오류성 추정 건수, int>,',
+            "Output strict JSON (statusLabel·statusReason은 시스템이 별도 룰로 결정 — LLM 출력 X):",
+            '{ "urgentCount":<RECENT_180 제목 중 긴급/장애/오류성 추정 건수, int>,',
             '  "faq":["<ALL 기준 자주 묻는 질문 패턴 1>","<2>","<3>", ...]   // 3~6개, 각 30자 이내,',
             '  "policies":[{"title":"<짧은 정책명>","detail":"<2~3문장>","source":"<출처 요약, 예: 직원 응답 패턴>"}, ...]  // 0~3개, 직원 응답(ALL)에서 일관되게 관찰되는 응답 규칙만,',
             '  "customerPersona":{',
@@ -759,9 +769,9 @@ app.post("/pms/projects/:id/briefing/generate", async (c) =>
             "  }",
             "}",
             "규칙:",
-            "  · statusLabel/statusReason/urgentCount/customerPersona는 RECENT_180 고객 메시지 기준",
+            "  · urgentCount/customerPersona는 RECENT_180 기준",
             "  · faq/policies는 ALL 기준",
-            "  · RECENT_180이 비어있으면 statusLabel='휴면', urgentCount=0, customerPersona는 빈 객체",
+            "  · RECENT_180이 비어있으면 urgentCount=0, customerPersona는 빈 객체",
             "  · customerPersona는 개별 사용자 한 명이 아니라 고객사 전체의 평균적 응대 톤·태도",
           ].join("\n"),
           user: [
@@ -801,9 +811,21 @@ app.post("/pms/projects/:id/briefing/generate", async (c) =>
 
         if (extrasR.status === "fulfilled") {
           const v = extrasR.value;
-          if (v.data.statusLabel) briefing.meta.statusLabel = v.data.statusLabel.slice(0, 10);
-          if (v.data.statusReason) briefing.meta.statusReason = v.data.statusReason.slice(0, 60);
-          if (typeof v.data.urgentCount === "number") briefing.stats.urgent = v.data.urgentCount;
+          // statusLabel·statusReason은 DB 임계값 룰이 결정 — LLM이 덮어쓰지 않음
+          // (LLM이 입력을 잘못 해석하는 경우가 있어 폴백 사실값을 보장)
+          if (typeof v.data.urgentCount === "number") {
+            briefing.stats.urgent = v.data.urgentCount;
+            // urgent ≥ 5 면 '긴급'으로 격상 + 사유도 교체
+            if (
+              v.data.urgentCount >= 5 &&
+              briefing.meta.statusLabel !== "휴면" &&
+              briefing.meta.statusLabel !== "원활" &&
+              briefing.meta.statusLabel !== "긴급"
+            ) {
+              briefing.meta.statusLabel = "긴급";
+              briefing.meta.statusReason = `긴급 문의 ${v.data.urgentCount}건 추정 — 우선 확인`;
+            }
+          }
           briefing.faq = (v.data.faq ?? []).filter((s) => typeof s === "string").slice(0, 6);
           briefing.policies = (v.data.policies ?? []).slice(0, 3).map((p) => ({
             title: String(p.title ?? "").slice(0, 50),
