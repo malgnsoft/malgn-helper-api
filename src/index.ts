@@ -10,6 +10,7 @@ import {
   BUSINESS_START_HOUR,
   BUSINESS_END_HOUR,
 } from "./business-hours";
+import { classifyUser, isPartner } from "./classify";
 
 type Bindings = {
   R2: R2Bucket;
@@ -396,8 +397,11 @@ async function buildBriefingDbOnly(conn: any, id: number): Promise<any | null> {
 
     // ── Briefing 객체 조립 ──────────────────────────────
     const members = memberRows as any[];
-    const customers = members.filter((m) => m.is_staff !== 1);
-    const staffs = members.filter((m) => m.is_staff === 1);
+    // 분류: staff / partner / customer (협력사 화이트리스트 적용)
+    const annotated = members.map((m) => ({ ...m, kind: classifyUser(m) }));
+    const staffs = annotated.filter((m) => m.kind === "staff");
+    const partners = annotated.filter((m) => m.kind === "partner");
+    const pureCustomers = annotated.filter((m) => m.kind === "customer");
     const hasRecentActivity = members.length > 0;
 
     // 이름 없는 user는 email 로컬파트로 fallback
@@ -408,13 +412,17 @@ async function buildBriefingDbOnly(conn: any, id: number): Promise<any | null> {
       const local = e.includes("@") ? e.split("@")[0] : e;
       return local || "(이름 미상)";
     };
-    // name이 있는 고객 우선 정렬
-    const sortedCustomers = [...customers].sort((a, b) => {
+    // name이 있는 사람 우선 정렬
+    const byNamePresent = (a: any, b: any) => {
       const an = String(a?.name ?? "").trim() ? 1 : 0;
       const bn = String(b?.name ?? "").trim() ? 1 : 0;
       return bn - an;
-    });
-    const primaryCustomer = sortedCustomers[0] ?? null;
+    };
+    const sortedCustomers = [...pureCustomers].sort(byNamePresent);
+    const sortedPartners = [...partners].sort(byNamePresent);
+    // primary는 순수 고객 우선, 없으면 협력사
+    const primaryCustomer = sortedCustomers[0] ?? sortedPartners[0] ?? null;
+    const primaryIsPartner = !!primaryCustomer && isPartner(primaryCustomer);
     const monthOf = (d: string | null) => (d && d.length >= 6 ? `${d.slice(0, 4)}-${d.slice(4, 6)}` : null);
 
     const alerts: any[] = [];
@@ -468,15 +476,36 @@ async function buildBriefingDbOnly(conn: any, id: number): Promise<any | null> {
       },
       customer: {
         primary: primaryCustomer
-          ? { name: displayName(primaryCustomer), email: primaryCustomer.email, role: primaryCustomer.rank || primaryCustomer.company }
+          ? {
+              name: displayName(primaryCustomer),
+              email: primaryCustomer.email,
+              role: primaryIsPartner
+                ? `협력사${primaryCustomer.rank ? ` · ${primaryCustomer.rank}` : ""}`
+                : (primaryCustomer.rank || primaryCustomer.company || "담당"),
+            }
           : { name: hasRecentActivity ? "(최근 고객 멤버 없음)" : `(최근 ${RECENT_DAYS}일 문의 없음)`, email: "", role: "" },
-        others: sortedCustomers.slice(1, 6).map((m) => ({
-          name: displayName(m),
-          email: m.email,
-          role: m.rank || m.company,
-        })),
-        note: customers.length > 6 ? `+ ${customers.length - 6}명` : undefined,
+        others: [
+          ...sortedCustomers.filter((m) => m !== primaryCustomer).slice(0, 6).map((m) => ({
+            name: displayName(m),
+            email: m.email,
+            role: m.rank || m.company || "고객",
+          })),
+          ...sortedPartners.filter((m) => m !== primaryCustomer).slice(0, 6).map((m) => ({
+            name: displayName(m),
+            email: m.email,
+            role: `협력사${m.rank ? ` · ${m.rank}` : ""}`,
+          })),
+        ].slice(0, 8),
+        note: pureCustomers.length + partners.length > 8
+          ? `+ ${pureCustomers.length + partners.length - 8}명`
+          : undefined,
       },
+      partners: sortedPartners.map((m) => ({
+        name: displayName(m),
+        email: m.email,
+        company: m.company || "",
+        rank: m.rank || "",
+      })),
       staff: {
         primary: (staffRows as any[]).slice(0, 5).map((r) => ({
           role: r.rank || "직원",
