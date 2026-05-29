@@ -73,6 +73,8 @@ async function withConn<T>(c: any, fn: (conn: any) => Promise<T>): Promise<T | R
     database: hd.database,
     port: hd.port,
     disableEval: true,
+    // PMS DB는 KST 기준. mysql2 default('local')는 Worker가 UTC라 9h 어긋남 → 명시.
+    timezone: "+09:00",
   });
   try {
     return await fn(conn);
@@ -129,10 +131,10 @@ app.get("/db/sample/:table", async (c) =>
 );
 
 // ── PMS 연동 ─────────────────────────────────────────────
-// reg_date가 'YYYYMMDDHHMMSS' varchar(14)이므로 ISO 형태로 변환
+// reg_date가 'YYYYMMDDHHMMSS' varchar(14) (KST). ISO 형식으로 +09:00 명시.
 function toIso(s: string | null): string | null {
   if (!s || s.length !== 14) return s;
-  return `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}T${s.slice(8, 10)}:${s.slice(10, 12)}:${s.slice(12, 14)}`;
+  return `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}T${s.slice(8, 10)}:${s.slice(10, 12)}:${s.slice(12, 14)}+09:00`;
 }
 
 // 그룹 목록 (셀렉트박스용). site_id 기본 1, 활성만.
