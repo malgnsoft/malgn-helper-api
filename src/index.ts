@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { createConnection } from "mysql2/promise";
 import { openapiSpec, docHtml } from "./openapi";
-import { callOpenAiJson } from "./llm";
+import { callOpenAiJson, callWorkersAi } from "./llm";
 import {
   parseKst14ToMs,
   businessMinutesBetween,
@@ -15,6 +15,7 @@ import { classifyUser, isPartner } from "./classify";
 type Bindings = {
   R2: R2Bucket;
   HYPERDRIVE: Hyperdrive;
+  AI: Ai;
   AI_GATEWAY_URL: string;
   AI_GATEWAY_TOKEN?: string;
   OPENAI_API_KEY: string;
@@ -1242,6 +1243,259 @@ const QA_SYSTEM_PROMPT = [
   "score가 정해지지 않으면 'warn' + scoreLabel='주의'.",
 ].join("\n");
 
+// ── 안내글 평가 (게시글 작성자가 직원인 경우) ─────────────
+// 직원이 작성한 공지·안내 성격의 게시글 자체를 3축으로 평가하고 3개 변형 추천.
+const ANNOUNCE_SYSTEM_PROMPT = [
+  "You evaluate Korean staff-authored announcement/notice posts (직원이 고객 대상 공지·안내로 작성한 게시글).",
+  "Inputs: an announcement post body (Korean, may contain HTML images).",
+  "Output strict JSON matching the schema below. Comments in Korean.",
+  "",
+  "Score 3 axes A~C, each 1-5 integer (or string 'warn' if unscorable):",
+  "  A 톤·자세 (고객 대상 공지에 적절한 정중·격식·신뢰감)",
+  "  B 명확성 (핵심이 먼저 나오는지, 한 번 읽고 이해 가능한지, 구조화)",
+  "  C 완전성 (일자·연락처·조건·예외·절차 등 빠진 정보 없는지)",
+  "",
+  "JSON schema:",
+  '{ "oneLiner":"<한 줄 평>",',
+  '  "axes":[',
+  '    {"letter":"A","title":"톤·자세","score":4,"scoreLabel":"양호","commentary":"...","bullets":[{"text":"...","emphasis":"high|normal"}]},',
+  '    {"letter":"B","title":"명확성",...},',
+  '    {"letter":"C","title":"완전성",...}',
+  '  ],',
+  '  "overallVerdict":"<종합 평 한 줄>",',
+  '  "templates":[',
+  '    {"label":"짧은","title":"<개선된 제목>","answer":"<짧은 안내글 — 핵심만, 3~4개 <p>>"},',
+  '    {"label":"명료한","title":"...","answer":"<명료한 안내글 — 핵심+절차 구조화, 4~5개 <p> + 필요시 <ol>>"},',
+  '    {"label":"자세한","title":"...","answer":"<자세한 안내글 — 절차/조건/예외/연락처 모두 포함, 5~7개 <p> + <ol>>"}',
+  '  ],',
+  '  "observation":{"title":"...","body":"...","hint":"..."} }',
+  "",
+  "Rules: bullets·observation는 의미 있을 때만 채우고 비어도 됨.",
+  "",
+  "── 이미지 처리 (원본에 <img>가 있다면) ──",
+  "user 메시지에 image_url로 원본 안내글의 첨부 이미지가 같이 들어올 수 있다.",
+  "  ◈ 시각적으로 무엇을 보여주는지 파악하고, templates 각 변형의 적절한 위치에 같은 src로 다시 배치 + 캡션(짧은 <p>) 작성.",
+  "  ◈ 캡션은 추측 금지 — 이미지에 실제 보이는 메뉴명·날짜·표 헤더 등을 그대로 옮김.",
+  "  ◈ 짧은 변형은 이미지 0~1장, 명료한 1~2장, 자세한 2~3장 권장.",
+  "  ◈ 이미지가 0장이면 templates에도 <img> 넣지 말 것.",
+  "",
+  "── templates 3개 작성 규칙(엄수) ──",
+  "  ◈ 형식: 반드시 HTML. 모든 문장은 <p>...</p>로 감싸고, 절차는 <ol><li>...</li></ol>, 강조는 <strong>.",
+  "  ◈ ★문단 분리: 한 <p>에 모든 내용을 몰아넣지 말 것. 의미 단위마다 <p>를 끊는다.",
+  "      [인사·도입] → <p>안녕하세요. ...</p>",
+  "      [본문 핵심] → <p>...</p>  또는 <ol><li>...</li></ol>",
+  "      [보조 정보·예외·일자·연락처] → 별도 <p>",
+  "      [마무리] → <p>문의 사항은 ...</p>",
+  "  ◈ 절차/단계가 2개 이상이면 반드시 <ol><li>...</li></ol>로 시각화.",
+  "  ◈ 링크: 원본의 <a href=\"...\">는 같은 href로 보존.",
+  "  ◈ 톤: 고객 대상 공지이므로 정중·격식·명료. '~드립니다', '~예정입니다', '~부탁드립니다'. 친근체·반말 금지.",
+  "  ◈ 일반화: 특정 고객 개인 정보는 빼고 누구에게나 적용 가능한 형태로.",
+  "  ◈ title은 안내글에 어울리는 한 줄 제목 (원본보다 명확·구체적).",
+  "  ◈ 3개 변형 (label 정확히 일치): '짧은' / '명료한' / '자세한'.",
+  "    - 짧은: 3~4개 <p>, 핵심 + 일자 + 문의처만. 절차 1~2단계면 인라인.",
+  "    - 명료한: 4~5개 <p>, 핵심을 먼저 강조한 후 절차를 <ol>로 정리. 균형.",
+  "    - 자세한: 5~7개 <p>, 절차 전체 + 조건·예외·문의처 모두 포함. <ol>은 단계별 캡션 포함.",
+  "score가 정해지지 않으면 'warn' + scoreLabel='주의'.",
+].join("\n");
+
+app.post("/pms/posts/:id/announce-eval/generate", async (c) =>
+  withConn(c, async (conn) => {
+    const id = parseInt(c.req.param("id"), 10);
+    if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
+    const force = c.req.query("force") === "1";
+    const skipLlm = c.req.query("nollm") === "1";
+    const t0 = Date.now();
+    const route = `POST /pms/posts/${id}/announce-eval/generate`;
+
+    // 1) 게시글 + 작성자 (staff 여부 검증)
+    const [postRows] = await conn.query(
+      `SELECT p.id, p.subject, p.content, p.project_id, p.reg_date,
+              u.name AS u_name, u.email AS u_email, u.company AS u_company, u.rank AS u_rank,
+              (u.email LIKE '%@malgnsoft.com' OR u.company = '맑은소프트') AS u_is_staff
+         FROM tb_post p
+    LEFT JOIN tb_user u ON u.id = p.user_id
+        WHERE p.id = ? AND p.status = 1`,
+      [id],
+    );
+    const post = (postRows as any[])[0];
+    if (!post) return c.json({ error: "post not found" }, 404);
+    if (post.u_is_staff !== 1) {
+      return c.json({ error: "not a staff-authored post — use /eval/generate for customer posts" }, 422);
+    }
+
+    // 2) 프로젝트
+    const [projRows] = await conn.query(
+      `SELECT name FROM tb_project WHERE id = ?`,
+      [post.project_id],
+    );
+    const projectName = (projRows as any[])[0]?.name ?? `프로젝트 #${post.project_id}`;
+
+    const meta = {
+      kind: "announce" as const, // UI에서 분기용
+      postId: post.id,
+      postTitle: post.subject,
+      projectId: post.project_id,
+      projectName,
+      projectType: "PMS",
+      projectStatus: "활성",
+      author: {
+        name: post.u_name ?? "(미상)",
+        email: post.u_email ?? "",
+        company: post.u_company ?? "",
+        kind: "직원",
+      },
+      writtenAt: toIso(post.reg_date) ?? "",
+      domainRule: "@malgnsoft.com 또는 맑은소프트 → 직원",
+      generatedAt: new Date().toISOString().slice(0, 10),
+    };
+
+    // 캐시 키: 안내글 본문 해시
+    const inputForHash = JSON.stringify({
+      postId: id,
+      kind: "announce",
+      subject: post.subject,
+      content: post.content?.slice(0, 8000) ?? "",
+    });
+    const inputHash = await sha256Hex(inputForHash);
+
+    if (!force) {
+      const [cacheRows] = await conn.query(
+        `SELECT id, eval_json, generated_at FROM hp_qa_eval
+          WHERE post_id = ? AND status = 1 AND llm_input_hash = ?
+          ORDER BY generated_at DESC LIMIT 1`,
+        [id, inputHash],
+      );
+      const cached = (cacheRows as any[])[0];
+      if (cached) {
+        await conn.query(
+          `INSERT INTO hp_llm_log (route, entity_type, entity_id, model, latency_ms, cache_hit)
+           VALUES (?, 'announce_eval', ?, 'cache', ?, 1)`,
+          [route, cached.id, Date.now() - t0],
+        );
+        return c.json({ eval: JSON.parse(cached.eval_json), cached: true, id: cached.id });
+      }
+    }
+
+    // ── LLM 평가 ──────────────────────────────────────────
+    let llmResult: any = {
+      oneLiner: "",
+      axes: [],
+      overallVerdict: "",
+      templates: [],
+      observation: undefined,
+    };
+    let generator: "db_only" | "hybrid" = "db_only";
+    let llmModel: string | null = null;
+    let promptTokens: number | null = null;
+    let completionTokens: number | null = null;
+    let llmLatency: number | null = null;
+    let costUsd: number | null = null;
+    let llmError: string | null = null;
+
+    if (!skipLlm && c.env.OPENAI_API_KEY) {
+      try {
+        // 안내글 본문 안 이미지 src 추출 → 절대 URL
+        const imgPattern = /<img\s[^>]*src\s*=\s*["']([^"']+)["'][^>]*>/gi;
+        const content = String(post.content ?? "");
+        const rawImgs = [...content.matchAll(imgPattern)].map((m) => m[1]);
+        const toAbsolute = (u: string): string => {
+          if (/^https?:\/\//i.test(u)) return u;
+          if (u.startsWith("/")) return `https://ppm.malgn.co.kr${u}`;
+          return u;
+        };
+        const visionImgs = rawImgs.map(toAbsolute).slice(0, 8);
+
+        const userMsgParts = [
+          `프로젝트: ${projectName}`,
+          `작성자: ${meta.author.name} (직원)`,
+          `작성 시각: ${meta.writtenAt}`,
+          "",
+          "=== 안내글 제목 ===",
+          post.subject,
+          "",
+          "=== 안내글 본문 (HTML 원본) ===",
+          content.slice(0, 12000),
+          "",
+          visionImgs.length > 0
+            ? `=== 첨부 이미지 (${visionImgs.length}장) ===\n아래 image_url로 같이 첨부됨. 첨부 순서대로 [이미지1], [이미지2] … 로 지칭.\n각 이미지의 실제 내용을 파악하고, templates 각 변형에 적절히 배치(캡션 포함)하라.\n${visionImgs.map((s, i) => `[이미지${i + 1}] ${s}`).join("\n")}`
+            : "(원본에 이미지 없음 — templates에 <img> 넣지 말 것)",
+        ];
+
+        const userMsg = userMsgParts.join("\n");
+        const llm = await callOpenAiJson<typeof llmResult>(c.env, {
+          model: visionImgs.length > 0 ? c.env.LLM_MODEL_PREMIUM : c.env.LLM_MODEL_DEFAULT,
+          system: ANNOUNCE_SYSTEM_PROMPT,
+          user: userMsg,
+          images: visionImgs,
+          maxTokens: 6000,
+          temperature: 0.3,
+          timeoutMs: 60_000,
+        });
+        llmResult = llm.data;
+        generator = "hybrid";
+        llmModel = llm.model;
+        promptTokens = llm.promptTokens;
+        completionTokens = llm.completionTokens;
+        llmLatency = llm.latencyMs;
+        costUsd = llm.costUsd;
+      } catch (e) {
+        llmError = (e as Error).message;
+      }
+    }
+
+    const numericScores = (llmResult.axes ?? [])
+      .map((a: any) => (typeof a.score === "number" ? a.score : null))
+      .filter((s: any) => s !== null) as number[];
+    const overallAverage =
+      numericScores.length > 0
+        ? Math.round((numericScores.reduce((a, b) => a + b, 0) / numericScores.length) * 10) / 10
+        : 0;
+
+    const announceEval = {
+      meta,
+      announcement: post.content ?? "",
+      oneLiner: llmResult.oneLiner ?? "",
+      axes: llmResult.axes ?? [],
+      overallAverage,
+      overallVerdict: llmResult.overallVerdict ?? "",
+      templates: llmResult.templates ?? [],
+      observation: llmResult.observation,
+    };
+
+    const totalLatency = Date.now() - t0;
+    const [ins] = await conn.query(
+      `INSERT INTO hp_qa_eval
+         (post_id, project_id, generated_at, generator, llm_model, llm_input_hash,
+          prompt_tokens, completion_tokens, latency_ms,
+          eval_json, overall_score, overall_verdict)
+       VALUES (?, ?, NOW(), ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        id,
+        post.project_id,
+        generator === "hybrid" ? "announce_llm" : "announce_db",
+        llmModel,
+        inputHash,
+        promptTokens,
+        completionTokens,
+        totalLatency,
+        JSON.stringify(announceEval),
+        overallAverage > 0 ? overallAverage : null,
+        announceEval.overallVerdict ? announceEval.overallVerdict.slice(0, 100) : null,
+      ],
+    );
+    const insertId = (ins as any).insertId as number;
+
+    await conn.query(
+      `INSERT INTO hp_llm_log
+         (route, entity_type, entity_id, model, prompt_tokens, completion_tokens, latency_ms, cost_usd, cache_hit, error)
+       VALUES (?, 'announce_eval', ?, ?, ?, ?, ?, ?, 0, ?)`,
+      [route, insertId, llmModel ?? "db_only", promptTokens, completionTokens, llmLatency ?? totalLatency, costUsd, llmError],
+    );
+
+    return c.json({ eval: announceEval, cached: false, id: insertId, generator, llmError });
+  }),
+);
+
 app.post("/pms/posts/:id/eval/generate", async (c) =>
   withConn(c, async (conn) => {
     const id = parseInt(c.req.param("id"), 10);
@@ -1429,15 +1683,15 @@ app.post("/pms/posts/:id/eval/generate", async (c) =>
         }
 
         const userMsg = userMsgParts.join("\n");
+        // AI Gateway compat endpoint 경유 OpenAI partner 모델 호출 (malgn-helper2 게이트웨이)
         const llm = await callOpenAiJson<typeof llmResult>(c.env, {
-          // 이미지 없으면 gpt-4o-mini, 이미지 있으면 llm.ts가 gpt-4o로 자동 업그레이드
-          model: visionImgs.length > 0 ? c.env.LLM_MODEL_PREMIUM : c.env.LLM_MODEL_DEFAULT,
+          model: c.env.LLM_MODEL_PREMIUM, // openai/gpt-4.1-mini
           system: QA_SYSTEM_PROMPT,
           user: userMsg,
           images: visionImgs,
-          maxTokens: 8000, // 보강된 templates 6개 + 이미지 캡션 + 다른 axes
+          maxTokens: 8000,
           temperature: 0.3,
-          timeoutMs: 60_000, // Vision은 더 오래 걸림
+          timeoutMs: 60_000,
         });
         llmResult = llm.data;
         generator = "hybrid";

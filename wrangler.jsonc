@@ -7,6 +7,10 @@
   "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true },
 
+  // Smart Placement — backend(OpenAI 등) 가까운 colo에서 Worker 실행.
+  // 한국 colo에서 OpenAI 호출 시 region 차단되는 문제를 자동 우회 (학습 후 미국 colo로 이동).
+  "placement": { "mode": "smart" },
+
   "r2_buckets": [
     { "binding": "R2", "bucket_name": "malgn-helper-files" }
   ],
@@ -15,11 +19,17 @@
     { "binding": "HYPERDRIVE", "id": "aea36082dfd84125a0da2063d5b8e5e0" }
   ],
 
+  // Workers AI binding — Cloudflare 자체 catalog (region 제한 없음, $10 크레딧 사용).
+  // openai/o4-mini 등 OpenAI partner 모델도 binding으로 호출 가능.
+  "ai": { "binding": "AI" },
+
   "vars": {
-    // Universal Endpoint (compat mode). model에 "openai/" 등 공급자 prefix 필요.
-    "AI_GATEWAY_URL": "https://gateway.ai.cloudflare.com/v1/d2b8c5524b7259214fa302f1fecb4ad6/malgn-helper/compat",
-    "LLM_MODEL_DEFAULT": "openai/gpt-4o-mini",
-    "LLM_MODEL_PREMIUM": "openai/gpt-4o"
+    // Cloudflare AI Gateway compat endpoint (비BYOK 모드).
+    // Cloudflare가 자체 credit으로 OpenAI 호출 → datacenter IP region 차단 우회.
+    // Provider(BYOK) 등록은 삭제하고 Gateway 크레딧 충전으로 운영.
+    "AI_GATEWAY_URL": "https://gateway.ai.cloudflare.com/v1/d2b8c5524b7259214fa302f1fecb4ad6/malgn-helper2/compat",
+    "LLM_MODEL_DEFAULT": "openai/gpt-4.1-mini",
+    "LLM_MODEL_PREMIUM": "openai/gpt-4.1-mini"
   }
 
   // OPENAI_API_KEY는 wrangler secret으로 등록 (코드·git 노출 금지)
