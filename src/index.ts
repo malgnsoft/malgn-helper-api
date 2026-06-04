@@ -1400,8 +1400,9 @@ app.post("/pms/posts/:id/announce-eval/generate", async (c) =>
         const rawImgs = [...content.matchAll(imgPattern)].map((m) => m[1]);
         const toAbsolute = (u: string): string => {
           if (/^https?:\/\//i.test(u)) return u;
-          if (u.startsWith("/")) return `https://ppm.malgn.co.kr${u}`;
-          return u;
+          // `/data/…`, `../data/…`, `./data/…`, `data/…` 등 모든 상대경로 → PMS 도메인으로 절대화
+          const cleaned = u.replace(/^(\.\.\/|\.\/)+/, "").replace(/^\/+/, "");
+          return `https://ppm.malgn.co.kr/${cleaned}`;
         };
         const visionImgs = rawImgs.map(toAbsolute).slice(0, 8);
 
@@ -1629,9 +1630,9 @@ app.post("/pms/posts/:id/eval/generate", async (c) =>
         const rawImgs = [...respContent.matchAll(imgPattern)].map((m) => m[1]);
         const toAbsolute = (u: string): string => {
           if (/^https?:\/\//i.test(u)) return u;
-          if (u.startsWith("/data/")) return `https://ppm.malgn.co.kr${u}`;
-          if (u.startsWith("/")) return `https://ppm.malgn.co.kr${u}`;
-          return u;
+          // `/data/…`, `../data/…`, `./data/…`, `data/…` 등 모든 상대경로 → PMS 도메인으로 절대화
+          const cleaned = u.replace(/^(\.\.\/|\.\/)+/, "").replace(/^\/+/, "");
+          return `https://ppm.malgn.co.kr/${cleaned}`;
         };
         const visionImgs = rawImgs.map(toAbsolute).slice(0, 8); // 비용/시간 보호 — 최대 8장
 
