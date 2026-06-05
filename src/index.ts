@@ -139,6 +139,92 @@ function toIso(s: string | null): string | null {
   return `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}T${s.slice(8, 10)}:${s.slice(10, 12)}:${s.slice(12, 14)}+09:00`;
 }
 
+// 일회용 마이그레이션 — hp_image_asset 테이블 생성. ?confirm=yes 호출 1번 후 라우트 제거 권장.
+app.post("/admin/migrate/hp_image_asset", async (c) =>
+  withConn(c, async (conn) => {
+    if (c.req.query("confirm") !== "yes") return c.json({ error: "add ?confirm=yes" }, 400);
+    await conn.query(`
+      CREATE TABLE IF NOT EXISTS hp_image_asset (
+        id                       INT NOT NULL AUTO_INCREMENT,
+        src_path                 VARCHAR(500) NOT NULL,
+        title                    VARCHAR(200) NOT NULL,
+        description              TEXT NOT NULL,
+        first_seen_post_id       INT NULL,
+        first_seen_project_id    INT NULL,
+        source                   ENUM('inquiry','reply') NULL,
+        llm_model                VARCHAR(50) NULL,
+        analyzed_at              DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        usage_count              INT NOT NULL DEFAULT 1,
+        last_used_at             DATETIME NULL,
+        status                   TINYINT NOT NULL DEFAULT 1,
+        created_at               DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY uk_src_path (src_path(255)),
+        KEY idx_project (first_seen_project_id, analyzed_at),
+        KEY idx_usage (status, usage_count)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `);
+    return c.json({ ok: true, table: "hp_image_asset" });
+  }),
+);
+
+// 이미지 자산 Vision 분석 + 저장. src_path UNIQUE라 이미 분석된 이미지는 재사용 (usage_count 증가).
+async function analyzeAndStoreImage(
+  conn: any,
+  env: Bindings,
+  args: {
+    srcPath: string;
+    absoluteUrl: string;
+    postId: number;
+    projectId: number;
+    source: "inquiry" | "reply";
+  },
+): Promise<{ id: number; title: string; description: string; reused: boolean } | null> {
+  // 1) 캐시 hit 체크
+  const [cachedRows] = await conn.query(
+    `SELECT id, title, description FROM hp_image_asset WHERE src_path = ? AND status = 1 LIMIT 1`,
+    [args.srcPath],
+  );
+  const cached = (cachedRows as any[])[0];
+  if (cached) {
+    await conn.query(
+      `UPDATE hp_image_asset SET usage_count = usage_count + 1, last_used_at = NOW() WHERE id = ?`,
+      [cached.id],
+    );
+    return { id: cached.id, title: cached.title, description: cached.description, reused: true };
+  }
+
+  // 2) Vision 분석 — title + description 추출
+  try {
+    const llm = await callOpenAiJson<{ title: string; description: string }>(env, {
+      model: env.LLM_MODEL_PREMIUM,
+      system: [
+        "이미지의 핵심 내용을 한국어 JSON으로 추출하라.",
+        "- title: 10~20자 이내 짧은 화면/이미지 제목 (예: '알림톡 코드 확인 화면', '비즈뿌리오 발신 프로필 등록 폼').",
+        "- description: 화면에 보이는 메뉴명·버튼명·필드명·표 내용·상황을 사실 기반 2~3줄로 묘사. 추측 금지.",
+        '출력: {"title":"...","description":"..."}',
+      ].join("\n"),
+      user: "이미지의 title과 description을 작성해 주세요.",
+      images: [args.absoluteUrl],
+      maxTokens: 600,
+      temperature: 0.2,
+      timeoutMs: 30_000,
+    });
+    const title = String(llm.data.title || "").slice(0, 200) || "(제목 없음)";
+    const description = String(llm.data.description || "").slice(0, 5000) || "(설명 없음)";
+    const [ins] = await conn.query(
+      `INSERT INTO hp_image_asset
+         (src_path, title, description, first_seen_post_id, first_seen_project_id, source, llm_model)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE usage_count = usage_count + 1, last_used_at = NOW()`,
+      [args.srcPath, title, description, args.postId, args.projectId, args.source, llm.model],
+    );
+    return { id: (ins as any).insertId, title, description, reused: false };
+  } catch {
+    return null; // 분석 실패 — 흐름은 진행, 다음 번 호출에서 재시도 가능
+  }
+}
+
 // 프로젝트의 게시글 목록 (검색·필터·페이지네이션). 작성자 분류 칩 포함.
 app.get("/pms/projects/:id/posts", async (c) =>
   withConn(c, async (conn) => {
@@ -1671,6 +1757,31 @@ app.post("/pms/posts/:id/eval/generate", async (c) =>
           return `https://ppm.malgn.co.kr/${cleaned}`;
         };
         const visionImgs = rawImgs.map(toAbsolute).slice(0, 8); // 비용/시간 보호 — 최대 8장
+
+        // 1-b) 본문(inquiry) + 응답(reply) 양쪽에서 /data/ 자산 이미지 추출 → hp_image_asset 분석·저장
+        const inquiryImgs = [...String(post.content ?? "").matchAll(imgPattern)].map((m) => ({
+          src: m[1],
+          source: "inquiry" as const,
+        }));
+        const replyImgs = resp
+          ? [...respContent.matchAll(imgPattern)].map((m) => ({ src: m[1], source: "reply" as const }))
+          : [];
+        const dataAssets = [...inquiryImgs, ...replyImgs].filter(({ src }) =>
+          /^(\.\.\/|\.\/|\/)?data\//i.test(src),
+        );
+        if (dataAssets.length > 0) {
+          await Promise.allSettled(
+            dataAssets.slice(0, 16).map(({ src, source }) =>
+              analyzeAndStoreImage(conn, c.env, {
+                srcPath: src,
+                absoluteUrl: toAbsolute(src),
+                postId: id,
+                projectId: post.project_id,
+                source,
+              }),
+            ),
+          );
+        }
 
         // 2) 같은 프로젝트의 활성 표준답변 일부를 컨텍스트로 첨부
         const [saRows] = await conn.query(
