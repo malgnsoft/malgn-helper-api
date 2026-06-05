@@ -159,7 +159,7 @@ app.post("/admin/migrate/hp_image_asset", async (c) =>
         status                   TINYINT NOT NULL DEFAULT 1,
         created_at               DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY (id),
-        UNIQUE KEY uk_src_path (src_path(255)),
+        UNIQUE KEY uk_src_path (src_path(191)),
         KEY idx_project (first_seen_project_id, analyzed_at),
         KEY idx_usage (status, usage_count)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
