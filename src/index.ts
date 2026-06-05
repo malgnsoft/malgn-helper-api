@@ -1497,6 +1497,41 @@ app.post("/pms/posts/:id/announce-eval/generate", async (c) =>
   }),
 );
 
+// 답변이 아직 없는 문의에 대한 추천 답변 6개 생성 prompt.
+// 5축 평가는 수행 불가(답변 부재) → 추천 답변만 D축 1개에 담아 반환.
+const QA_INQUIRY_ONLY_SYSTEM_PROMPT = [
+  "You are helping a Korean customer support agent draft replies to a customer inquiry that has not been answered yet.",
+  "Inputs: an inquiry post (Korean), optional related standard answers, optional inquiry-attached images.",
+  "Goal: produce 6 candidate replies the agent can copy and send.",
+  "Output strict JSON matching the schema below.",
+  "",
+  "JSON schema:",
+  '{ "oneLiner":"<문의 요지 한 줄>",',
+  '  "overallVerdict":"<답변 가이드 한 줄 — 어떤 톤·접근으로 답할지>",',
+  '  "axes":[',
+  '    {"letter":"D","title":"추천 답변","score":"info","scoreLabel":"추천","commentary":"<답변 작성 시 주의점 한 줄>","templates":[',
+  '      {"label":"짧은 답변","question":"<문의 패턴>","answer":"<HTML>"},',
+  '      {"label":"긴 답변","question":"...","answer":"<HTML>"},',
+  '      {"label":"친절한 톤","question":"...","answer":"<HTML>"},',
+  '      {"label":"비즈니스 톤","question":"...","answer":"<HTML>"},',
+  '      {"label":"FAQ 형식","question":"...","answer":"<HTML>"},',
+  '      {"label":"단계별 안내","question":"...","answer":"<HTML>"}',
+  '    ]}',
+  '  ],',
+  '  "observation":null }',
+  "",
+  "templates 6개 작성 규칙(엄수):",
+  "  ◈ 형식: 반드시 HTML. 모든 문장은 <p>로 감싸고, 목록은 <ol>/<ul>, 강조는 <strong>.",
+  "  ◈ 문단 분리: 한 <p>에 몰지 말 것. [인사] [핵심 답/절차] [보조 정보·연락처·예외] [마무리] 등 의미 단위마다 별도 <p>.",
+  "  ◈ 절차가 2단계 이상이면 <ol><li>...</li></ol>로 시각화. 인라인 '먼저 X하고 그다음 Y' 금지.",
+  "  ◈ 내용 풍부화: 최소 ① 인사 ② 핵심 답(절차·조건·정책) ③ 보조 정보(예외·연관 안내·문의처) ④ 마무리 4파트.",
+  "  ◈ 컨텍스트 활용: '관련 표준답변' 섹션이 있으면 톤·구조 참고. 본문 복붙 금지, 재구성.",
+  "  ◈ 일반화: 특정 고객명·계약번호·이메일 등 개인 정보는 빼고 누구에게나 적용 가능한 형태로.",
+  "  ◈ 답변 길이·디테일은 label에 맞게 (짧은 답변=3~4 <p>, 긴 답변=5~7 <p>, FAQ=Q/A 2~3쌍 등).",
+  "  ◈ 단계별 안내: 인사 <p> + <ol>(단계별 <li>) + 마무리 <p>. 인사·마무리를 <ol> 안에 넣지 말 것.",
+  "  ◈ 문의가 모호하면 commentary에 '추가 확인이 필요한 정보(예: 환경/버전/일자)'를 1~2줄 명시.",
+].join("\n");
+
 app.post("/pms/posts/:id/eval/generate", async (c) =>
   withConn(c, async (conn) => {
     const id = parseInt(c.req.param("id"), 10);
@@ -1622,12 +1657,13 @@ app.post("/pms/posts/:id/eval/generate", async (c) =>
     let costUsd: number | null = null;
     let llmError: string | null = null;
 
-    if (!skipLlm && c.env.OPENAI_API_KEY && resp) {
+    if (!skipLlm && c.env.OPENAI_API_KEY) {
       try {
-        // 1) 원본 HTML에서 이미지 src 추출 + 절대 URL 변환 (Vision이 fetch할 수 있도록)
+        // 1) 이미지 src 추출 + 절대 URL 변환. 응답 있으면 응답에서, 없으면 문의 본문에서.
         const imgPattern = /<img\s[^>]*src\s*=\s*["']([^"']+)["'][^>]*>/gi;
-        const respContent = String(resp.content ?? "");
-        const rawImgs = [...respContent.matchAll(imgPattern)].map((m) => m[1]);
+        const respContent = String(resp?.content ?? "");
+        const sourceForImgs = resp ? respContent : String(post.content ?? "");
+        const rawImgs = [...sourceForImgs.matchAll(imgPattern)].map((m) => m[1]);
         const toAbsolute = (u: string): string => {
           if (/^https?:\/\//i.test(u)) return u;
           // `/data/…`, `../data/…`, `./data/…`, `data/…` 등 모든 상대경로 → PMS 도메인으로 절대화
@@ -1651,27 +1687,45 @@ app.post("/pms/posts/:id/eval/generate", async (c) =>
           answer: String(r.answer ?? "").slice(0, 2000),
         }));
 
-        const userMsgParts = [
-          `프로젝트: ${projectName}`,
-          `문의자: ${meta.inquirer.name} (${inquirerKind})`,
-          `응답자: ${meta.responder.name} (직원)`,
-          `문의 시각: ${meta.inquiryAt}`,
-          `응답 시각: ${meta.responseAt}`,
-          `FRT: ${frt}`,
-          "",
-          "=== 문의 제목 ===",
-          post.subject,
-          "",
-          "=== 문의 본문 ===",
-          (post.content ?? "").slice(0, 6000),
-          "",
-          "=== 첫 직원 응답 (HTML 원본) ===",
-          respContent.slice(0, 10000),
-          "",
-          visionImgs.length > 0
-            ? `=== 첨부 이미지 (${visionImgs.length}장) ===\n아래 image_url로 같이 첨부됨. 첨부 순서대로 [이미지1], [이미지2] … 로 지칭.\n각 이미지의 실제 화면 내용(메뉴/버튼/필드명)을 시각적으로 파악하고, templates 답변에 캡션과 함께 배치하라.\n${visionImgs.map((s, i) => `[이미지${i + 1}] ${s}`).join("\n")}`
-            : "(원본에 이미지 없음 — templates에 <img> 넣지 말 것)",
-        ];
+        const userMsgParts = resp
+          ? [
+              `프로젝트: ${projectName}`,
+              `문의자: ${meta.inquirer.name} (${inquirerKind})`,
+              `응답자: ${meta.responder.name} (직원)`,
+              `문의 시각: ${meta.inquiryAt}`,
+              `응답 시각: ${meta.responseAt}`,
+              `FRT: ${frt}`,
+              "",
+              "=== 문의 제목 ===",
+              post.subject,
+              "",
+              "=== 문의 본문 ===",
+              (post.content ?? "").slice(0, 6000),
+              "",
+              "=== 첫 직원 응답 (HTML 원본) ===",
+              respContent.slice(0, 10000),
+              "",
+              visionImgs.length > 0
+                ? `=== 첨부 이미지 (${visionImgs.length}장) ===\n아래 image_url로 같이 첨부됨. 첨부 순서대로 [이미지1], [이미지2] … 로 지칭.\n각 이미지의 실제 화면 내용(메뉴/버튼/필드명)을 시각적으로 파악하고, templates 답변에 캡션과 함께 배치하라.\n${visionImgs.map((s, i) => `[이미지${i + 1}] ${s}`).join("\n")}`
+                : "(원본에 이미지 없음 — templates에 <img> 넣지 말 것)",
+            ]
+          : [
+              // ── 답변이 아직 없는 문의 — 추천 답변 6개 생성 모드 ──
+              `프로젝트: ${projectName}`,
+              `문의자: ${meta.inquirer.name} (${inquirerKind})`,
+              `문의 시각: ${meta.inquiryAt}`,
+              `상태: 아직 답변이 등록되지 않은 문의 — 상담사가 보낼 후보 답변을 6개 작성하라.`,
+              "",
+              "=== 문의 제목 ===",
+              post.subject,
+              "",
+              "=== 문의 본문 ===",
+              (post.content ?? "").slice(0, 6000),
+              "",
+              visionImgs.length > 0
+                ? `=== 문의 첨부 이미지 (${visionImgs.length}장) ===\n${visionImgs.map((s, i) => `[이미지${i + 1}] ${s}`).join("\n")}`
+                : "(문의에 이미지 없음)",
+            ];
 
         if (standardAnswers.length > 0) {
           userMsgParts.push(
@@ -1684,10 +1738,9 @@ app.post("/pms/posts/:id/eval/generate", async (c) =>
         }
 
         const userMsg = userMsgParts.join("\n");
-        // AI Gateway compat endpoint 경유 OpenAI partner 모델 호출 (malgn-helper2 게이트웨이)
         const llm = await callOpenAiJson<typeof llmResult>(c.env, {
           model: c.env.LLM_MODEL_PREMIUM, // openai/gpt-4.1-mini
-          system: QA_SYSTEM_PROMPT,
+          system: resp ? QA_SYSTEM_PROMPT : QA_INQUIRY_ONLY_SYSTEM_PROMPT,
           user: userMsg,
           images: visionImgs,
           maxTokens: 8000,
@@ -1695,7 +1748,7 @@ app.post("/pms/posts/:id/eval/generate", async (c) =>
           timeoutMs: 60_000,
         });
         llmResult = llm.data;
-        generator = "hybrid";
+        generator = resp ? "hybrid" : "inquiry_only";
         llmModel = llm.model;
         promptTokens = llm.promptTokens;
         completionTokens = llm.completionTokens;
