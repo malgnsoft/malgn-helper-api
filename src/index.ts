@@ -2546,4 +2546,145 @@ app.put("/wbs", async (c) => {
   return c.json({ ok: true, size: text.length, savedAt: new Date().toISOString() });
 });
 
+// ── 이미지 자산 목록 (hp_image_asset) ──────────────────
+app.get("/image-assets", async (c) =>
+  withConn(c, async (conn) => {
+    const limit = Math.min(parseInt(c.req.query("limit") ?? "30", 10) || 30, 200);
+    const offset = Math.max(parseInt(c.req.query("offset") ?? "0", 10) || 0, 0);
+    const search = (c.req.query("search") ?? "").trim();
+    const source = c.req.query("source") ?? "";
+    const projectId = c.req.query("projectId") ?? "";
+
+    const where: string[] = ["status = 1"];
+    const params: any[] = [];
+    if (search) {
+      where.push("(title LIKE ? OR description LIKE ?)");
+      const like = `%${search}%`;
+      params.push(like, like);
+    }
+    if (source === "inquiry" || source === "reply") {
+      where.push("source = ?");
+      params.push(source);
+    }
+    if (projectId) {
+      where.push("first_seen_project_id = ?");
+      params.push(parseInt(projectId, 10));
+    }
+    const whereSql = `WHERE ${where.join(" AND ")}`;
+
+    const [countRows] = await conn.query(`SELECT COUNT(*) AS total FROM hp_image_asset ${whereSql}`, params);
+    const total = Number((countRows as any[])[0]?.total ?? 0);
+
+    const [rows] = await conn.query(
+      `SELECT id, src_path, title, description, source,
+              first_seen_post_id, first_seen_project_id,
+              usage_count, last_used_at, analyzed_at, llm_model
+         FROM hp_image_asset ${whereSql}
+     ORDER BY analyzed_at DESC, id DESC
+        LIMIT ${limit} OFFSET ${offset}`,
+      params,
+    );
+
+    return c.json({
+      total,
+      limit,
+      offset,
+      rows: (rows as any[]).map((r) => ({
+        id: r.id,
+        srcPath: r.src_path,
+        absoluteUrl: r.src_path.startsWith("http")
+          ? r.src_path
+          : `https://ppm.malgn.co.kr/${r.src_path.replace(/^(\.\.\/|\.\/)+/, "").replace(/^\/+/, "")}`,
+        title: r.title,
+        description: r.description,
+        source: r.source,
+        firstSeenPostId: r.first_seen_post_id,
+        firstSeenProjectId: r.first_seen_project_id,
+        usageCount: r.usage_count,
+        lastUsedAt: r.last_used_at,
+        analyzedAt: r.analyzed_at,
+        llmModel: r.llm_model,
+      })),
+    });
+  }),
+);
+
+app.get("/image-assets/:id", async (c) =>
+  withConn(c, async (conn) => {
+    const id = parseInt(c.req.param("id"), 10);
+    if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
+    const [rows] = await conn.query(`SELECT * FROM hp_image_asset WHERE id = ? AND status = 1`, [id]);
+    const row = (rows as any[])[0];
+    if (!row) return c.json({ error: "not found" }, 404);
+    return c.json({
+      ...row,
+      absoluteUrl: row.src_path.startsWith("http")
+        ? row.src_path
+        : `https://ppm.malgn.co.kr/${row.src_path.replace(/^(\.\.\/|\.\/)+/, "").replace(/^\/+/, "")}`,
+    });
+  }),
+);
+
+// ── admin 홈 KPI 집계 ─────────────────────────────────
+app.get("/admin/kpi", async (c) =>
+  withConn(c, async (conn) => {
+    // 표준답변·이미지·평가는 단순 COUNT, 비용은 이번 달
+    const [[sa]] = await conn.query<any>(
+      `SELECT COUNT(*) AS total FROM hp_standard_answer WHERE status = 1`,
+    );
+    const [[img]] = await conn.query<any>(
+      `SELECT COUNT(*) AS total FROM hp_image_asset WHERE status = 1`,
+    );
+    const [[evals]] = await conn.query<any>(
+      `SELECT COUNT(*) AS total,
+              AVG(overall_score) AS avg_score
+         FROM hp_qa_eval
+        WHERE status = 1 AND overall_score IS NOT NULL`,
+    );
+    const [[cost]] = await conn.query<any>(
+      `SELECT SUM(IFNULL(cost_usd, 0)) AS month_cost,
+              COUNT(*) AS month_calls
+         FROM hp_llm_log
+        WHERE request_at >= DATE_FORMAT(NOW(), '%Y-%m-01')`,
+    );
+    const [[brief]] = await conn.query<any>(
+      `SELECT COUNT(*) AS total FROM hp_briefing WHERE status = 1`,
+    );
+
+    // 최근 활동 (최근 10건 — 평가·이미지·표준답변 등록 시각 기반 합치기)
+    const [recent] = await conn.query<any>(
+      `(
+         SELECT 'qa_eval' AS kind, id, created_at, overall_verdict AS title, post_id AS ref_id
+           FROM hp_qa_eval WHERE status = 1 ORDER BY created_at DESC LIMIT 5
+       ) UNION ALL (
+         SELECT 'image' AS kind, id, created_at, title, first_seen_post_id AS ref_id
+           FROM hp_image_asset WHERE status = 1 ORDER BY created_at DESC LIMIT 5
+       ) UNION ALL (
+         SELECT 'standard_answer' AS kind, id, created_at, label AS title, source_post_id AS ref_id
+           FROM hp_standard_answer WHERE status = 1 ORDER BY created_at DESC LIMIT 5
+       )
+       ORDER BY created_at DESC LIMIT 10`,
+    );
+
+    return c.json({
+      kpi: {
+        standardAnswers: Number(sa.total ?? 0),
+        images: Number(img.total ?? 0),
+        evals: Number(evals.total ?? 0),
+        evalsAvgScore: evals.avg_score != null ? Math.round(Number(evals.avg_score) * 10) / 10 : null,
+        briefings: Number(brief.total ?? 0),
+        monthCostUsd: Number(cost.month_cost ?? 0),
+        monthCalls: Number(cost.month_calls ?? 0),
+      },
+      recent: (recent as any[]).map((r) => ({
+        kind: r.kind,
+        id: r.id,
+        title: r.title,
+        refId: r.ref_id,
+        createdAt: r.created_at,
+      })),
+    });
+  }),
+);
+
 export default app;
