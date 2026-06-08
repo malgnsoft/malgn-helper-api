@@ -3,6 +3,8 @@ import { cors } from "hono/cors";
 import { createConnection } from "mysql2/promise";
 import { openapiSpec, docHtml } from "./openapi";
 import { callOpenAiJson, callWorkersAi } from "./llm";
+import { sign as jwtSign, verify as jwtVerify } from "hono/jwt";
+import { getCookie, setCookie, deleteCookie } from "hono/cookie";
 import {
   parseKst14ToMs,
   businessMinutesBetween,
@@ -21,6 +23,7 @@ type Bindings = {
   OPENAI_API_KEY: string;
   LLM_MODEL_DEFAULT: string;
   LLM_MODEL_PREMIUM: string;
+  JWT_SECRET: string; // wrangler secret — admin JWT 서명
 };
 
 const app = new Hono<{ Bindings: Bindings }>();
@@ -36,7 +39,8 @@ app.use(
       return null;
     },
     allowMethods: ["GET", "PUT", "POST", "PATCH", "DELETE", "OPTIONS"],
-    allowHeaders: ["Content-Type"],
+    allowHeaders: ["Content-Type", "Authorization"],
+    credentials: true, // cookie 기반 인증 (admin)
     maxAge: 600, // 10분 — 룰 변경 시 빠르게 전파
   }),
 );
@@ -2686,5 +2690,112 @@ app.get("/admin/kpi", async (c) =>
     });
   }),
 );
+
+// ── 인증 (admin · tb_user 기반) ─────────────────────────
+// CLAUDE.md/메모리 룰: 직원 = `@malgnsoft.com` 이메일 OR `tb_user.company='맑은소프트'`
+// PMS의 tb_user.passwd가 SHA-256 hex 64자라 가정 (사용자 명시).
+
+const SESSION_COOKIE = "helper_session";
+const SESSION_TTL_SECONDS = 60 * 60 * 8; // 8h
+
+type SessionPayload = {
+  sub: number;        // tb_user.id
+  loginId: string;
+  name: string;
+  email: string;
+  company: string;
+  level: number;
+  iat: number;
+  exp: number;
+};
+
+/** POST /auth/login — login_id + password로 JWT 발급 + httpOnly cookie */
+app.post("/auth/login", async (c) =>
+  withConn(c, async (conn) => {
+    const body = await c.req.json<{ loginId?: string; password?: string }>().catch(() => ({}));
+    const loginId = (body.loginId ?? "").trim();
+    const password = body.password ?? "";
+    if (!loginId || !password) return c.json({ error: "loginId, password required" }, 400);
+
+    const passHash = await sha256Hex(password);
+    const [rows] = await conn.query(
+      `SELECT id, login_id, name, email, company, level, status
+         FROM tb_user
+        WHERE login_id = ? AND passwd = ? AND status = 1
+        LIMIT 1`,
+      [loginId, passHash],
+    );
+    const user = (rows as any[])[0];
+    if (!user) return c.json({ error: "invalid credentials" }, 401);
+
+    // 직원 검증 (메모리 룰)
+    const isStaff =
+      (typeof user.email === "string" && user.email.endsWith("@malgnsoft.com")) ||
+      user.company === "맑은소프트";
+    if (!isStaff) return c.json({ error: "forbidden: staff only" }, 403);
+
+    const now = Math.floor(Date.now() / 1000);
+    const payload: SessionPayload = {
+      sub: user.id,
+      loginId: user.login_id,
+      name: user.name ?? "",
+      email: user.email ?? "",
+      company: user.company ?? "",
+      level: user.level ?? 0,
+      iat: now,
+      exp: now + SESSION_TTL_SECONDS,
+    };
+    const token = await jwtSign(payload, c.env.JWT_SECRET);
+
+    setCookie(c, SESSION_COOKIE, token, {
+      httpOnly: true,
+      secure: true,
+      sameSite: "None", // admin·api가 다른 origin (cross-site)
+      path: "/",
+      maxAge: SESSION_TTL_SECONDS,
+    });
+
+    return c.json({
+      ok: true,
+      user: {
+        id: user.id,
+        loginId: user.login_id,
+        name: user.name,
+        email: user.email,
+        company: user.company,
+        level: user.level,
+      },
+    });
+  }),
+);
+
+/** POST /auth/logout — cookie 삭제 */
+app.post("/auth/logout", (c) => {
+  deleteCookie(c, SESSION_COOKIE, { path: "/" });
+  return c.json({ ok: true });
+});
+
+/** GET /auth/me — 현재 세션 사용자 (미인증 시 401) */
+app.get("/auth/me", async (c) => {
+  const token = getCookie(c, SESSION_COOKIE);
+  if (!token) return c.json({ error: "unauthorized" }, 401);
+  try {
+    const payload = (await jwtVerify(token, c.env.JWT_SECRET)) as unknown as SessionPayload;
+    return c.json({
+      user: {
+        id: payload.sub,
+        loginId: payload.loginId,
+        name: payload.name,
+        email: payload.email,
+        company: payload.company,
+        level: payload.level,
+      },
+      exp: payload.exp,
+    });
+  } catch {
+    deleteCookie(c, SESSION_COOKIE, { path: "/" });
+    return c.json({ error: "invalid or expired session" }, 401);
+  }
+});
 
 export default app;
