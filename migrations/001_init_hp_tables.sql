@@ -1,7 +1,7 @@
 -- migrations/001_init_hp_tables.sql
 -- Malgn Helper — 초기 hp_* 테이블 생성
 -- 실행 위치: PMS DB (Hyperdrive 통해 연결 중인 동일 MySQL)
--- 설계 문서: malgn-helper/doc/HP-SCHEMA.md
+-- 설계 문서: malgn-helper/docs/HP-SCHEMA.md
 -- 안전성: 모두 CREATE TABLE IF NOT EXISTS. tb_* 운영 테이블은 건드리지 않음.
 
 -- ── 1. 프로젝트 브리핑 카드 캐시 ─────────────────────────
