@@ -130,16 +130,28 @@ export async function callWorkersAi<T>(
   };
 }
 
-// OpenAI 공시 가격(2024-2025, USD per 1M tokens). 모델 추가 시 여기 갱신.
+// OpenAI 공시 가격(USD per 1M tokens). 모델 추가 시 여기 갱신.
 const PRICING: Record<string, { input: number; output: number }> = {
-  "gpt-4o-mini": { input: 0.15, output: 0.6 },
-  "gpt-4o":      { input: 2.5,  output: 10 },
+  // gpt-4.1 계열 (2025) — 현재 운영 모델 LLM_MODEL_DEFAULT/PREMIUM = openai/gpt-4.1-mini
+  "gpt-4.1":      { input: 2.0,  output: 8.0 },
+  "gpt-4.1-mini": { input: 0.4,  output: 1.6 },
+  "gpt-4.1-nano": { input: 0.1,  output: 0.4 },
+  // gpt-4o 계열
+  "gpt-4o-mini":  { input: 0.15, output: 0.6 },
+  "gpt-4o":       { input: 2.5,  output: 10 },
 };
 
 function estimateCost(model: string, pin: number, pout: number): number {
-  // model이 "openai/gpt-4o-mini" 같은 prefix 형식일 수 있음
+  // model이 "openai/gpt-4.1-mini" 같은 vendor prefix 형식일 수 있음 → 마지막 segment 사용
   const base = model.includes("/") ? model.split("/").slice(-1)[0] : model;
-  const p = PRICING[base];
+  // 정확 매칭 우선, 없으면 날짜 suffix(예: gpt-4.1-mini-2025-04-14) 등 변형 대비 최장 prefix 매칭
+  let p = PRICING[base];
+  if (!p) {
+    const key = Object.keys(PRICING)
+      .filter((k) => base.startsWith(k))
+      .sort((a, b) => b.length - a.length)[0];
+    if (key) p = PRICING[key];
+  }
   if (!p) return 0;
   return ((pin * p.input) + (pout * p.output)) / 1_000_000;
 }
