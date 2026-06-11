@@ -141,7 +141,7 @@ const PRICING: Record<string, { input: number; output: number }> = {
   "gpt-4o":       { input: 2.5,  output: 10 },
 };
 
-export function estimateCost(model: string, pin: number, pout: number): number {
+function estimateCost(model: string, pin: number, pout: number): number {
   // model이 "openai/gpt-4.1-mini" 같은 vendor prefix 형식일 수 있음 → 마지막 segment 사용
   const base = model.includes("/") ? model.split("/").slice(-1)[0] : model;
   // 정확 매칭 우선, 없으면 날짜 suffix(예: gpt-4.1-mini-2025-04-14) 등 변형 대비 최장 prefix 매칭
