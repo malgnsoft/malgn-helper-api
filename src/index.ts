@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { createConnection } from "mysql2/promise";
 import { openapiSpec, docHtml } from "./openapi";
-import { callOpenAiJson, callWorkersAi } from "./llm";
+import { callOpenAiJson, callWorkersAi, estimateCost } from "./llm";
 import { sign as jwtSign, verify as jwtVerify } from "hono/jwt";
 import { getCookie, setCookie, deleteCookie } from "hono/cookie";
 import {
@@ -169,6 +169,42 @@ app.post("/admin/migrate/hp_image_asset", async (c) =>
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     `);
     return c.json({ ok: true, table: "hp_image_asset" });
+  }),
+);
+
+// 일회용 백필 — cost_usd 가 0/NULL 로 기록된 과거 LLM 로그를 단가로 재계산.
+// (gpt-4.1-mini 단가 미등록 시기에 0 으로 저장된 행 보정). ?confirm=yes 호출.
+app.post("/admin/migrate/backfill-cost", async (c) =>
+  withConn(c, async (conn) => {
+    if (c.req.query("confirm") !== "yes") return c.json({ error: "add ?confirm=yes" }, 400);
+    // 비용 0/NULL + 토큰 기록 있음 + 캐시 히트 아님(캐시는 비용 0 정상)
+    const [rows] = await conn.query(
+      `SELECT id, model, prompt_tokens, completion_tokens
+         FROM hp_llm_log
+        WHERE (cost_usd IS NULL OR cost_usd = 0)
+          AND prompt_tokens IS NOT NULL
+          AND completion_tokens IS NOT NULL
+          AND (prompt_tokens > 0 OR completion_tokens > 0)
+          AND cache_hit = 0`,
+    );
+    const list = rows as Array<{ id: number; model: string; prompt_tokens: number; completion_tokens: number }>;
+    let updated = 0;
+    let skipped = 0;
+    let totalCost = 0;
+    for (const r of list) {
+      const cost = estimateCost(r.model ?? "", r.prompt_tokens, r.completion_tokens);
+      if (!(cost > 0)) { skipped++; continue; } // 단가 미등록 모델·db_only 등은 건너뜀
+      await conn.query(`UPDATE hp_llm_log SET cost_usd = ? WHERE id = ?`, [cost, r.id]);
+      updated++;
+      totalCost += cost;
+    }
+    return c.json({
+      ok: true,
+      candidates: list.length,
+      updated,
+      skipped,
+      backfilledCostUsd: Number(totalCost.toFixed(6)),
+    });
   }),
 );
 
