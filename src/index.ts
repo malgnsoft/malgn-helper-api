@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import type { MiddlewareHandler } from "hono";
 import { cors } from "hono/cors";
 import { createConnection } from "mysql2/promise";
 import { openapiSpec, docHtml } from "./openapi";
@@ -26,7 +27,7 @@ type Bindings = {
   JWT_SECRET: string; // wrangler secret — admin JWT 서명
 };
 
-const app = new Hono<{ Bindings: Bindings }>();
+const app = new Hono<{ Bindings: Bindings; Variables: { session: SessionPayload } }>();
 
 app.use(
   "*",
@@ -2709,6 +2710,42 @@ type SessionPayload = {
   exp: number;
 };
 
+// ── 인증 가드 미들웨어 ───────────────────────────────────
+// 기존엔 라우트별 가드가 없었다(/admin/* 무인증). requireAuth/requireRole 신설.
+// 역할 레벨: agent < developer(5) <= admin(9). roleOf와 정합.
+const ROLE_LEVEL = { agent: 1, developer: 5, admin: 9 } as const;
+
+/** helper_session 쿠키의 JWT를 검증하고 c.set("session")에 payload 주입. 실패 시 401. */
+const requireAuth: MiddlewareHandler<{
+  Bindings: Bindings;
+  Variables: { session: SessionPayload };
+}> = async (c, next) => {
+  const token = getCookie(c, SESSION_COOKIE);
+  if (!token) return c.json({ error: "unauthorized" }, 401);
+  try {
+    // sign은 default(HS256) → verify에도 alg 명시 (hono v4 verify는 3번째 인자 필수)
+    const payload = (await jwtVerify(token, c.env.JWT_SECRET, "HS256")) as unknown as SessionPayload;
+    c.set("session", payload);
+    await next();
+  } catch {
+    deleteCookie(c, SESSION_COOKIE, { path: "/" });
+    return c.json({ error: "invalid or expired session" }, 401);
+  }
+};
+
+/** 최소 권한(level) 가드 — requireAuth 뒤에 체인해서 사용. */
+const requireRole = (
+  minLevel: number,
+): MiddlewareHandler<{
+  Bindings: Bindings;
+  Variables: { session: SessionPayload };
+}> => async (c, next) => {
+  const s = c.get("session");
+  if (!s) return c.json({ error: "unauthorized" }, 401);
+  if ((s.level ?? 0) < minLevel) return c.json({ error: "forbidden: insufficient role" }, 403);
+  await next();
+};
+
 /** POST /auth/login — login_id + password로 JWT 발급 + httpOnly cookie */
 app.post("/auth/login", async (c) =>
   withConn(c, async (conn) => {
@@ -2797,5 +2834,519 @@ app.get("/auth/me", async (c) => {
     return c.json({ error: "invalid or expired session" }, 401);
   }
 });
+
+// ── 계정 관리 (admin) ────────────────────────────────────
+type AccountRow = {
+  id: number;
+  loginId: string;
+  name: string;
+  email: string;
+  company: string;
+  level: number;
+  lastLogin: string | null; // conn_date(varchar14, KST) → ISO+09:00
+  isActive: boolean;         // tb_user.status === 1
+};
+type AccountsResponse = {
+  page: number;
+  pageSize: number;
+  total: number;
+  rows: AccountRow[];
+};
+
+/**
+ * GET /accounts — 운영자/개발자/상담사 계정 목록 (admin 전용).
+ * query: q(이름/로그인ID/이메일 부분검색), page(1~), pageSize(1~100, 기본 20).
+ * PII(이메일)는 운영자 화면 용도로 노출. passwd 등 민감 컬럼은 select·반환 금지.
+ * 고객 계정 노출 방지를 위해 직원(@malgnsoft.com 또는 company='맑은소프트')으로 스코프.
+ */
+app.get("/accounts", requireAuth, requireRole(ROLE_LEVEL.admin), async (c) =>
+  withConn(c, async (conn) => {
+    const q = (c.req.query("q") ?? "").trim();
+    const page = Math.max(1, Number(c.req.query("page") ?? "1") || 1);
+    const pageSizeRaw = Number(c.req.query("pageSize") ?? "20") || 20;
+    const pageSize = Math.min(100, Math.max(1, pageSizeRaw));
+    const offset = (page - 1) * pageSize;
+
+    // 직원 스코프 (고객 PII 대량 노출 방지)
+    const where: string[] = ["(email LIKE ? OR company = ?)"];
+    const params: (string | number)[] = ["%@malgnsoft.com", "맑은소프트"];
+    if (q) {
+      where.push("(name LIKE ? OR login_id LIKE ? OR email LIKE ?)");
+      const like = `%${q}%`;
+      params.push(like, like, like);
+    }
+    const whereSql = `WHERE ${where.join(" AND ")}`;
+
+    const [countRows] = await conn.query(
+      `SELECT COUNT(*) AS total FROM tb_user ${whereSql}`,
+      params,
+    );
+    const total = Number((countRows as { total: number }[])[0]?.total ?? 0);
+
+    const [rows] = await conn.query(
+      `SELECT id, login_id, name, email, company, level, conn_date, status
+         FROM tb_user
+         ${whereSql}
+        ORDER BY (conn_date IS NULL), conn_date DESC, id DESC
+        LIMIT ? OFFSET ?`,
+      [...params, pageSize, offset],
+    );
+
+    const out: AccountRow[] = (rows as {
+      id: number;
+      login_id: string;
+      name: string | null;
+      email: string | null;
+      company: string | null;
+      level: number;
+      conn_date: string | null;
+      status: number;
+    }[]).map((r) => ({
+      id: r.id,
+      loginId: r.login_id,
+      name: r.name ?? "",
+      email: r.email ?? "",
+      company: r.company ?? "",
+      level: r.level ?? 0,
+      lastLogin: toIso(r.conn_date),
+      isActive: r.status === 1,
+    }));
+
+    const body: AccountsResponse = { page, pageSize, total, rows: out };
+    return c.json(body);
+  }),
+);
+
+// ══════════════════════════════════════════════════════════
+// 관리자 콘솔 — catalog(hp_topic/hp_service) · settings(hp_setting) · integrations(hp_integration)
+// 테이블은 migrations/002_admin_console.sql 정의 그대로 사용(여기선 raw SQL CRUD만).
+// status: 1=active, -1=deleted(soft). active: 운영 노출 토글(0/1).
+// ══════════════════════════════════════════════════════════
+
+// withConn이 넘기는 conn을 any 없이 다루기 위한 최소 인터페이스.
+type Queryable = {
+  query: (sql: string, params?: unknown[]) => Promise<[unknown[], unknown]>;
+};
+
+function isDupKey(e: unknown): boolean {
+  return typeof e === "object" && e !== null && (e as { code?: string }).code === "ER_DUP_ENTRY";
+}
+
+// 요청 body 타입(전부 optional → JSON 파싱 실패 시 {} 폴백 허용).
+type TopicInput = { slug?: string; scope?: string; label?: string; description?: string; sortOrder?: number; active?: boolean };
+type ServiceInput = { slug?: string; name?: string; note?: string; sortOrder?: number; active?: boolean };
+type SettingsPutBody = { settings?: Record<string, unknown> };
+type IntegrationPutBody = { connStatus?: string; detail?: string; config?: unknown; secretSet?: boolean };
+
+// ── value_type 파싱/직렬화 유틸 (settings 공용) ──
+type SettingValueType = "string" | "number" | "boolean" | "json";
+
+function parseSettingValue(raw: string | null, type: string): unknown {
+  if (raw === null) return null;
+  switch (type) {
+    case "number": {
+      const n = Number(raw);
+      return Number.isFinite(n) ? n : null;
+    }
+    case "boolean":
+      return raw === "true" || raw === "1";
+    case "json":
+      try {
+        return JSON.parse(raw) as unknown;
+      } catch {
+        return null;
+      }
+    default:
+      return raw; // string
+  }
+}
+
+function serializeSettingValue(value: unknown, type: string): string {
+  switch (type) {
+    case "number":
+      return String(Number(value));
+    case "boolean":
+      return value ? "true" : "false";
+    case "json":
+      return JSON.stringify(value ?? null);
+    default:
+      return value == null ? "" : String(value);
+  }
+}
+
+function inferValueType(value: unknown): SettingValueType {
+  if (typeof value === "boolean") return "boolean";
+  if (typeof value === "number") return "number";
+  if (value !== null && typeof value === "object") return "json";
+  return "string";
+}
+
+// ── 토픽 카탈로그 (hp_topic) ──────────────────────────────
+type TopicScope = "common" | "service";
+type TopicDto = {
+  id: number;
+  slug: string;
+  scope: TopicScope;
+  label: string;
+  description: string;
+  sortOrder: number;
+  active: boolean;
+};
+type TopicRaw = {
+  id: number;
+  slug: string;
+  scope: TopicScope;
+  label: string;
+  description: string | null;
+  sort_order: number;
+  active: number;
+};
+function toTopicDto(r: TopicRaw): TopicDto {
+  return {
+    id: r.id,
+    slug: r.slug,
+    scope: r.scope,
+    label: r.label,
+    description: r.description ?? "",
+    sortOrder: r.sort_order,
+    active: r.active === 1,
+  };
+}
+
+/** GET /topics?scope=common|service&active=1|0 — 토픽 목록(soft-deleted 제외). */
+app.get("/topics", requireAuth, requireRole(ROLE_LEVEL.developer), async (c) =>
+  withConn(c, async (conn) => {
+    const scope = c.req.query("scope");
+    const active = c.req.query("active");
+    const where: string[] = ["status = 1"];
+    const params: unknown[] = [];
+    if (scope === "common" || scope === "service") {
+      where.push("scope = ?");
+      params.push(scope);
+    }
+    if (active === "0" || active === "1") {
+      where.push("active = ?");
+      params.push(Number(active));
+    }
+    const [rows] = await conn.query(
+      `SELECT id, slug, scope, label, description, sort_order, active
+         FROM hp_topic
+        WHERE ${where.join(" AND ")}
+        ORDER BY scope, sort_order, id`,
+      params,
+    );
+    return c.json({ rows: (rows as TopicRaw[]).map(toTopicDto) });
+  }),
+);
+
+/** POST /topics — 토픽 생성. body {slug, scope, label, description?, sortOrder?, active?} */
+app.post("/topics", requireAuth, requireRole(ROLE_LEVEL.admin), async (c) =>
+  withConn(c, async (conn) => {
+    const b = await c.req.json<TopicInput>().catch((): TopicInput => ({}));
+    const slug = (b.slug ?? "").trim();
+    const scope = b.scope === "service" ? "service" : b.scope === "common" ? "common" : "";
+    const label = (b.label ?? "").trim();
+    if (!slug || !scope || !label) return c.json({ error: "slug, scope(common|service), label required" }, 400);
+    try {
+      const [res] = await conn.query(
+        `INSERT INTO hp_topic (slug, scope, label, description, sort_order, active)
+         VALUES (?,?,?,?,?,?)`,
+        [slug, scope, label, b.description ?? null, Number(b.sortOrder ?? 0), b.active === false ? 0 : 1],
+      );
+      const id = (res as unknown as { insertId: number }).insertId;
+      const [rows] = await conn.query(
+        `SELECT id, slug, scope, label, description, sort_order, active FROM hp_topic WHERE id = ?`,
+        [id],
+      );
+      return c.json(toTopicDto((rows as TopicRaw[])[0]), 201);
+    } catch (e) {
+      if (isDupKey(e)) return c.json({ error: "duplicate (scope, slug)" }, 409);
+      throw e;
+    }
+  }),
+);
+
+/** PUT /topics/:id — 부분 수정(전달 필드만). active 토글 포함. */
+app.put("/topics/:id", requireAuth, requireRole(ROLE_LEVEL.admin), async (c) =>
+  withConn(c, async (conn) => {
+    const id = Number(c.req.param("id"));
+    if (!Number.isInteger(id)) return c.json({ error: "invalid id" }, 400);
+    const b = await c.req.json<TopicInput>().catch((): TopicInput => ({}));
+    const sets: string[] = [];
+    const params: unknown[] = [];
+    if (typeof b.slug === "string") { sets.push("slug = ?"); params.push(b.slug.trim()); }
+    if (b.scope === "common" || b.scope === "service") { sets.push("scope = ?"); params.push(b.scope); }
+    if (typeof b.label === "string") { sets.push("label = ?"); params.push(b.label.trim()); }
+    if (b.description !== undefined) { sets.push("description = ?"); params.push(b.description ?? null); }
+    if (b.sortOrder !== undefined) { sets.push("sort_order = ?"); params.push(Number(b.sortOrder)); }
+    if (b.active !== undefined) { sets.push("active = ?"); params.push(b.active ? 1 : 0); }
+    if (!sets.length) return c.json({ error: "no updatable fields" }, 400);
+    try {
+      const [res] = await conn.query(
+        `UPDATE hp_topic SET ${sets.join(", ")} WHERE id = ? AND status = 1`,
+        [...params, id],
+      );
+      if ((res as unknown as { affectedRows: number }).affectedRows === 0)
+        return c.json({ error: "not found" }, 404);
+      const [rows] = await conn.query(
+        `SELECT id, slug, scope, label, description, sort_order, active FROM hp_topic WHERE id = ?`,
+        [id],
+      );
+      return c.json(toTopicDto((rows as TopicRaw[])[0]));
+    } catch (e) {
+      if (isDupKey(e)) return c.json({ error: "duplicate (scope, slug)" }, 409);
+      throw e;
+    }
+  }),
+);
+
+/** DELETE /topics/:id — soft delete(status=-1). */
+app.delete("/topics/:id", requireAuth, requireRole(ROLE_LEVEL.admin), async (c) =>
+  withConn(c, async (conn) => {
+    const id = Number(c.req.param("id"));
+    if (!Number.isInteger(id)) return c.json({ error: "invalid id" }, 400);
+    const [res] = await conn.query(`UPDATE hp_topic SET status = -1 WHERE id = ? AND status = 1`, [id]);
+    if ((res as unknown as { affectedRows: number }).affectedRows === 0) return c.json({ error: "not found" }, 404);
+    return c.json({ ok: true, id });
+  }),
+);
+
+// ── 서비스 카탈로그 (hp_service) ──────────────────────────
+type ServiceDto = { id: number; slug: string; name: string; note: string; sortOrder: number; active: boolean };
+type ServiceRaw = { id: number; slug: string; name: string; note: string | null; sort_order: number; active: number };
+function toServiceDto(r: ServiceRaw): ServiceDto {
+  return { id: r.id, slug: r.slug, name: r.name, note: r.note ?? "", sortOrder: r.sort_order, active: r.active === 1 };
+}
+
+/** GET /services?active=1|0 — 서비스 목록(soft-deleted 제외). */
+app.get("/services", requireAuth, requireRole(ROLE_LEVEL.developer), async (c) =>
+  withConn(c, async (conn) => {
+    const active = c.req.query("active");
+    const where: string[] = ["status = 1"];
+    const params: unknown[] = [];
+    if (active === "0" || active === "1") { where.push("active = ?"); params.push(Number(active)); }
+    const [rows] = await conn.query(
+      `SELECT id, slug, name, note, sort_order, active
+         FROM hp_service
+        WHERE ${where.join(" AND ")}
+        ORDER BY sort_order, id`,
+      params,
+    );
+    return c.json({ rows: (rows as ServiceRaw[]).map(toServiceDto) });
+  }),
+);
+
+/** POST /services — 생성. body {slug, name, note?, sortOrder?, active?} */
+app.post("/services", requireAuth, requireRole(ROLE_LEVEL.admin), async (c) =>
+  withConn(c, async (conn) => {
+    const b = await c.req.json<ServiceInput>().catch((): ServiceInput => ({}));
+    const slug = (b.slug ?? "").trim();
+    const name = (b.name ?? "").trim();
+    if (!slug || !name) return c.json({ error: "slug, name required" }, 400);
+    try {
+      const [res] = await conn.query(
+        `INSERT INTO hp_service (slug, name, note, sort_order, active) VALUES (?,?,?,?,?)`,
+        [slug, name, b.note ?? null, Number(b.sortOrder ?? 0), b.active === false ? 0 : 1],
+      );
+      const id = (res as unknown as { insertId: number }).insertId;
+      const [rows] = await conn.query(`SELECT id, slug, name, note, sort_order, active FROM hp_service WHERE id = ?`, [id]);
+      return c.json(toServiceDto((rows as ServiceRaw[])[0]), 201);
+    } catch (e) {
+      if (isDupKey(e)) return c.json({ error: "duplicate slug" }, 409);
+      throw e;
+    }
+  }),
+);
+
+/** PUT /services/:id — 부분 수정. */
+app.put("/services/:id", requireAuth, requireRole(ROLE_LEVEL.admin), async (c) =>
+  withConn(c, async (conn) => {
+    const id = Number(c.req.param("id"));
+    if (!Number.isInteger(id)) return c.json({ error: "invalid id" }, 400);
+    const b = await c.req.json<ServiceInput>().catch((): ServiceInput => ({}));
+    const sets: string[] = [];
+    const params: unknown[] = [];
+    if (typeof b.slug === "string") { sets.push("slug = ?"); params.push(b.slug.trim()); }
+    if (typeof b.name === "string") { sets.push("name = ?"); params.push(b.name.trim()); }
+    if (b.note !== undefined) { sets.push("note = ?"); params.push(b.note ?? null); }
+    if (b.sortOrder !== undefined) { sets.push("sort_order = ?"); params.push(Number(b.sortOrder)); }
+    if (b.active !== undefined) { sets.push("active = ?"); params.push(b.active ? 1 : 0); }
+    if (!sets.length) return c.json({ error: "no updatable fields" }, 400);
+    try {
+      const [res] = await conn.query(`UPDATE hp_service SET ${sets.join(", ")} WHERE id = ? AND status = 1`, [...params, id]);
+      if ((res as unknown as { affectedRows: number }).affectedRows === 0) return c.json({ error: "not found" }, 404);
+      const [rows] = await conn.query(`SELECT id, slug, name, note, sort_order, active FROM hp_service WHERE id = ?`, [id]);
+      return c.json(toServiceDto((rows as ServiceRaw[])[0]));
+    } catch (e) {
+      if (isDupKey(e)) return c.json({ error: "duplicate slug" }, 409);
+      throw e;
+    }
+  }),
+);
+
+/** DELETE /services/:id — soft delete. */
+app.delete("/services/:id", requireAuth, requireRole(ROLE_LEVEL.admin), async (c) =>
+  withConn(c, async (conn) => {
+    const id = Number(c.req.param("id"));
+    if (!Number.isInteger(id)) return c.json({ error: "invalid id" }, 400);
+    const [res] = await conn.query(`UPDATE hp_service SET status = -1 WHERE id = ? AND status = 1`, [id]);
+    if ((res as unknown as { affectedRows: number }).affectedRows === 0) return c.json({ error: "not found" }, 404);
+    return c.json({ ok: true, id });
+  }),
+);
+
+// ── 외부 연동 (hp_integration) ────────────────────────────
+// ⚠ 시크릿(Webhook URL·API Key·Secret 등)은 DB 저장·반환 금지. secret_set 플래그만. 실제 시크릿은 wrangler secret.
+// ※ 정적 경로 "/settings/integrations" 가 파라미터 경로 "/settings/:group" 보다 먼저 등록돼야
+//   매칭 우선순위가 보장된다(Hono는 등록 순서 의존) — 그래서 이 섹션을 설정 섹션보다 앞에 둔다.
+type IntegrationDto = {
+  id: string; // integration_key (UI 식별자)
+  name: string;
+  category: string;
+  description: string;
+  status: "connected" | "disconnected" | "error";
+  detail: string;
+  config: unknown; // 비밀 아닌 설정 JSON
+  secretSet: boolean;
+  docsUrl: string | null;
+  sortOrder: number;
+};
+type IntegrationRaw = {
+  integration_key: string;
+  name: string;
+  category: string;
+  description: string | null;
+  conn_status: "connected" | "disconnected" | "error";
+  detail: string | null;
+  config_json: string | null;
+  secret_set: number;
+  docs_url: string | null;
+  sort_order: number;
+};
+function toIntegrationDto(r: IntegrationRaw): IntegrationDto {
+  let config: unknown = null;
+  if (r.config_json) {
+    try { config = JSON.parse(r.config_json) as unknown; } catch { config = null; }
+  }
+  return {
+    id: r.integration_key,
+    name: r.name,
+    category: r.category,
+    description: r.description ?? "",
+    status: r.conn_status,
+    detail: r.detail ?? "",
+    config,
+    secretSet: r.secret_set === 1,
+    docsUrl: r.docs_url,
+    sortOrder: r.sort_order,
+  };
+}
+
+/** GET /settings/integrations — 외부 연동 목록. 시크릿 값은 포함하지 않음. */
+app.get("/settings/integrations", requireAuth, requireRole(ROLE_LEVEL.developer), async (c) =>
+  withConn(c, async (conn) => {
+    const [rows] = await conn.query(
+      `SELECT integration_key, name, category, description, conn_status, detail, config_json, secret_set, docs_url, sort_order
+         FROM hp_integration
+        WHERE status = 1
+        ORDER BY sort_order, id`,
+    );
+    return c.json({ rows: (rows as IntegrationRaw[]).map(toIntegrationDto) });
+  }),
+);
+
+/**
+ * PUT /settings/integrations/:key — conn_status·detail·config(비밀 아님)·secretSet 갱신.
+ * 시크릿 값 자체는 받지 않는다. 실제 시크릿은 `wrangler secret put` 로 설정.
+ */
+app.put("/settings/integrations/:key", requireAuth, requireRole(ROLE_LEVEL.admin), async (c) =>
+  withConn(c, async (conn) => {
+    const key = c.req.param("key");
+    const b = await c.req.json<IntegrationPutBody>().catch((): IntegrationPutBody => ({}));
+    const sets: string[] = [];
+    const params: unknown[] = [];
+    if (b.connStatus === "connected" || b.connStatus === "disconnected" || b.connStatus === "error") {
+      sets.push("conn_status = ?");
+      params.push(b.connStatus);
+    }
+    if (b.detail !== undefined) { sets.push("detail = ?"); params.push(b.detail ?? null); }
+    if (b.config !== undefined) { sets.push("config_json = ?"); params.push(b.config == null ? null : JSON.stringify(b.config)); }
+    if (b.secretSet !== undefined) { sets.push("secret_set = ?"); params.push(b.secretSet ? 1 : 0); }
+    if (!sets.length) return c.json({ error: "no updatable fields" }, 400);
+    const [res] = await conn.query(
+      `UPDATE hp_integration SET ${sets.join(", ")} WHERE integration_key = ? AND status = 1`,
+      [...params, key],
+    );
+    if ((res as unknown as { affectedRows: number }).affectedRows === 0) return c.json({ error: "not found" }, 404);
+    const [rows] = await conn.query(
+      `SELECT integration_key, name, category, description, conn_status, detail, config_json, secret_set, docs_url, sort_order
+         FROM hp_integration WHERE integration_key = ?`,
+      [key],
+    );
+    return c.json(toIntegrationDto((rows as IntegrationRaw[])[0]));
+  }),
+);
+
+// ── 설정 (hp_setting) — group: ai|safety|cache ────────────
+const SETTING_GROUPS = ["ai", "safety", "cache"] as const;
+type SettingGroup = (typeof SETTING_GROUPS)[number];
+function isSettingGroup(g: string): g is SettingGroup {
+  return (SETTING_GROUPS as readonly string[]).includes(g);
+}
+type SettingRaw = { setting_key: string; setting_value: string | null; value_type: string };
+
+async function loadSettingsGroup(conn: Queryable, group: string) {
+  const [rows] = await conn.query(
+    `SELECT setting_key, setting_value, value_type FROM hp_setting WHERE group_name = ? AND status = 1 ORDER BY setting_key`,
+    [group],
+  );
+  const settings: Record<string, unknown> = {};
+  const valueTypes: Record<string, string> = {};
+  for (const r of rows as SettingRaw[]) {
+    settings[r.setting_key] = parseSettingValue(r.setting_value, r.value_type);
+    valueTypes[r.setting_key] = r.value_type;
+  }
+  return { group, settings, valueTypes };
+}
+
+/** GET /settings/:group — ai|safety|cache 설정 묶음. setting_key(snake_case) → value_type대로 파싱된 값. */
+app.get("/settings/:group", requireAuth, requireRole(ROLE_LEVEL.developer), async (c) =>
+  withConn(c, async (conn) => {
+    const group = c.req.param("group");
+    if (!isSettingGroup(group)) return c.json({ error: "unknown setting group (ai|safety|cache)" }, 404);
+    return c.json(await loadSettingsGroup(conn, group));
+  }),
+);
+
+/** PUT /settings/:group — upsert. body {settings:{<setting_key>: value, ...}} (snake_case 키, 원시 타입 값). */
+app.put("/settings/:group", requireAuth, requireRole(ROLE_LEVEL.admin), async (c) =>
+  withConn(c, async (conn) => {
+    const group = c.req.param("group");
+    if (!isSettingGroup(group)) return c.json({ error: "unknown setting group (ai|safety|cache)" }, 404);
+    const body = await c.req.json<SettingsPutBody>().catch((): SettingsPutBody => ({}));
+    const incoming = body.settings;
+    if (!incoming || typeof incoming !== "object" || Array.isArray(incoming))
+      return c.json({ error: "settings object required" }, 400);
+
+    // 기존 키의 value_type 보존(없으면 JS 타입 추론).
+    const [typeRows] = await conn.query(`SELECT setting_key, value_type FROM hp_setting WHERE group_name = ?`, [group]);
+    const typeMap = new Map<string, string>();
+    for (const r of typeRows as { setting_key: string; value_type: string }[]) typeMap.set(r.setting_key, r.value_type);
+
+    const updatedBy = c.get("session").email ?? null;
+    for (const key of Object.keys(incoming)) {
+      const vtype = typeMap.get(key) ?? inferValueType(incoming[key]);
+      const sval = serializeSettingValue(incoming[key], vtype);
+      await conn.query(
+        `INSERT INTO hp_setting (group_name, setting_key, setting_value, value_type, updated_by)
+         VALUES (?,?,?,?,?)
+         ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value), value_type = VALUES(value_type),
+                                 updated_by = VALUES(updated_by), status = 1`,
+        [group, key, sval, vtype, updatedBy],
+      );
+    }
+    return c.json(await loadSettingsGroup(conn, group));
+  }),
+);
 
 export default app;
