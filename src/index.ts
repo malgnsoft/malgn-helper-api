@@ -25,7 +25,15 @@ type Bindings = {
   LLM_MODEL_DEFAULT: string;
   LLM_MODEL_PREMIUM: string;
   JWT_SECRET: string; // wrangler secret — admin JWT 서명
+  PMS_SERVICE_TOKEN?: string; // wrangler secret — PMS 프록시 공유 시크릿(미설정 시 가드 통과)
+  SERVICE_TOKEN_ENFORCE?: string; // vars "1"이면 secret 설정+토큰 불일치 시 401
+  RL_LLM?: RateLimit; // Cloudflare Rate Limiting binding (LLM generate)
 };
+
+/** Cloudflare Rate Limiting binding 형상 (workers-types 미포함 시 대비 인라인). */
+interface RateLimit {
+  limit(opts: { key: string }): Promise<{ success: boolean }>;
+}
 
 const app = new Hono<{ Bindings: Bindings; Variables: { session: SessionPayload } }>();
 
@@ -94,6 +102,74 @@ const requireRole = (
   const s = c.get("session");
   if (!s) return c.json({ error: "unauthorized" }, 401);
   if ((s.level ?? 0) < minLevel) return c.json({ error: "forbidden: insufficient role" }, 403);
+  await next();
+};
+
+// ── PMS 서비스 토큰 가드 (보안 백로그 #1) ─────────────────
+// 대상: PMS 임베드가 비인증으로 호출하는 6개 라우트(표준답변 주입·usage·LLM generate).
+// 전달 경로: PMS는 client-only Nuxt SPA(server/ 없음) → 토큰을 브라우저 번들에 두면 노출.
+//   따라서 PMS는 Nitro 서버 라우트 프록시(server/api/*)를 신설하고, 토큰은 PMS 서버 env로만 보관.
+//   브라우저 → PMS 서버 프록시 → 이 API(X-Service-Token 헤더).
+//
+// 점진 전환(prod 회귀 방지):
+//   - secret 미설정(env.PMS_SERVICE_TOKEN 부재)  → 통과 (전환 전 현행 동작 유지)
+//   - secret 설정 + 헤더 없음/불일치          → SERVICE_TOKEN_ENFORCE !== "1" 이면 통과(관찰),
+//                                              "1" 이면 401 (하드 차단)
+//   - secret 설정 + 헤더 일치                  → 통과
+//   롤아웃 순서: (1) secret put + PMS 프록시 배포 → (2) 일치 로그 확인 → (3) ENFORCE=1.
+const SERVICE_TOKEN_HEADER = "x-service-token";
+
+/** 길이 누설 없는 상수시간 문자열 비교. */
+const timingSafeEqual = (a: string, b: string): boolean => {
+  // 길이 불일치도 가짜 비교로 흡수해 early-return 타이밍 차이를 줄인다.
+  const len = Math.max(a.length, b.length);
+  let diff = a.length ^ b.length;
+  for (let i = 0; i < len; i++) {
+    diff |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
+  }
+  return diff === 0;
+};
+
+const requireServiceToken: MiddlewareHandler<{
+  Bindings: Bindings;
+  Variables: { session: SessionPayload };
+}> = async (c, next) => {
+  const expected = c.env.PMS_SERVICE_TOKEN;
+  // 전환 전: secret 미설정 → 현행 무인증 동작 유지.
+  if (!expected) return next();
+
+  const provided = c.req.header(SERVICE_TOKEN_HEADER);
+  const ok = typeof provided === "string" && timingSafeEqual(provided, expected);
+  if (ok) return next();
+
+  // secret은 설정됐는데 토큰이 없거나 틀림.
+  if (c.env.SERVICE_TOKEN_ENFORCE === "1") {
+    return c.json({ error: "unauthorized: invalid service token" }, 401);
+  }
+  // 관찰 모드: 차단하지 않되 헤더로 표시(로그/대시보드에서 미전환 호출 추적).
+  c.header("X-Service-Token-Status", provided ? "mismatch" : "missing");
+  return next();
+};
+
+// ── rate limit (LLM generate 4종 — IP+프로젝트/포스트 키 기준 분당 한도) ──
+// Cloudflare Rate Limiting binding 사용(무상태·무료, KV/D1 불필요).
+// wrangler.jsonc 의 [[ratelimits]] / unsafe binding 으로 RL_LLM 주입(분당 N회/키).
+const rateLimitLlm: MiddlewareHandler<{
+  Bindings: Bindings;
+  Variables: { session: SessionPayload };
+}> = async (c, next) => {
+  const rl = c.env.RL_LLM;
+  if (!rl) return next(); // 바인딩 미설정 시 통과(점진 적용).
+  const ip =
+    c.req.header("cf-connecting-ip") ||
+    c.req.header("x-forwarded-for") ||
+    "unknown";
+  // 키: route path(파라미터 포함) + IP → 프로젝트/포스트별·IP별 버킷.
+  const key = `${c.req.path}|${ip}`;
+  const { success } = await rl.limit({ key });
+  if (!success) {
+    return c.json({ error: "rate limited: too many generate requests" }, 429);
+  }
   await next();
 };
 
@@ -798,7 +874,7 @@ app.get("/pms/projects/:id/briefing", async (c) =>
 // POST: 새 브리핑 카드 생성 — hp_briefing 저장 + LLM(hotTopics)
 //   캐시: 동일 input_hash + 24h 이내면 LLM 미호출. ?force=1로 우회.
 //   LLM 실패 시 graceful degrade — DB-only 브리핑은 그대로 저장.
-app.post("/pms/projects/:id/briefing/generate", async (c) =>
+app.post("/pms/projects/:id/briefing/generate", requireServiceToken, rateLimitLlm, async (c) =>
   withConn(c, async (conn) => {
     const id = parseInt(c.req.param("id"), 10);
     if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
@@ -1366,7 +1442,7 @@ const ANNOUNCE_SYSTEM_PROMPT = [
   "score가 정해지지 않으면 'warn' + scoreLabel='주의'.",
 ].join("\n");
 
-app.post("/pms/posts/:id/announce-eval/generate", async (c) =>
+app.post("/pms/posts/:id/announce-eval/generate", requireServiceToken, rateLimitLlm, async (c) =>
   withConn(c, async (conn) => {
     const id = parseInt(c.req.param("id"), 10);
     if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
@@ -1600,7 +1676,7 @@ const QA_INQUIRY_ONLY_SYSTEM_PROMPT = [
   "  ◈ 문의가 모호하면 commentary에 '추가 확인이 필요한 정보(예: 환경/버전/일자)'를 1~2줄 명시.",
 ].join("\n");
 
-app.post("/pms/posts/:id/eval/generate", async (c) =>
+app.post("/pms/posts/:id/eval/generate", requireServiceToken, rateLimitLlm, async (c) =>
   withConn(c, async (conn) => {
     const id = parseInt(c.req.param("id"), 10);
     if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
@@ -1958,7 +2034,7 @@ app.delete("/pms/evals/:id", async (c) =>
 // 프로젝트의 직원 응답 본문을 모아 LLM이 반복 패턴을 표준답변 후보로 정리.
 // 저장은 별도 — UI에서 후보 검토 후 POST /standard-answers 호출.
 
-app.post("/pms/projects/:id/standard-answer-suggestions", async (c) =>
+app.post("/pms/projects/:id/standard-answer-suggestions", requireServiceToken, rateLimitLlm, async (c) =>
   withConn(c, async (conn) => {
     const id = parseInt(c.req.param("id"), 10);
     if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
@@ -2293,13 +2369,13 @@ app.get("/admin/cost", requireAuth, requireRole(ROLE_LEVEL.developer), async (c)
 // QaEvalCard "표준답변으로 저장" 액션의 destination + 챗봇 응답 1순위 소스.
 //
 // 가드 방침 (소비자 분석 결과):
-//  - POST: malgn-helper-pms 임베드가 "표준답변으로 저장"에서 비인증으로 호출 중
-//    (credentials 미전송). requireAuth를 붙이면 PMS 회귀 발생 → 의도적으로 미보강.
-//    TODO(보안): /pms/* 읽기 분리 또는 서비스 토큰 도입 후 가드. 별도 보고.
+//  - POST: malgn-helper-pms 임베드가 "표준답변으로 저장"에서 호출.
+//    보안 백로그 #1 — requireServiceToken(X-Service-Token) 적용.
+//    PMS는 Nitro 프록시 경유(브라우저에 토큰 노출 금지). 점진 전환 플래그로 회귀 방지.
 //  - GET(목록·상세): admin UI(standard-answers.vue, credentials 전송)만 소비.
 //    카탈로그 전량 노출 방지 → developer 이상으로 보호.
 //  - PATCH/DELETE: 파괴적 변경 → admin. admin UI가 credentials 전송 중.
-app.post("/standard-answers", async (c) =>
+app.post("/standard-answers", requireServiceToken, async (c) =>
   withConn(c, async (conn) => {
     const body = await c.req.json<{
       label?: string;
@@ -2442,7 +2518,7 @@ app.delete("/standard-answers/:id", requireAuth, requireRole(ROLE_LEVEL.admin), 
 );
 
 // 챗봇이 답변을 사용했을 때 usage_count 증가용 (Phase 2 챗봇 도입 시 호출)
-app.post("/standard-answers/:id/use", async (c) =>
+app.post("/standard-answers/:id/use", requireServiceToken, async (c) =>
   withConn(c, async (conn) => {
     const id = parseInt(c.req.param("id"), 10);
     if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);

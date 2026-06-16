@@ -23,16 +23,32 @@
   // openai/o4-mini 등 OpenAI partner 모델도 binding으로 호출 가능.
   "ai": { "binding": "AI" },
 
+  // Cloudflare Rate Limiting binding (무상태·무료, KV/D1 불필요).
+  // PMS LLM generate 4종에 적용 — key(route path + IP) 기준.
+  // limit/period 는 계정의 rate-limit 한도 단위(period 는 10 또는 60 만 허용).
+  // 분당 12회 = 프로젝트/포스트별·IP별 generate 상한(LLM 비용 남용 방어).
+  "ratelimits": [
+    {
+      "name": "RL_LLM",
+      "namespace_id": "1001",
+      "simple": { "limit": 12, "period": 60 }
+    }
+  ],
+
   "vars": {
     // Cloudflare AI Gateway compat endpoint (비BYOK 모드).
     // Cloudflare가 자체 credit으로 OpenAI 호출 → datacenter IP region 차단 우회.
     // Provider(BYOK) 등록은 삭제하고 Gateway 크레딧 충전으로 운영.
     "AI_GATEWAY_URL": "https://gateway.ai.cloudflare.com/v1/d2b8c5524b7259214fa302f1fecb4ad6/malgn-helper2/compat",
     "LLM_MODEL_DEFAULT": "openai/gpt-4.1-mini",
-    "LLM_MODEL_PREMIUM": "openai/gpt-4.1-mini"
+    "LLM_MODEL_PREMIUM": "openai/gpt-4.1-mini",
+
+    // 서비스 토큰 하드 차단 플래그. PMS 프록시 전환 검증 후 "1"로 올린다.
+    // "0"(또는 미설정): secret 설정+토큰 불일치도 통과(관찰 모드).
+    "SERVICE_TOKEN_ENFORCE": "0"
   }
 
-  // OPENAI_API_KEY는 wrangler secret으로 등록 (코드·git 노출 금지)
-  // 추후 활성화할 바인딩
-  // "ai": { "binding": "AI" }
+  // PMS_SERVICE_TOKEN / OPENAI_API_KEY / JWT_SECRET / AI_GATEWAY_TOKEN 은
+  // wrangler secret 으로 등록 (코드·git 노출 금지):
+  //   wrangler secret put PMS_SERVICE_TOKEN
 }
