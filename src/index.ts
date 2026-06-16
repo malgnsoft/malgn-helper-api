@@ -46,6 +46,57 @@ app.use(
   }),
 );
 
+// ── 인증 세션·가드 (admin · tb_user 기반) ────────────────
+// 라우트 핸들러는 모듈 로드 시점에 등록되므로(top-down), 가드 const는
+// 이를 참조하는 어떤 app.get/post(...)보다 반드시 먼저 선언돼야 한다(TDZ 회피).
+const SESSION_COOKIE = "helper_session";
+const SESSION_TTL_SECONDS = 60 * 60 * 8; // 8h
+
+type SessionPayload = {
+  sub: number;        // tb_user.id
+  loginId: string;
+  name: string;
+  email: string;
+  company: string;
+  level: number;
+  iat: number;
+  exp: number;
+};
+
+// 역할 레벨: agent < developer(5) <= admin(9). roleOf와 정합.
+const ROLE_LEVEL = { agent: 1, developer: 5, admin: 9 } as const;
+
+/** helper_session 쿠키의 JWT를 검증하고 c.set("session")에 payload 주입. 실패 시 401. */
+const requireAuth: MiddlewareHandler<{
+  Bindings: Bindings;
+  Variables: { session: SessionPayload };
+}> = async (c, next) => {
+  const token = getCookie(c, SESSION_COOKIE);
+  if (!token) return c.json({ error: "unauthorized" }, 401);
+  try {
+    // sign은 default(HS256) → verify에도 alg 명시 (hono v4 verify는 3번째 인자 필수)
+    const payload = (await jwtVerify(token, c.env.JWT_SECRET, "HS256")) as unknown as SessionPayload;
+    c.set("session", payload);
+    await next();
+  } catch {
+    deleteCookie(c, SESSION_COOKIE, { path: "/" });
+    return c.json({ error: "invalid or expired session" }, 401);
+  }
+};
+
+/** 최소 권한(level) 가드 — requireAuth 뒤에 체인해서 사용. */
+const requireRole = (
+  minLevel: number,
+): MiddlewareHandler<{
+  Bindings: Bindings;
+  Variables: { session: SessionPayload };
+}> => async (c, next) => {
+  const s = c.get("session");
+  if (!s) return c.json({ error: "unauthorized" }, 401);
+  if ((s.level ?? 0) < minLevel) return c.json({ error: "forbidden: insufficient role" }, 403);
+  await next();
+};
+
 app.get("/", (c) => c.json({ name: "malgn-helper-api", status: "ok" }));
 app.get("/healthz", (c) => c.json({ ok: true }));
 
@@ -92,86 +143,12 @@ async function withConn<T>(c: any, fn: (conn: any) => Promise<T>): Promise<T | R
   }
 }
 
-app.get("/db/ping", async (c) =>
-  withConn(c, async (conn) => {
-    const [rows] = await conn.query(
-      "SELECT 1 AS ok, NOW() AS now, VERSION() AS version",
-    );
-    return c.json({ ok: true, rows });
-  }),
-);
-
-// ── 임시 DB 탐색 엔드포인트 (스키마 파악 후 삭제) ────────
-app.get("/db/whoami", async (c) =>
-  withConn(c, async (conn) => {
-    const [rows] = await conn.query(
-      "SELECT DATABASE() AS db, CURRENT_USER() AS user, @@hostname AS host, VERSION() AS version",
-    );
-    return c.json({ rows });
-  }),
-);
-
-app.get("/db/tables", async (c) =>
-  withConn(c, async (conn) => {
-    const [rows] = await conn.query("SHOW TABLES");
-    return c.json({ count: (rows as any[]).length, rows });
-  }),
-);
-
-app.get("/db/columns/:table", async (c) =>
-  withConn(c, async (conn) => {
-    const table = c.req.param("table");
-    if (!/^[a-zA-Z0-9_]+$/.test(table)) return c.json({ error: "invalid table" }, 400);
-    const [rows] = await conn.query(`DESCRIBE \`${table}\``);
-    return c.json({ table, rows });
-  }),
-);
-
-app.get("/db/sample/:table", async (c) =>
-  withConn(c, async (conn) => {
-    const table = c.req.param("table");
-    if (!/^[a-zA-Z0-9_]+$/.test(table)) return c.json({ error: "invalid table" }, 400);
-    const limit = Math.min(parseInt(c.req.query("limit") ?? "5", 10), 20);
-    const [rows] = await conn.query(`SELECT * FROM \`${table}\` LIMIT ${limit}`);
-    return c.json({ table, limit, rows });
-  }),
-);
-
 // ── PMS 연동 ─────────────────────────────────────────────
 // reg_date가 'YYYYMMDDHHMMSS' varchar(14) (KST). ISO 형식으로 +09:00 명시.
 function toIso(s: string | null): string | null {
   if (!s || s.length !== 14) return s;
   return `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}T${s.slice(8, 10)}:${s.slice(10, 12)}:${s.slice(12, 14)}+09:00`;
 }
-
-// 일회용 마이그레이션 — hp_image_asset 테이블 생성. ?confirm=yes 호출 1번 후 라우트 제거 권장.
-app.post("/admin/migrate/hp_image_asset", async (c) =>
-  withConn(c, async (conn) => {
-    if (c.req.query("confirm") !== "yes") return c.json({ error: "add ?confirm=yes" }, 400);
-    await conn.query(`
-      CREATE TABLE IF NOT EXISTS hp_image_asset (
-        id                       INT NOT NULL AUTO_INCREMENT,
-        src_path                 VARCHAR(500) NOT NULL,
-        title                    VARCHAR(200) NOT NULL,
-        description              TEXT NOT NULL,
-        first_seen_post_id       INT NULL,
-        first_seen_project_id    INT NULL,
-        source                   ENUM('inquiry','reply') NULL,
-        llm_model                VARCHAR(50) NULL,
-        analyzed_at              DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        usage_count              INT NOT NULL DEFAULT 1,
-        last_used_at             DATETIME NULL,
-        status                   TINYINT NOT NULL DEFAULT 1,
-        created_at               DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        PRIMARY KEY (id),
-        UNIQUE KEY uk_src_path (src_path(191)),
-        KEY idx_project (first_seen_project_id, analyzed_at),
-        KEY idx_usage (status, usage_count)
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-    `);
-    return c.json({ ok: true, table: "hp_image_asset" });
-  }),
-);
 
 // 이미지 자산 Vision 분석 + 저장. src_path UNIQUE라 이미 분석된 이미지는 재사용 (usage_count 증가).
 async function analyzeAndStoreImage(
@@ -2101,7 +2078,8 @@ app.post("/pms/projects/:id/standard-answer-suggestions", async (c) =>
 );
 
 // ── /admin/evals — Q&A 평가 목록·정렬·필터 ────────────────
-app.get("/admin/evals", async (c) =>
+// 가드: 운영 데이터(평가 점수·게시글) → developer 이상. admin UI(qa-evals.vue)만 소비.
+app.get("/admin/evals", requireAuth, requireRole(ROLE_LEVEL.developer), async (c) =>
   withConn(c, async (conn) => {
     const limit = Math.min(parseInt(c.req.query("limit") ?? "50", 10) || 50, 200);
     const offset = Math.max(parseInt(c.req.query("offset") ?? "0", 10) || 0, 0);
@@ -2187,7 +2165,8 @@ app.get("/admin/evals", async (c) =>
 );
 
 // ── /admin/cost — LLM 호출 비용·지연·실패 대시보드 데이터 ───
-app.get("/admin/cost", async (c) =>
+// 가드: 비용·감사 데이터 → developer 이상. admin UI(cost.vue)만 소비.
+app.get("/admin/cost", requireAuth, requireRole(ROLE_LEVEL.developer), async (c) =>
   withConn(c, async (conn) => {
     const days = Math.min(Math.max(parseInt(c.req.query("days") ?? "30", 10) || 30, 1), 365);
     const recentLimit = Math.min(parseInt(c.req.query("limit") ?? "50", 10) || 50, 200);
@@ -2312,7 +2291,14 @@ app.get("/admin/cost", async (c) =>
 
 // ── 표준 답변 카탈로그 (hp_standard_answer) ────────────
 // QaEvalCard "표준답변으로 저장" 액션의 destination + 챗봇 응답 1순위 소스.
-
+//
+// 가드 방침 (소비자 분석 결과):
+//  - POST: malgn-helper-pms 임베드가 "표준답변으로 저장"에서 비인증으로 호출 중
+//    (credentials 미전송). requireAuth를 붙이면 PMS 회귀 발생 → 의도적으로 미보강.
+//    TODO(보안): /pms/* 읽기 분리 또는 서비스 토큰 도입 후 가드. 별도 보고.
+//  - GET(목록·상세): admin UI(standard-answers.vue, credentials 전송)만 소비.
+//    카탈로그 전량 노출 방지 → developer 이상으로 보호.
+//  - PATCH/DELETE: 파괴적 변경 → admin. admin UI가 credentials 전송 중.
 app.post("/standard-answers", async (c) =>
   withConn(c, async (conn) => {
     const body = await c.req.json<{
@@ -2354,7 +2340,7 @@ app.post("/standard-answers", async (c) =>
 );
 
 // 목록 + 검색 (LIKE 기반 — 한국어 짧은 키워드 호환). FULLTEXT는 향후 ngram parser 도입 시 전환.
-app.get("/standard-answers", async (c) =>
+app.get("/standard-answers", requireAuth, requireRole(ROLE_LEVEL.developer), async (c) =>
   withConn(c, async (conn) => {
     const q = (c.req.query("q") ?? "").trim();
     const projectId = c.req.query("projectId");
@@ -2399,7 +2385,7 @@ app.get("/standard-answers", async (c) =>
   }),
 );
 
-app.get("/standard-answers/:id", async (c) =>
+app.get("/standard-answers/:id", requireAuth, requireRole(ROLE_LEVEL.developer), async (c) =>
   withConn(c, async (conn) => {
     const id = parseInt(c.req.param("id"), 10);
     if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
@@ -2413,7 +2399,7 @@ app.get("/standard-answers/:id", async (c) =>
   }),
 );
 
-app.patch("/standard-answers/:id", async (c) =>
+app.patch("/standard-answers/:id", requireAuth, requireRole(ROLE_LEVEL.admin), async (c) =>
   withConn(c, async (conn) => {
     const id = parseInt(c.req.param("id"), 10);
     if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
@@ -2443,7 +2429,7 @@ app.patch("/standard-answers/:id", async (c) =>
   }),
 );
 
-app.delete("/standard-answers/:id", async (c) =>
+app.delete("/standard-answers/:id", requireAuth, requireRole(ROLE_LEVEL.admin), async (c) =>
   withConn(c, async (conn) => {
     const id = parseInt(c.req.param("id"), 10);
     if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
@@ -2552,7 +2538,8 @@ app.put("/wbs", async (c) => {
 });
 
 // ── 이미지 자산 목록 (hp_image_asset) ──────────────────
-app.get("/image-assets", async (c) =>
+// 가드: admin UI(images.vue)만 소비, PMS 미사용. 캡션(개인정보 가능) 노출 방지 → developer 이상.
+app.get("/image-assets", requireAuth, requireRole(ROLE_LEVEL.developer), async (c) =>
   withConn(c, async (conn) => {
     const limit = Math.min(parseInt(c.req.query("limit") ?? "30", 10) || 30, 200);
     const offset = Math.max(parseInt(c.req.query("offset") ?? "0", 10) || 0, 0);
@@ -2614,7 +2601,7 @@ app.get("/image-assets", async (c) =>
   }),
 );
 
-app.get("/image-assets/:id", async (c) =>
+app.get("/image-assets/:id", requireAuth, requireRole(ROLE_LEVEL.developer), async (c) =>
   withConn(c, async (conn) => {
     const id = parseInt(c.req.param("id"), 10);
     if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
@@ -2631,7 +2618,8 @@ app.get("/image-assets/:id", async (c) =>
 );
 
 // ── admin 홈 KPI 집계 ─────────────────────────────────
-app.get("/admin/kpi", async (c) =>
+// 가드: 운영 집계(비용·평가·자산 카운트) → developer 이상. admin 홈(index.vue)만 소비.
+app.get("/admin/kpi", requireAuth, requireRole(ROLE_LEVEL.developer), async (c) =>
   withConn(c, async (conn) => {
     // 표준답변·이미지·평가는 단순 COUNT, 비용은 이번 달
     const [[sa]] = await conn.query<any>(
@@ -2695,56 +2683,8 @@ app.get("/admin/kpi", async (c) =>
 // ── 인증 (admin · tb_user 기반) ─────────────────────────
 // CLAUDE.md/메모리 룰: 직원 = `@malgnsoft.com` 이메일 OR `tb_user.company='맑은소프트'`
 // PMS의 tb_user.passwd가 SHA-256 hex 64자라 가정 (사용자 명시).
-
-const SESSION_COOKIE = "helper_session";
-const SESSION_TTL_SECONDS = 60 * 60 * 8; // 8h
-
-type SessionPayload = {
-  sub: number;        // tb_user.id
-  loginId: string;
-  name: string;
-  email: string;
-  company: string;
-  level: number;
-  iat: number;
-  exp: number;
-};
-
-// ── 인증 가드 미들웨어 ───────────────────────────────────
-// 기존엔 라우트별 가드가 없었다(/admin/* 무인증). requireAuth/requireRole 신설.
-// 역할 레벨: agent < developer(5) <= admin(9). roleOf와 정합.
-const ROLE_LEVEL = { agent: 1, developer: 5, admin: 9 } as const;
-
-/** helper_session 쿠키의 JWT를 검증하고 c.set("session")에 payload 주입. 실패 시 401. */
-const requireAuth: MiddlewareHandler<{
-  Bindings: Bindings;
-  Variables: { session: SessionPayload };
-}> = async (c, next) => {
-  const token = getCookie(c, SESSION_COOKIE);
-  if (!token) return c.json({ error: "unauthorized" }, 401);
-  try {
-    // sign은 default(HS256) → verify에도 alg 명시 (hono v4 verify는 3번째 인자 필수)
-    const payload = (await jwtVerify(token, c.env.JWT_SECRET, "HS256")) as unknown as SessionPayload;
-    c.set("session", payload);
-    await next();
-  } catch {
-    deleteCookie(c, SESSION_COOKIE, { path: "/" });
-    return c.json({ error: "invalid or expired session" }, 401);
-  }
-};
-
-/** 최소 권한(level) 가드 — requireAuth 뒤에 체인해서 사용. */
-const requireRole = (
-  minLevel: number,
-): MiddlewareHandler<{
-  Bindings: Bindings;
-  Variables: { session: SessionPayload };
-}> => async (c, next) => {
-  const s = c.get("session");
-  if (!s) return c.json({ error: "unauthorized" }, 401);
-  if ((s.level ?? 0) < minLevel) return c.json({ error: "forbidden: insufficient role" }, 403);
-  await next();
-};
+// 세션 상수·가드(SESSION_COOKIE / requireAuth / requireRole / ROLE_LEVEL)는
+// 파일 상단(CORS 직후)으로 이전 — TDZ 회피 위해 라우트 등록보다 앞서야 함.
 
 /** POST /auth/login — login_id + password로 JWT 발급 + httpOnly cookie */
 app.post("/auth/login", async (c) =>
