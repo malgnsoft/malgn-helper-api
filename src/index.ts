@@ -2434,35 +2434,6 @@ app.post("/standard-answers", requireServiceToken, async (c) =>
   }),
 );
 
-// 일회용 백필 — 과거 표준답변 본문의 PMS 자산(/data/..) 상대경로를 절대 URL로 정규화.
-// absolutizePmsAssets는 이미 절대 URL이면 그대로 두므로 멱등(재호출 안전). ?confirm=yes 호출.
-app.post("/admin/migrate/backfill-sa-images", async (c) =>
-  withConn(c, async (conn) => {
-    if (c.req.query("confirm") !== "yes") return c.json({ error: "add ?confirm=yes" }, 400);
-    const assetBase = c.env.PMS_ASSET_BASE || DEFAULT_PMS_ASSET_BASE;
-    const [rows] = await conn.query(
-      `SELECT id, question, answer FROM hp_standard_answer WHERE status = 1`,
-    );
-    const list = rows as Array<{ id: number; question: string; answer: string }>;
-    let updated = 0;
-    let unchanged = 0;
-    for (const r of list) {
-      const q = absolutizePmsAssets(r.question ?? "", assetBase);
-      const a = absolutizePmsAssets(r.answer ?? "", assetBase);
-      if (q === (r.question ?? "") && a === (r.answer ?? "")) {
-        unchanged++;
-        continue;
-      }
-      await conn.query(
-        `UPDATE hp_standard_answer SET question = ?, answer = ? WHERE id = ?`,
-        [q, a, r.id],
-      );
-      updated++;
-    }
-    return c.json({ ok: true, candidates: list.length, updated, unchanged });
-  }),
-);
-
 // 목록 + 검색 (LIKE 기반 — 한국어 짧은 키워드 호환). FULLTEXT는 향후 ngram parser 도입 시 전환.
 app.get("/standard-answers", requireAuth, requireRole(ROLE_LEVEL.developer), async (c) =>
   withConn(c, async (conn) => {
