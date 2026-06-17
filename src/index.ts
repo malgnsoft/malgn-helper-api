@@ -308,6 +308,82 @@ async function analyzeAndStoreImage(
   }
 }
 
+// ─────────────────────────────────────────────────────────────
+// 일회용 마이그레이션 — 003 표준답변 큐레이션 강화 (분류·승인·중복/병합 컬럼+인덱스).
+//   migrations/003_standard_answer_curation.sql 을 운영 적용. ?confirm=yes 1회 호출 후 라우트 제거.
+//   MySQL 5.6 은 ADD COLUMN/INDEX IF NOT EXISTS 미지원 → SHOW COLUMNS/INDEX 로 부재분만 ADD (멱등).
+// ─────────────────────────────────────────────────────────────
+app.post("/admin/migrate/003-sa-curation", async (c) =>
+  withConn(c, async (conn) => {
+    if (c.req.query("confirm") !== "yes") return c.json({ error: "add ?confirm=yes" }, 400);
+
+    // 003 파일 정의 그대로 (embedding 제외). 부재분만 ADD 하기 위해 개별 절로 보관.
+    const COLS: { name: string; ddl: string }[] = [
+      { name: "scope", ddl: "ADD COLUMN scope ENUM('common','service') NOT NULL DEFAULT 'service' COMMENT 'common=전 솔루션 공통, service=특정 서비스 전용 (§2-1)' AFTER source_axis" },
+      { name: "topic_id", ddl: "ADD COLUMN topic_id INT NULL COMMENT 'hp_topic.id (FK 없음, 앱 검증). 주제 분류 (§2-1)' AFTER scope" },
+      { name: "service_id", ddl: "ADD COLUMN service_id INT NULL COMMENT 'hp_service.id (FK 없음, 앱 검증). scope=service 일 때만 의미 (§2-1)' AFTER topic_id" },
+      { name: "tags", ddl: "ADD COLUMN tags LONGTEXT NULL COMMENT '자유 태그 JSON 직렬화 문자열. 5.6 JSON 미지원 → LONGTEXT (NULL=미지정, \"[]\"=빈배열)' AFTER service_id" },
+      { name: "approval_status", ddl: "ADD COLUMN approval_status ENUM('draft','reviewing','approved','rejected','archived') NOT NULL DEFAULT 'draft' COMMENT '큐레이션 라이프사이클 (§3-2). 챗봇은 approved 만 사용. status(soft-delete)와 분리' AFTER tags" },
+      { name: "approved_by", ddl: "ADD COLUMN approved_by VARCHAR(100) NULL COMMENT '승인/반려 처리 직원 이메일 (§3-4)' AFTER approval_status" },
+      { name: "approved_at", ddl: "ADD COLUMN approved_at DATETIME NULL COMMENT '승인 시각 (§3-4)' AFTER approved_by" },
+      { name: "rejection_reason", ddl: "ADD COLUMN rejection_reason VARCHAR(255) NULL COMMENT '반려 사유 — 반려 시 필수 (§3-4)' AFTER approved_at" },
+      { name: "merged_into_id", ddl: "ADD COLUMN merged_into_id INT NULL COMMENT '병합 흡수 시 생존(primary) row id. 흡수 row 는 status=-1 (§4-2)' AFTER rejection_reason" },
+      { name: "source_uncovered_id", ddl: "ADD COLUMN source_uncovered_id INT NULL COMMENT 'hp_uncovered_question.id — 미커버 질문→후보 전환 출처 (§5-1, Phase 2)' AFTER merged_into_id" },
+    ];
+    const IDX: { name: string; ddl: string }[] = [
+      { name: "idx_approval", ddl: "ADD KEY idx_approval (approval_status, status)" },
+      { name: "idx_scope_topic", ddl: "ADD KEY idx_scope_topic (scope, topic_id, service_id, status)" },
+      { name: "idx_merged", ddl: "ADD KEY idx_merged (merged_into_id)" },
+    ];
+
+    const beforeCount = ((await conn.query(`SELECT COUNT(*) AS n FROM hp_standard_answer`))[0] as { n: number }[])[0].n;
+
+    // 기존 컬럼·인덱스 조회 → 부재분만 추림.
+    const [colRows] = await conn.query(`SHOW COLUMNS FROM hp_standard_answer`);
+    const existingCols = new Set((colRows as { Field: string }[]).map((r) => r.Field));
+    const [idxRows] = await conn.query(`SHOW INDEX FROM hp_standard_answer`);
+    const existingIdx = new Set((idxRows as { Key_name: string }[]).map((r) => r.Key_name));
+
+    const addCols = COLS.filter((x) => !existingCols.has(x.name));
+    const addIdx = IDX.filter((x) => !existingIdx.has(x.name));
+
+    if (addCols.length > 0) {
+      await conn.query(`ALTER TABLE hp_standard_answer ${addCols.map((x) => x.ddl).join(", ")}`);
+    }
+    if (addIdx.length > 0) {
+      await conn.query(`ALTER TABLE hp_standard_answer ${addIdx.map((x) => x.ddl).join(", ")}`);
+    }
+
+    // ── backfill (컬럼 추가 후) — 기존 3행은 운영 검증 답변 + 챗봇 Phase 2 미가동이라 안전 ──
+    let approvedBackfilled = 0;
+    let commonBackfilled = 0;
+    if (existingCols.has("approval_status") || addCols.some((x) => x.name === "approval_status")) {
+      const [r] = await conn.query(
+        `UPDATE hp_standard_answer SET approval_status='approved', approved_by='system-backfill', approved_at=NOW() WHERE status=1 AND approval_status='draft'`,
+      );
+      approvedBackfilled = (r as { affectedRows?: number }).affectedRows ?? 0;
+    }
+    if (existingCols.has("scope") || addCols.some((x) => x.name === "scope")) {
+      const [r] = await conn.query(
+        `UPDATE hp_standard_answer SET scope='common' WHERE status=1 AND project_id IS NULL`,
+      );
+      commonBackfilled = (r as { affectedRows?: number }).affectedRows ?? 0;
+    }
+
+    const afterCount = ((await conn.query(`SELECT COUNT(*) AS n FROM hp_standard_answer`))[0] as { n: number }[])[0].n;
+
+    return c.json({
+      ok: true,
+      table: "hp_standard_answer",
+      addedColumns: addCols.map((x) => x.name),
+      addedIndexes: addIdx.map((x) => x.name),
+      approvedBackfilled,
+      commonBackfilled,
+      rowCount: { before: beforeCount, after: afterCount },
+    });
+  }),
+);
+
 // 프로젝트의 게시글 목록 (검색·필터·페이지네이션). 작성자 분류 칩 포함.
 app.get("/pms/projects/:id/posts", async (c) =>
   withConn(c, async (conn) => {
