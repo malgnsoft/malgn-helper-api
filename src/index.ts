@@ -25,6 +25,7 @@ type Bindings = {
   LLM_MODEL_DEFAULT: string;
   LLM_MODEL_PREMIUM: string;
   JWT_SECRET: string; // wrangler secret — admin JWT 서명
+  PMS_ASSET_BASE?: string; // vars — PMS 자산(/data/..) 절대화 base. 미설정 시 https://ppm.malgn.co.kr
   PMS_SERVICE_TOKEN?: string; // wrangler secret — PMS 프록시 공유 시크릿(미설정 시 가드 통과)
   SERVICE_TOKEN_ENFORCE?: string; // vars "1"이면 secret 설정+토큰 불일치 시 401
   RL_LLM?: RateLimit; // Cloudflare Rate Limiting binding (LLM generate)
@@ -36,6 +37,30 @@ interface RateLimit {
 }
 
 const app = new Hono<{ Bindings: Bindings; Variables: { session: SessionPayload } }>();
+
+const DEFAULT_PMS_ASSET_BASE = "https://ppm.malgn.co.kr";
+
+// PMS 자산(/data/..) 상대경로 1건 → 절대 URL. 이미 절대(http) 면 그대로.
+function pmsAbsoluteUrl(u: string, base: string): string {
+  if (/^https?:\/\//i.test(u)) return u;
+  const cleaned = u.replace(/^(\.\.\/|\.\/)+/, "").replace(/^\/+/, "");
+  return `${base.replace(/\/+$/, "")}/${cleaned}`;
+}
+
+// 본문(마크다운 ![](..)/링크 + HTML src/href) 내 PMS 자산 이미지 경로를 모두 절대 URL로 정규화.
+// 표준답변 저장 시 정본을 도메인 포함 절대경로로 고정 → 챗봇·admin 등 다른 도메인에서도 안 깨짐.
+function absolutizePmsAssets(text: string, base: string): string {
+  if (!text) return text;
+  return text
+    .replace(
+      /(\]\(\s*)((?:\.\.\/|\.\/)*\/?data\/[^)\s]+)/g,
+      (_m, pre: string, p: string) => pre + pmsAbsoluteUrl(p, base),
+    )
+    .replace(
+      /((?:src|href)=)(["'])((?:\.\.\/|\.\/)*\/?data\/[^"']+)\2/gi,
+      (_m, attr: string, q: string, p: string) => `${attr}${q}${pmsAbsoluteUrl(p, base)}${q}`,
+    );
+}
 
 app.use(
   "*",
@@ -1542,12 +1567,8 @@ app.post("/pms/posts/:id/announce-eval/generate", requireServiceToken, rateLimit
         const imgPattern = /<img\s[^>]*src\s*=\s*["']([^"']+)["'][^>]*>/gi;
         const content = String(post.content ?? "");
         const rawImgs = [...content.matchAll(imgPattern)].map((m) => m[1]);
-        const toAbsolute = (u: string): string => {
-          if (/^https?:\/\//i.test(u)) return u;
-          // `/data/…`, `../data/…`, `./data/…`, `data/…` 등 모든 상대경로 → PMS 도메인으로 절대화
-          const cleaned = u.replace(/^(\.\.\/|\.\/)+/, "").replace(/^\/+/, "");
-          return `https://ppm.malgn.co.kr/${cleaned}`;
-        };
+        const assetBase = c.env.PMS_ASSET_BASE || DEFAULT_PMS_ASSET_BASE;
+        const toAbsolute = (u: string): string => pmsAbsoluteUrl(u, assetBase);
         const visionImgs = rawImgs.map(toAbsolute).slice(0, 8);
 
         const userMsgParts = [
@@ -1808,12 +1829,8 @@ app.post("/pms/posts/:id/eval/generate", requireServiceToken, rateLimitLlm, asyn
         const respContent = String(resp?.content ?? "");
         const sourceForImgs = resp ? respContent : String(post.content ?? "");
         const rawImgs = [...sourceForImgs.matchAll(imgPattern)].map((m) => m[1]);
-        const toAbsolute = (u: string): string => {
-          if (/^https?:\/\//i.test(u)) return u;
-          // `/data/…`, `../data/…`, `./data/…`, `data/…` 등 모든 상대경로 → PMS 도메인으로 절대화
-          const cleaned = u.replace(/^(\.\.\/|\.\/)+/, "").replace(/^\/+/, "");
-          return `https://ppm.malgn.co.kr/${cleaned}`;
-        };
+        const assetBase = c.env.PMS_ASSET_BASE || DEFAULT_PMS_ASSET_BASE;
+        const toAbsolute = (u: string): string => pmsAbsoluteUrl(u, assetBase);
         const visionImgs = rawImgs.map(toAbsolute).slice(0, 8); // 비용/시간 보호 — 최대 8장
 
         // 1-b) 본문(inquiry) + 응답(reply) 양쪽에서 /data/ 자산 이미지 추출 → hp_image_asset 분석·저장
@@ -2386,9 +2403,11 @@ app.post("/standard-answers", requireServiceToken, async (c) =>
       sourceAxis?: string | null;
       createdBy?: string | null;
     }>();
+    const assetBase = c.env.PMS_ASSET_BASE || DEFAULT_PMS_ASSET_BASE;
     const label = (body.label ?? "").trim();
-    const question = (body.question ?? "").trim();
-    const answer = (body.answer ?? "").trim();
+    // 이미지 경로(/data/..)를 도메인 포함 절대 URL로 정규화해 저장 — 정본이 어디서든 안 깨지게.
+    const question = absolutizePmsAssets((body.question ?? "").trim(), assetBase);
+    const answer = absolutizePmsAssets((body.answer ?? "").trim(), assetBase);
     if (!label || !question || !answer) {
       return c.json({ error: "label, question, answer required" }, 400);
     }

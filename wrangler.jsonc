@@ -43,6 +43,9 @@
     "LLM_MODEL_DEFAULT": "openai/gpt-4.1-mini",
     "LLM_MODEL_PREMIUM": "openai/gpt-4.1-mini",
 
+    // PMS 자산(/data/..) 절대화 base — 표준답변 저장 시 이미지 경로를 도메인 포함 절대 URL로 정규화.
+    "PMS_ASSET_BASE": "https://ppm.malgn.co.kr",
+
     // 서비스 토큰 하드 차단 플래그. PMS 프록시 전환 검증 후 "1"로 올린다.
     // "0"(또는 미설정): secret 설정+토큰 불일치도 통과(관찰 모드).
     "SERVICE_TOKEN_ENFORCE": "0"
