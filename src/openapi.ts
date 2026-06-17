@@ -399,8 +399,12 @@ export const openapiSpec = {
     "/standard-answers": {
       post: {
         tags: ["standard-answers"],
-        summary: "표준 답변 저장",
-        description: "QaEvalCard 'Save as standard answer' 액션의 destination. `hp_standard_answer` INSERT.",
+        summary: "표준 답변 저장 (항상 draft)",
+        description:
+          "QaEvalCard 'Save as standard answer' 액션의 destination. `hp_standard_answer` INSERT.\n\n" +
+          "**항상 `approval_status='draft'`로 저장**(무검증 답변 챗봇 직행 방지, 큐레이션 §3-4). " +
+          "분류(`scope/topicId/serviceId/tags`)는 선택. `topicId/serviceId`는 `hp_topic/hp_service` 존재·active 검증. " +
+          "응답에 유사 표준답변 `similar[]`(중복 경고용, §4-1) 동봉.",
         requestBody: {
           required: true,
           content: {
@@ -416,28 +420,69 @@ export const openapiSpec = {
                   sourcePostId: { type: ["integer", "null"] },
                   sourceAxis: { type: ["string", "null"], description: "QaEval A~E" },
                   createdBy: { type: ["string", "null"], description: "직원 email (인증 도입 후)" },
+                  scope: { type: ["string", "null"], enum: ["common", "service", null], description: "분류 §2-1" },
+                  topicId: { type: ["integer", "null"], description: "hp_topic.id (앱 검증)" },
+                  serviceId: { type: ["integer", "null"], description: "hp_service.id (scope=service)" },
+                  tags: { type: ["array", "null"], items: { type: "string" }, description: "자유 태그 배열" },
                 },
               },
             },
           },
         },
         responses: {
-          "201": { description: "생성", content: { "application/json": { example: { ok: true, id: 1 } } } },
-          "400": { description: "필수 필드 누락 / 길이 초과" },
+          "201": {
+            description: "생성",
+            content: { "application/json": { example: { ok: true, id: 1, approvalStatus: "draft", similar: [] } } },
+          },
+          "400": { description: "필수 필드 누락 / 길이 초과 / 분류 검증 실패" },
         },
       },
       get: {
         tags: ["standard-answers"],
         summary: "표준 답변 목록·검색",
         description:
-          "활성(status=1) 표준 답변. `projectId` 지정 시 해당 프로젝트 전용 + 전사 공통(NULL) 모두 포함. 검색은 LIKE (한국어 짧은 키워드 호환). FULLTEXT는 향후 ngram parser 도입 시 전환.",
+          "활성(status=1) 표준 답변. `projectId` 지정 시 해당 프로젝트 전용 + 전사 공통(NULL) 모두 포함. " +
+          "분류 필터(`scope/topicId/serviceId/approvalStatus`) + `search`(또는 레거시 `q`) LIKE. " +
+          "응답 행에 `topic_slug/topic_label/service_slug/service_name`(LEFT JOIN) + `tags`(배열) 포함.",
         parameters: [
-          { name: "q", in: "query", required: false, schema: { type: "string" }, description: "label/question/answer LIKE" },
+          { name: "search", in: "query", required: false, schema: { type: "string" }, description: "label/question/answer LIKE (레거시 q 호환)" },
+          { name: "q", in: "query", required: false, schema: { type: "string" }, description: "레거시 별칭" },
+          { name: "scope", in: "query", required: false, schema: { type: "string", enum: ["common", "service"] } },
+          { name: "topicId", in: "query", required: false, schema: { type: "integer" } },
+          { name: "serviceId", in: "query", required: false, schema: { type: "integer" } },
+          { name: "approvalStatus", in: "query", required: false, schema: { type: "string", enum: ["draft", "reviewing", "approved", "rejected", "archived"] } },
           { name: "projectId", in: "query", required: false, schema: { type: "integer" } },
           { name: "limit", in: "query", required: false, schema: { type: "integer", default: 20, maximum: 100 } },
           { name: "offset", in: "query", required: false, schema: { type: "integer", default: 0 } },
         ],
         responses: { "200": { description: "목록" } },
+      },
+    },
+
+    "/standard-answers/check-duplicate": {
+      post: {
+        tags: ["standard-answers"],
+        summary: "중복 감지 — 유사 질문 표준답변 top N (§4-1)",
+        description:
+          "질문 유사도로 기존 표준답변 후보를 반환. **OpenSearch k-NN 전환 대상(§4-1, T2)** — 현재는 LIKE+토큰 자카드 MVP. 가드 developer↑.",
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                required: ["question"],
+                properties: {
+                  question: { type: "string" },
+                  topicId: { type: ["integer", "null"] },
+                  serviceId: { type: ["integer", "null"] },
+                  limit: { type: "integer", default: 5, maximum: 20 },
+                },
+              },
+            },
+          },
+        },
+        responses: { "200": { description: "유사 후보", content: { "application/json": { example: { similar: [] } } } }, "400": { description: "question 누락" } },
       },
     },
 
@@ -485,6 +530,65 @@ export const openapiSpec = {
         description: "Phase 2 챗봇이 답변을 사용할 때마다 호출. `usage_count` +1, `last_used_at` 갱신.",
         parameters: [{ name: "id", in: "path", required: true, schema: { type: "integer", minimum: 1 } }],
         responses: { "200": { description: "OK" } },
+      },
+    },
+
+    "/standard-answers/{id}/transition": {
+      patch: {
+        tags: ["standard-answers"],
+        summary: "승인 워크플로 상태 전이 (§3-2/§3-3)",
+        description:
+          "전이표 검증: draft→reviewing/rejected · reviewing→approved/rejected · approved→archived · rejected→draft · archived→reviewing. " +
+          "위반 시 422. `approved` 시 `approved_by`(세션)·`approved_at=NOW()` 기록. `rejected` 시 `reason` 필수. 가드 developer↑.",
+        parameters: [{ name: "id", in: "path", required: true, schema: { type: "integer", minimum: 1 } }],
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                required: ["to"],
+                properties: {
+                  to: { type: "string", enum: ["draft", "reviewing", "approved", "rejected", "archived"] },
+                  reason: { type: "string", description: "rejected 시 필수" },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          "200": { description: "전이 완료", content: { "application/json": { example: { ok: true, id: 1, from: "reviewing", to: "approved" } } } },
+          "400": { description: "잘못된 to / 반려 사유 누락" },
+          "404": { description: "없음" },
+          "422": { description: "전이표 위반" },
+        },
+      },
+    },
+
+    "/standard-answers/{id}/merge": {
+      post: {
+        tags: ["standard-answers"],
+        summary: "중복 병합 — secondary(:id)→primary(intoId) (§4-2)",
+        description:
+          "secondary 흡수: `status=-1` + `merged_into_id`. primary: `usage_count` 합산·`last_used_at` 최신·`tags` 합집합·출처 승계. 가드 admin.",
+        parameters: [{ name: "id", in: "path", required: true, schema: { type: "integer", minimum: 1 }, description: "흡수될 secondary id" }],
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                required: ["intoId"],
+                properties: { intoId: { type: "integer", minimum: 1, description: "생존할 primary id" } },
+              },
+            },
+          },
+        },
+        responses: {
+          "200": { description: "병합 완료", content: { "application/json": { example: { ok: true, primaryId: 2, secondaryId: 1, usageCount: 7 } } } },
+          "400": { description: "intoId 누락 / self 병합" },
+          "404": { description: "primary/secondary 없음" },
+        },
       },
     },
 

@@ -2382,6 +2382,159 @@ app.get("/admin/cost", requireAuth, requireRole(ROLE_LEVEL.developer), async (c)
   }),
 );
 
+// ── 표준답변 큐레이션 공통 헬퍼 (분류·승인·중복) ───────────
+// 정본: malgn-helper-mng/docs/STANDARD-ANSWER-CURATION.md (§2 분류 · §3 전이 · §4 중복/병합)
+// 003 마이그레이션(운영 적용 완료)이 추가한 컬럼:
+//   scope(common|service)·topic_id·service_id·tags(LONGTEXT JSON)·approval_status
+//   ·approved_by·approved_at·rejection_reason·merged_into_id·source_uncovered_id
+
+type SaScope = "common" | "service";
+type SaApproval = "draft" | "reviewing" | "approved" | "rejected" | "archived";
+const SA_APPROVALS: readonly SaApproval[] = ["draft", "reviewing", "approved", "rejected", "archived"];
+
+/** §3-3 전이표 — from → 허용 to 집합. 위반 시 422. */
+const SA_TRANSITIONS: Record<SaApproval, SaApproval[]> = {
+  draft: ["reviewing", "rejected"],
+  reviewing: ["approved", "rejected"],
+  approved: ["archived"],
+  rejected: ["draft"],
+  archived: ["reviewing"],
+};
+
+/** tags(LONGTEXT) 역직렬화 — NULL/빈문자/비배열은 [] 로 정규화. */
+function parseTags(raw: unknown): string[] {
+  if (typeof raw !== "string" || !raw.trim()) return [];
+  try {
+    const v = JSON.parse(raw);
+    return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+/** 입력 tags 검증·직렬화 — 배열 아니면 null(미지정), 빈배열은 "[]". 문자열 요소만 허용. */
+function serializeTags(input: unknown): string | null {
+  if (input == null) return null;
+  if (!Array.isArray(input)) return undefined as unknown as null; // 호출부에서 400 처리
+  const arr = input.filter((x): x is string => typeof x === "string").map((s) => s.trim()).filter(Boolean);
+  return JSON.stringify(arr);
+}
+
+/** hp_topic 존재·active 검증. 반환: ok면 scope 동반, 아니면 사유. */
+async function validateTopic(
+  conn: Queryable,
+  topicId: number,
+): Promise<{ ok: true; scope: SaScope } | { ok: false; reason: string }> {
+  const [rows] = await conn.query(
+    `SELECT id, scope, active FROM hp_topic WHERE id = ? AND status = 1`,
+    [topicId],
+  );
+  const r = (rows as { scope: SaScope; active: number }[])[0];
+  if (!r) return { ok: false, reason: "topic not found" };
+  if (r.active !== 1) return { ok: false, reason: "topic inactive" };
+  return { ok: true, scope: r.scope };
+}
+
+/** hp_service 존재·active 검증. */
+async function validateService(
+  conn: Queryable,
+  serviceId: number,
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  const [rows] = await conn.query(
+    `SELECT id, active FROM hp_service WHERE id = ? AND status = 1`,
+    [serviceId],
+  );
+  const r = (rows as { active: number }[])[0];
+  if (!r) return { ok: false, reason: "service not found" };
+  if (r.active !== 1) return { ok: false, reason: "service inactive" };
+  return { ok: true };
+}
+
+type SaSimilar = {
+  id: number;
+  label: string;
+  question: string;
+  scope: SaScope;
+  topicId: number | null;
+  serviceId: number | null;
+  approvalStatus: SaApproval;
+  usageCount: number;
+  score: number; // 토큰 자카드 유사도 0~1 (MVP)
+};
+
+/**
+ * 질문 유사 표준답변 top N.
+ * OpenSearch k-NN 전환 대상(§4-1, T2) — 현재는 인프라 부재로 LIKE+토큰 자카드 MVP.
+ * 1) 질문에서 2글자 이상 토큰 추출 → LIKE 후보 수집(topic/service 동일 우선)
+ * 2) 후보별 토큰 자카드 계산 → 임계 이상만 점수순 top N.
+ */
+async function findSimilarStandardAnswers(
+  conn: Queryable,
+  args: { question: string; topicId?: number | null; serviceId?: number | null; excludeId?: number; limit?: number },
+): Promise<SaSimilar[]> {
+  const question = (args.question ?? "").trim();
+  if (!question) return [];
+  const limit = args.limit ?? 5;
+  // 한국어 짧은 키워드: 공백/구두점 분리 후 2글자 이상 토큰만.
+  const tokens = Array.from(
+    new Set(question.toLowerCase().split(/[\s,.!?·…"'()[\]{}<>/\\|:;~`@#$%^&*+=\-]+/u).filter((t) => t.length >= 2)),
+  );
+  if (!tokens.length) return [];
+
+  const where: string[] = ["status = 1"];
+  const params: unknown[] = [];
+  if (args.excludeId != null) {
+    where.push("id <> ?");
+    params.push(args.excludeId);
+  }
+  // 토큰 LIKE OR (최대 8개로 제한해 쿼리 폭증 방지)
+  const likeTokens = tokens.slice(0, 8);
+  where.push(`(${likeTokens.map(() => "question LIKE ?").join(" OR ")})`);
+  for (const t of likeTokens) params.push(`%${t}%`);
+
+  const [rows] = await conn.query(
+    `SELECT id, label, question, scope, topic_id, service_id, approval_status, usage_count
+       FROM hp_standard_answer
+      WHERE ${where.join(" AND ")}
+      LIMIT 200`,
+    params,
+  );
+
+  const qSet = new Set(tokens);
+  const scored: SaSimilar[] = [];
+  for (const r of rows as {
+    id: number; label: string; question: string; scope: SaScope;
+    topic_id: number | null; service_id: number | null;
+    approval_status: SaApproval; usage_count: number;
+  }[]) {
+    const cTokens = new Set(
+      (r.question ?? "").toLowerCase().split(/[\s,.!?·…"'()[\]{}<>/\\|:;~`@#$%^&*+=\-]+/u).filter((t) => t.length >= 2),
+    );
+    if (!cTokens.size) continue;
+    let inter = 0;
+    for (const t of qSet) if (cTokens.has(t)) inter++;
+    const union = qSet.size + cTokens.size - inter;
+    let score = union > 0 ? inter / union : 0;
+    // 같은 topic/service면 가중(분류 일치 신호) — §4-1 "동일 topic_id+키워드 다수 일치"
+    if (args.topicId != null && r.topic_id === args.topicId) score += 0.1;
+    if (args.serviceId != null && r.service_id === args.serviceId) score += 0.05;
+    if (score < 0.3) continue; // MVP 임계(자카드 0.6은 토큰 적을 때 과엄격 → 0.3 + 분류가중). T2에서 재튜닝.
+    scored.push({
+      id: r.id,
+      label: r.label,
+      question: r.question,
+      scope: r.scope,
+      topicId: r.topic_id,
+      serviceId: r.service_id,
+      approvalStatus: r.approval_status,
+      usageCount: Number(r.usage_count ?? 0),
+      score: Math.min(1, Number(score.toFixed(3))),
+    });
+  }
+  scored.sort((a, b) => b.score - a.score || b.usageCount - a.usageCount);
+  return scored.slice(0, limit);
+}
+
 // ── 표준 답변 카탈로그 (hp_standard_answer) ────────────
 // QaEvalCard "표준답변으로 저장" 액션의 destination + 챗봇 응답 1순위 소스.
 //
@@ -2402,6 +2555,11 @@ app.post("/standard-answers", requireServiceToken, async (c) =>
       sourcePostId?: number | null;
       sourceAxis?: string | null;
       createdBy?: string | null;
+      // 003 분류 (§2-1). 모두 선택 — 미지정이면 NULL(운영자가 admin에서 후분류).
+      scope?: string | null;
+      topicId?: number | null;
+      serviceId?: number | null;
+      tags?: unknown;
     }>();
     const assetBase = c.env.PMS_ASSET_BASE || DEFAULT_PMS_ASSET_BASE;
     const label = (body.label ?? "").trim();
@@ -2416,10 +2574,44 @@ app.post("/standard-answers", requireServiceToken, async (c) =>
       return c.json({ error: "question/answer too long (<=10000)" }, 400);
     }
 
+    // 분류 검증 (§2-1). scope 미지정이면 'service' DB default 따름(컬럼 생략).
+    let scope: SaScope | null = null;
+    if (body.scope != null) {
+      if (body.scope !== "common" && body.scope !== "service") {
+        return c.json({ error: "scope must be common|service" }, 400);
+      }
+      scope = body.scope;
+    }
+    // topic_id / service_id 존재·active 검증 (FK 없음 → 앱 레벨, 규칙 준수).
+    let topicId: number | null = null;
+    if (body.topicId != null) {
+      const tid = Number(body.topicId);
+      if (!Number.isInteger(tid)) return c.json({ error: "invalid topicId" }, 400);
+      const v = await validateTopic(conn, tid);
+      if (!v.ok) return c.json({ error: v.reason }, 400);
+      topicId = tid;
+    }
+    let serviceId: number | null = null;
+    if (body.serviceId != null) {
+      const sid = Number(body.serviceId);
+      if (!Number.isInteger(sid)) return c.json({ error: "invalid serviceId" }, 400);
+      const v = await validateService(conn, sid);
+      if (!v.ok) return c.json({ error: v.reason }, 400);
+      serviceId = sid;
+    }
+    // tags: 배열→JSON.stringify, 없으면 NULL. 비배열은 400.
+    const tagsJson = serializeTags(body.tags);
+    if (tagsJson === undefined) return c.json({ error: "tags must be an array of strings" }, 400);
+
+    // 저장 직전 유사 표준답변 top N (중복 경고용, §4-1). OpenSearch k-NN 전환 대상(§4-1, T2).
+    const similar = await findSimilarStandardAnswers(conn, { question, topicId, serviceId });
+
+    // 모든 수집 진입점은 항상 draft 로 진입 — 무검증 답변 챗봇 직행 방지 (§3-4).
     const [ins] = await conn.query(
       `INSERT INTO hp_standard_answer
-         (label, question, answer, project_id, source_post_id, source_axis, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+         (label, question, answer, project_id, source_post_id, source_axis, created_by,
+          ${scope != null ? "scope, " : ""}topic_id, service_id, tags, approval_status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ${scope != null ? "?, " : ""}?, ?, ?, 'draft')`,
       [
         label,
         question,
@@ -2428,55 +2620,110 @@ app.post("/standard-answers", requireServiceToken, async (c) =>
         body.sourcePostId ?? null,
         body.sourceAxis ?? null,
         body.createdBy ?? null,
+        ...(scope != null ? [scope] : []),
+        topicId,
+        serviceId,
+        tagsJson,
       ],
     );
-    return c.json({ ok: true, id: (ins as any).insertId }, 201);
+    return c.json(
+      { ok: true, id: (ins as { insertId: number }).insertId, approvalStatus: "draft", similar },
+      201,
+    );
   }),
 );
 
 // 목록 + 검색 (LIKE 기반 — 한국어 짧은 키워드 호환). FULLTEXT는 향후 ngram parser 도입 시 전환.
+// 필터(§9-B): scope / topicId / serviceId / approvalStatus / search. topic·service slug/name LEFT JOIN.
 app.get("/standard-answers", requireAuth, requireRole(ROLE_LEVEL.developer), async (c) =>
   withConn(c, async (conn) => {
-    const q = (c.req.query("q") ?? "").trim();
+    // search(신규) 우선, 없으면 기존 q 호환.
+    const q = (c.req.query("search") ?? c.req.query("q") ?? "").trim();
     const projectId = c.req.query("projectId");
+    const scopeQ = c.req.query("scope");
+    const topicIdQ = c.req.query("topicId");
+    const serviceIdQ = c.req.query("serviceId");
+    const approvalQ = c.req.query("approvalStatus");
     const limit = Math.min(parseInt(c.req.query("limit") ?? "20", 10) || 20, 100);
     const offset = Math.max(parseInt(c.req.query("offset") ?? "0", 10) || 0, 0);
 
-    const where: string[] = ["status = 1"];
-    const params: any[] = [];
+    const where: string[] = ["sa.status = 1"];
+    const params: unknown[] = [];
     if (projectId) {
       // 해당 프로젝트 전용 + 전사 공통(NULL) 모두 포함
-      where.push("(project_id = ? OR project_id IS NULL)");
+      where.push("(sa.project_id = ? OR sa.project_id IS NULL)");
       params.push(parseInt(projectId, 10));
     }
+    if (scopeQ === "common" || scopeQ === "service") {
+      where.push("sa.scope = ?");
+      params.push(scopeQ);
+    }
+    if (topicIdQ) {
+      where.push("sa.topic_id = ?");
+      params.push(parseInt(topicIdQ, 10));
+    }
+    if (serviceIdQ) {
+      where.push("sa.service_id = ?");
+      params.push(parseInt(serviceIdQ, 10));
+    }
+    if (approvalQ && (SA_APPROVALS as readonly string[]).includes(approvalQ)) {
+      where.push("sa.approval_status = ?");
+      params.push(approvalQ);
+    }
     if (q) {
-      where.push("(label LIKE ? OR question LIKE ? OR answer LIKE ?)");
+      where.push("(sa.label LIKE ? OR sa.question LIKE ? OR sa.answer LIKE ?)");
       const like = `%${q}%`;
       params.push(like, like, like);
     }
     const whereSql = `WHERE ${where.join(" AND ")}`;
 
     const [countRows] = await conn.query(
-      `SELECT COUNT(*) AS total FROM hp_standard_answer ${whereSql}`,
+      `SELECT COUNT(*) AS total FROM hp_standard_answer sa ${whereSql}`,
       params,
     );
-    const total = Number((countRows as any[])[0]?.total ?? 0);
+    const total = Number((countRows as { total: number }[])[0]?.total ?? 0);
 
     // 정렬: 해당 프로젝트 전용 우선 → 사용량 많은 순 → 최신
     const order = projectId
-      ? "(project_id IS NOT NULL) DESC, usage_count DESC, created_at DESC"
-      : "usage_count DESC, created_at DESC";
+      ? "(sa.project_id IS NOT NULL) DESC, sa.usage_count DESC, sa.created_at DESC"
+      : "sa.usage_count DESC, sa.created_at DESC";
 
     const [rows] = await conn.query(
-      `SELECT id, label, question, answer, project_id, source_post_id, source_axis,
-              created_by, usage_count, last_used_at, created_at, updated_at
-         FROM hp_standard_answer ${whereSql}
+      `SELECT sa.id, sa.label, sa.question, sa.answer, sa.project_id, sa.source_post_id, sa.source_axis,
+              sa.created_by, sa.usage_count, sa.last_used_at, sa.created_at, sa.updated_at,
+              sa.scope, sa.topic_id, sa.service_id, sa.tags, sa.approval_status,
+              sa.approved_by, sa.approved_at, sa.rejection_reason, sa.merged_into_id, sa.source_uncovered_id,
+              t.slug AS topic_slug, t.label AS topic_label,
+              s.slug AS service_slug, s.name AS service_name
+         FROM hp_standard_answer sa
+         LEFT JOIN hp_topic   t ON t.id = sa.topic_id   AND t.status = 1
+         LEFT JOIN hp_service s ON s.id = sa.service_id AND s.status = 1
+         ${whereSql}
      ORDER BY ${order}
         LIMIT ${limit} OFFSET ${offset}`,
       params,
     );
 
-    return c.json({ total, limit, offset, rows });
+    // tags(LONGTEXT) → 배열 역직렬화해 노출.
+    const mapped = (rows as { tags: unknown }[]).map((r) => ({ ...r, tags: parseTags(r.tags) }));
+    return c.json({ total, limit, offset, rows: mapped });
+  }),
+);
+
+// 중복 감지 (§4-1) — 질문 유사 표준답변 top N.
+// 정적 경로 → 파라미터 경로(`/:id`)보다 먼저 등록(라우트 가로채기 방지, 현행 관례).
+// OpenSearch k-NN 전환 대상(§4-1, T2) — 현재는 LIKE+토큰 자카드 MVP.
+app.post("/standard-answers/check-duplicate", requireAuth, requireRole(ROLE_LEVEL.developer), async (c) =>
+  withConn(c, async (conn) => {
+    type DupBody = { question?: string; topicId?: number | null; serviceId?: number | null; limit?: number };
+    const body = await c.req.json<DupBody>().catch((): DupBody => ({}));
+    const question = (body.question ?? "").trim();
+    if (!question) return c.json({ error: "question required" }, 400);
+    const limit = Math.min(Math.max(Number(body.limit ?? 5) || 5, 1), 20);
+    const topicId = body.topicId != null && Number.isInteger(Number(body.topicId)) ? Number(body.topicId) : null;
+    const serviceId = body.serviceId != null && Number.isInteger(Number(body.serviceId)) ? Number(body.serviceId) : null;
+    const similar = await findSimilarStandardAnswers(conn, { question, topicId, serviceId, limit });
+    return c.json({ similar });
   }),
 );
 
@@ -2485,12 +2732,17 @@ app.get("/standard-answers/:id", requireAuth, requireRole(ROLE_LEVEL.developer),
     const id = parseInt(c.req.param("id"), 10);
     if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
     const [rows] = await conn.query(
-      `SELECT * FROM hp_standard_answer WHERE id = ? AND status = 1`,
+      `SELECT sa.*, t.slug AS topic_slug, t.label AS topic_label,
+              s.slug AS service_slug, s.name AS service_name
+         FROM hp_standard_answer sa
+         LEFT JOIN hp_topic   t ON t.id = sa.topic_id   AND t.status = 1
+         LEFT JOIN hp_service s ON s.id = sa.service_id AND s.status = 1
+        WHERE sa.id = ? AND sa.status = 1`,
       [id],
     );
-    const r = (rows as any[])[0];
+    const r = (rows as { tags?: unknown }[])[0];
     if (!r) return c.json({ error: "not found" }, 404);
-    return c.json(r);
+    return c.json({ ...r, tags: parseTags(r.tags) });
   }),
 );
 
@@ -2548,6 +2800,119 @@ app.post("/standard-answers/:id/use", requireServiceToken, async (c) =>
       [id],
     );
     return c.json({ ok: true });
+  }),
+);
+
+// 승인 워크플로 상태 전이 (§3-2/§3-3). body { to, reason? }.
+// 전이표(SA_TRANSITIONS) 위반 시 422. approved 시 approved_by(세션)·approved_at=NOW().
+// rejected 시 rejection_reason 필수. 가드 developer↑ (승인/반려/보관/검토착수/재작업/복원 모두).
+//   - 정본 §3-3 은 draft→reviewing(검토착수)을 agent(자기 제안)도 허용하나,
+//     현 가드 체계엔 "본인 제안" 판별이 없어 우선 developer↑ 로 통일(보고: 확인 필요).
+app.patch("/standard-answers/:id/transition", requireAuth, requireRole(ROLE_LEVEL.developer), async (c) =>
+  withConn(c, async (conn) => {
+    const id = parseInt(c.req.param("id"), 10);
+    if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
+    type TransBody = { to?: string; reason?: string };
+    const body = await c.req.json<TransBody>().catch((): TransBody => ({}));
+    const to = body.to;
+    if (!to || !(SA_APPROVALS as readonly string[]).includes(to)) {
+      return c.json({ error: "to must be one of draft|reviewing|approved|rejected|archived" }, 400);
+    }
+    const target = to as SaApproval;
+
+    const [rows] = await conn.query(
+      `SELECT id, approval_status FROM hp_standard_answer WHERE id = ? AND status = 1`,
+      [id],
+    );
+    const cur = (rows as { approval_status: SaApproval }[])[0];
+    if (!cur) return c.json({ error: "not found" }, 404);
+    const from = cur.approval_status;
+
+    // 전이 유효성 (§3-3 전이표). 같은 상태로의 no-op도 위반으로 막는다.
+    if (!SA_TRANSITIONS[from]?.includes(target)) {
+      return c.json({ error: `invalid transition: ${from} -> ${target}`, from, allowed: SA_TRANSITIONS[from] ?? [] }, 422);
+    }
+
+    const reason = (body.reason ?? "").trim();
+    if (target === "rejected" && !reason) {
+      return c.json({ error: "rejection_reason required for rejected (§3-4)" }, 400);
+    }
+
+    const sets: string[] = ["approval_status = ?"];
+    const params: unknown[] = [target];
+    if (target === "approved") {
+      // 승인자·승인시각 기록 (§3-4).
+      sets.push("approved_by = ?", "approved_at = NOW()");
+      params.push(c.get("session").email ?? null);
+    }
+    if (target === "rejected") {
+      sets.push("rejection_reason = ?", "approved_by = ?");
+      params.push(reason, c.get("session").email ?? null);
+    }
+    params.push(id);
+    await conn.query(
+      `UPDATE hp_standard_answer SET ${sets.join(", ")} WHERE id = ? AND status = 1`,
+      params,
+    );
+    return c.json({ ok: true, id, from, to: target });
+  }),
+);
+
+// 중복 병합 (§4-2) — secondary(:id) → primary(intoId).
+//   secondary: status=-1 + merged_into_id=intoId, primary: usage_count 합산·last_used_at 최신·tags 합집합·출처 승계.
+//   가드 admin (정본 §1-3 병합은 developer/admin — 보수적으로 admin 적용. 확인 필요).
+app.post("/standard-answers/:id/merge", requireAuth, requireRole(ROLE_LEVEL.admin), async (c) =>
+  withConn(c, async (conn) => {
+    const secondaryId = parseInt(c.req.param("id"), 10);
+    if (!Number.isFinite(secondaryId) || secondaryId <= 0) return c.json({ error: "invalid id" }, 400);
+    type MergeBody = { intoId?: number };
+    const body = await c.req.json<MergeBody>().catch((): MergeBody => ({}));
+    const primaryId = Number(body.intoId);
+    if (!Number.isInteger(primaryId) || primaryId <= 0) return c.json({ error: "intoId required" }, 400);
+    if (primaryId === secondaryId) return c.json({ error: "cannot merge into self" }, 400);
+
+    // 두 행을 모두 잠금 조회(원자성은 단일 connection·순차 UPDATE로 충분 — 트래픽 소규모).
+    const [rows] = await conn.query(
+      `SELECT id, usage_count, last_used_at, tags, source_post_id, source_axis, project_id
+         FROM hp_standard_answer
+        WHERE id IN (?, ?) AND status = 1`,
+      [primaryId, secondaryId],
+    );
+    const list = rows as {
+      id: number; usage_count: number; last_used_at: string | null;
+      tags: unknown; source_post_id: number | null; source_axis: string | null; project_id: number | null;
+    }[];
+    const primary = list.find((r) => r.id === primaryId);
+    const secondary = list.find((r) => r.id === secondaryId);
+    if (!primary) return c.json({ error: "primary(intoId) not found" }, 404);
+    if (!secondary) return c.json({ error: "secondary(:id) not found" }, 404);
+
+    // usage_count 합산 (채택 신호 손실 방지).
+    const mergedUsage = Number(primary.usage_count ?? 0) + Number(secondary.usage_count ?? 0);
+    // last_used_at: 더 최근 값.
+    const mergedLastUsed =
+      [primary.last_used_at, secondary.last_used_at]
+        .filter((v): v is string => !!v)
+        .sort()
+        .pop() ?? null;
+    // tags 합집합.
+    const mergedTags = Array.from(new Set([...parseTags(primary.tags), ...parseTags(secondary.tags)]));
+    // 출처: primary가 NULL이면 secondary 값 승계.
+    const mergedSourcePost = primary.source_post_id ?? secondary.source_post_id ?? null;
+    const mergedSourceAxis = primary.source_axis ?? secondary.source_axis ?? null;
+
+    await conn.query(
+      `UPDATE hp_standard_answer
+          SET usage_count = ?, last_used_at = ?, tags = ?, source_post_id = ?, source_axis = ?
+        WHERE id = ? AND status = 1`,
+      [mergedUsage, mergedLastUsed, JSON.stringify(mergedTags), mergedSourcePost, mergedSourceAxis, primaryId],
+    );
+    // secondary soft-delete + merged_into_id 역추적 기록.
+    await conn.query(
+      `UPDATE hp_standard_answer SET status = -1, merged_into_id = ? WHERE id = ?`,
+      [primaryId, secondaryId],
+    );
+    return c.json({ ok: true, primaryId, secondaryId, usageCount: mergedUsage });
   }),
 );
 
