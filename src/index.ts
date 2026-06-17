@@ -3749,4 +3749,370 @@ app.put("/settings/:group", requireAuth, requireRole(ROLE_LEVEL.admin), async (c
   }),
 );
 
+// ── 봇 (hp_bot) — 서비스별 챗봇 페르소나·답변범위·모델 설정 ──────────
+// 설계: BOTS-PLAN §3 / 스키마: migrations/004_bots.sql
+// ⚠ 정적 경로 "/admin/bots" 가 파라미터 경로 "/admin/bots/:id" 보다 먼저 등록됨(아래 순서 준수).
+//   JSON 컬럼(traits/refusal_topics/topics)은 LONGTEXT — 저장 시 stringify, 조회 시 parse.
+//   service_id NULL = 공통(전 서비스) 봇. FK 없음 → 앱이 hp_service 존재 검증.
+
+type BotJsonArr = string[];
+function parseJsonArr(raw: string | null): BotJsonArr | null {
+  if (raw == null) return null;
+  try {
+    const v = JSON.parse(raw) as unknown;
+    if (Array.isArray(v)) return v.filter((x): x is string => typeof x === "string");
+    return null;
+  } catch {
+    return null;
+  }
+}
+function serializeJsonArr(value: unknown): string | null {
+  if (value == null) return null;
+  if (!Array.isArray(value)) return null;
+  return JSON.stringify(value.filter((x): x is string => typeof x === "string"));
+}
+
+type BotStatus = "active" | "inactive" | "draft";
+type BotTone = "formal" | "friendly" | "concise";
+type BotVisibility = "public" | "internal";
+type BotUnknownPolicy = "strict" | "normal" | "lenient";
+type BotStandardAnswerScope = "all" | "service";
+
+function asBotStatus(v: unknown): BotStatus | null {
+  return v === "active" || v === "inactive" || v === "draft" ? v : null;
+}
+function asBotTone(v: unknown): BotTone | null {
+  return v === "formal" || v === "friendly" || v === "concise" ? v : null;
+}
+function asBotVisibility(v: unknown): BotVisibility | null {
+  return v === "public" || v === "internal" ? v : null;
+}
+function asBotUnknownPolicy(v: unknown): BotUnknownPolicy | null {
+  return v === "strict" || v === "normal" || v === "lenient" ? v : null;
+}
+function asBotScope(v: unknown): BotStandardAnswerScope | null {
+  return v === "all" || v === "service" ? v : null;
+}
+
+type BotDto = {
+  id: number;
+  serviceId: number | null;
+  serviceName: string | null; // hp_service.name 조인 (공통 봇이면 null)
+  name: string;
+  avatar: string | null;
+  description: string | null;
+  botStatus: BotStatus;
+  tone: BotTone;
+  traits: string[] | null;
+  greeting: string | null;
+  systemPrompt: string | null;
+  visibility: BotVisibility;
+  unknownPolicy: BotUnknownPolicy;
+  escalationThreshold: number;
+  refusalTopics: string[] | null;
+  topics: string[] | null;
+  useStandardAnswers: boolean;
+  standardAnswerScope: BotStandardAnswerScope;
+  model: string;
+  temperature: number;
+  maxTokens: number;
+  createdAt: string | null;
+  updatedAt: string | null;
+};
+type BotRaw = {
+  id: number;
+  service_id: number | null;
+  service_name: string | null;
+  name: string;
+  avatar: string | null;
+  description: string | null;
+  bot_status: BotStatus;
+  tone: BotTone;
+  traits: string | null;
+  greeting: string | null;
+  system_prompt: string | null;
+  visibility: BotVisibility;
+  unknown_policy: BotUnknownPolicy;
+  escalation_threshold: string | number;
+  refusal_topics: string | null;
+  topics: string | null;
+  use_standard_answers: number;
+  standard_answer_scope: BotStandardAnswerScope;
+  model: string;
+  temperature: string | number;
+  max_tokens: number;
+  created_at: string | null;
+  updated_at: string | null;
+};
+function toBotDto(r: BotRaw): BotDto {
+  return {
+    id: r.id,
+    serviceId: r.service_id,
+    serviceName: r.service_name,
+    name: r.name,
+    avatar: r.avatar,
+    description: r.description,
+    botStatus: r.bot_status,
+    tone: r.tone,
+    traits: parseJsonArr(r.traits),
+    greeting: r.greeting,
+    systemPrompt: r.system_prompt,
+    visibility: r.visibility,
+    unknownPolicy: r.unknown_policy,
+    escalationThreshold: Number(r.escalation_threshold),
+    refusalTopics: parseJsonArr(r.refusal_topics),
+    topics: parseJsonArr(r.topics),
+    useStandardAnswers: r.use_standard_answers === 1,
+    standardAnswerScope: r.standard_answer_scope,
+    model: r.model,
+    temperature: Number(r.temperature),
+    maxTokens: r.max_tokens,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  };
+}
+
+// 단건 조회 공통 SELECT(서비스명 조인). 소프트삭제 행은 제외하지 않음(직후 조회는 status 무관 id 단건).
+const BOT_SELECT = `
+  SELECT b.id, b.service_id, s.name AS service_name, b.name, b.avatar, b.description, b.bot_status,
+         b.tone, b.traits, b.greeting, b.system_prompt, b.visibility, b.unknown_policy,
+         b.escalation_threshold, b.refusal_topics, b.topics, b.use_standard_answers,
+         b.standard_answer_scope, b.model, b.temperature, b.max_tokens, b.created_at, b.updated_at
+    FROM hp_bot b
+    LEFT JOIN hp_service s ON s.id = b.service_id AND s.status = 1`;
+
+type BotInput = {
+  serviceId?: number | null;
+  name?: string;
+  avatar?: string | null;
+  description?: string | null;
+  botStatus?: string;
+  tone?: string;
+  traits?: unknown;
+  greeting?: string | null;
+  systemPrompt?: string | null;
+  visibility?: string;
+  unknownPolicy?: string;
+  escalationThreshold?: number;
+  refusalTopics?: unknown;
+  topics?: unknown;
+  useStandardAnswers?: boolean;
+  standardAnswerScope?: string;
+  model?: string;
+  temperature?: number;
+  maxTokens?: number;
+};
+
+// service_id 존재 검증(NULL=공통 허용). 유효하지 않으면 false.
+async function serviceIdExists(conn: Queryable, serviceId: number): Promise<boolean> {
+  const [rows] = await conn.query(`SELECT id FROM hp_service WHERE id = ? AND status = 1 LIMIT 1`, [serviceId]);
+  return (rows as unknown[]).length > 0;
+}
+
+/**
+ * GET /admin/bots?service_id=&bot_status=&limit=&offset= — 봇 목록(soft-deleted 제외).
+ * service_id 필터: 숫자=해당 서비스 / "common"(또는 빈값) = 공통(service_id IS NULL).
+ * 빈값(미지정)은 필터 없음(전체). 응답 {total,limit,offset,rows}.
+ */
+app.get("/admin/bots", requireAuth, requireRole(ROLE_LEVEL.developer), async (c) =>
+  withConn(c, async (conn) => {
+    const where: string[] = ["b.status = 1"];
+    const params: unknown[] = [];
+
+    // service_id 필터: "common" → IS NULL, 숫자 → = ?, 그 외/빈값 → 필터 없음(전체).
+    const sidRaw = c.req.query("service_id");
+    if (sidRaw === "common") {
+      where.push("b.service_id IS NULL");
+    } else if (sidRaw !== undefined && sidRaw !== "") {
+      const sid = Number(sidRaw);
+      if (!Number.isInteger(sid)) return c.json({ error: "invalid service_id (number|common)" }, 400);
+      where.push("b.service_id = ?");
+      params.push(sid);
+    }
+
+    const botStatus = c.req.query("bot_status");
+    if (asBotStatus(botStatus)) {
+      where.push("b.bot_status = ?");
+      params.push(botStatus);
+    }
+
+    const limit = Math.min(Math.max(Number(c.req.query("limit") ?? 50) || 50, 1), 200);
+    const offset = Math.max(Number(c.req.query("offset") ?? 0) || 0, 0);
+    const whereSql = where.join(" AND ");
+
+    const [countRows] = await conn.query(`SELECT COUNT(*) AS cnt FROM hp_bot b WHERE ${whereSql}`, params);
+    const total = Number((countRows as { cnt: number }[])[0]?.cnt ?? 0);
+
+    const [rows] = await conn.query(
+      `${BOT_SELECT} WHERE ${whereSql} ORDER BY b.service_id IS NULL DESC, b.service_id, b.id LIMIT ? OFFSET ?`,
+      [...params, limit, offset],
+    );
+    return c.json({ total, limit, offset, rows: (rows as BotRaw[]).map(toBotDto) });
+  }),
+);
+
+/** GET /admin/bots/:id — 단건(JSON 역직렬화). soft-deleted 제외. */
+app.get("/admin/bots/:id", requireAuth, requireRole(ROLE_LEVEL.developer), async (c) =>
+  withConn(c, async (conn) => {
+    const id = Number(c.req.param("id"));
+    if (!Number.isInteger(id)) return c.json({ error: "invalid id" }, 400);
+    const [rows] = await conn.query(`${BOT_SELECT} WHERE b.id = ? AND b.status = 1`, [id]);
+    const r = (rows as BotRaw[])[0];
+    if (!r) return c.json({ error: "not found" }, 404);
+    return c.json(toBotDto(r));
+  }),
+);
+
+/** POST /admin/bots — 생성. name 필수. service_id는 NULL(공통) 또는 존재하는 hp_service.id만. */
+app.post("/admin/bots", requireAuth, requireRole(ROLE_LEVEL.admin), async (c) =>
+  withConn(c, async (conn) => {
+    const b = await c.req.json<BotInput>().catch((): BotInput => ({}));
+    const name = (b.name ?? "").trim();
+    if (!name) return c.json({ error: "name required" }, 400);
+
+    // service_id 검증: undefined/null → 공통(NULL). 숫자면 hp_service 존재 확인.
+    let serviceId: number | null = null;
+    if (b.serviceId !== undefined && b.serviceId !== null) {
+      const sid = Number(b.serviceId);
+      if (!Number.isInteger(sid)) return c.json({ error: "invalid serviceId" }, 400);
+      if (!(await serviceIdExists(conn, sid))) return c.json({ error: "serviceId not found" }, 400);
+      serviceId = sid;
+    }
+
+    // ENUM 값 검증(잘못된 값은 400). 미지정은 DB DEFAULT 사용.
+    const botStatus = b.botStatus === undefined ? "draft" : asBotStatus(b.botStatus);
+    if (botStatus === null) return c.json({ error: "invalid botStatus (active|inactive|draft)" }, 400);
+    const tone = b.tone === undefined ? "friendly" : asBotTone(b.tone);
+    if (tone === null) return c.json({ error: "invalid tone (formal|friendly|concise)" }, 400);
+    const visibility = b.visibility === undefined ? "public" : asBotVisibility(b.visibility);
+    if (visibility === null) return c.json({ error: "invalid visibility (public|internal)" }, 400);
+    const unknownPolicy = b.unknownPolicy === undefined ? "strict" : asBotUnknownPolicy(b.unknownPolicy);
+    if (unknownPolicy === null) return c.json({ error: "invalid unknownPolicy (strict|normal|lenient)" }, 400);
+    const scope = b.standardAnswerScope === undefined ? "all" : asBotScope(b.standardAnswerScope);
+    if (scope === null) return c.json({ error: "invalid standardAnswerScope (all|service)" }, 400);
+
+    const [res] = await conn.query(
+      `INSERT INTO hp_bot
+         (service_id, name, avatar, description, bot_status, tone, traits, greeting, system_prompt,
+          visibility, unknown_policy, escalation_threshold, refusal_topics, topics,
+          use_standard_answers, standard_answer_scope, model, temperature, max_tokens)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [
+        serviceId,
+        name,
+        b.avatar ?? null,
+        b.description ?? null,
+        botStatus,
+        tone,
+        serializeJsonArr(b.traits),
+        b.greeting ?? null,
+        b.systemPrompt ?? null,
+        visibility,
+        unknownPolicy,
+        b.escalationThreshold === undefined ? 0.5 : Number(b.escalationThreshold),
+        serializeJsonArr(b.refusalTopics),
+        serializeJsonArr(b.topics),
+        b.useStandardAnswers === false ? 0 : 1,
+        scope,
+        (b.model ?? "openai/gpt-4.1-mini").trim() || "openai/gpt-4.1-mini",
+        b.temperature === undefined ? 0.3 : Number(b.temperature),
+        b.maxTokens === undefined ? 2048 : Number(b.maxTokens),
+      ],
+    );
+    const id = (res as unknown as { insertId: number }).insertId;
+    const [rows] = await conn.query(`${BOT_SELECT} WHERE b.id = ?`, [id]);
+    return c.json(toBotDto((rows as BotRaw[])[0]), 201);
+  }),
+);
+
+/** PATCH /admin/bots/:id — 부분 수정(전달 필드만). updated_at는 ON UPDATE로 자동 갱신. */
+app.patch("/admin/bots/:id", requireAuth, requireRole(ROLE_LEVEL.admin), async (c) =>
+  withConn(c, async (conn) => {
+    const id = Number(c.req.param("id"));
+    if (!Number.isInteger(id)) return c.json({ error: "invalid id" }, 400);
+    const b = await c.req.json<BotInput>().catch((): BotInput => ({}));
+    const sets: string[] = [];
+    const params: unknown[] = [];
+
+    if (b.serviceId !== undefined) {
+      if (b.serviceId === null) {
+        sets.push("service_id = ?");
+        params.push(null);
+      } else {
+        const sid = Number(b.serviceId);
+        if (!Number.isInteger(sid)) return c.json({ error: "invalid serviceId" }, 400);
+        if (!(await serviceIdExists(conn, sid))) return c.json({ error: "serviceId not found" }, 400);
+        sets.push("service_id = ?");
+        params.push(sid);
+      }
+    }
+    if (typeof b.name === "string") {
+      const name = b.name.trim();
+      if (!name) return c.json({ error: "name cannot be empty" }, 400);
+      sets.push("name = ?"); params.push(name);
+    }
+    if (b.avatar !== undefined) { sets.push("avatar = ?"); params.push(b.avatar ?? null); }
+    if (b.description !== undefined) { sets.push("description = ?"); params.push(b.description ?? null); }
+    if (b.botStatus !== undefined) {
+      const v = asBotStatus(b.botStatus);
+      if (v === null) return c.json({ error: "invalid botStatus (active|inactive|draft)" }, 400);
+      sets.push("bot_status = ?"); params.push(v);
+    }
+    if (b.tone !== undefined) {
+      const v = asBotTone(b.tone);
+      if (v === null) return c.json({ error: "invalid tone (formal|friendly|concise)" }, 400);
+      sets.push("tone = ?"); params.push(v);
+    }
+    if (b.traits !== undefined) { sets.push("traits = ?"); params.push(serializeJsonArr(b.traits)); }
+    if (b.greeting !== undefined) { sets.push("greeting = ?"); params.push(b.greeting ?? null); }
+    if (b.systemPrompt !== undefined) { sets.push("system_prompt = ?"); params.push(b.systemPrompt ?? null); }
+    if (b.visibility !== undefined) {
+      const v = asBotVisibility(b.visibility);
+      if (v === null) return c.json({ error: "invalid visibility (public|internal)" }, 400);
+      sets.push("visibility = ?"); params.push(v);
+    }
+    if (b.unknownPolicy !== undefined) {
+      const v = asBotUnknownPolicy(b.unknownPolicy);
+      if (v === null) return c.json({ error: "invalid unknownPolicy (strict|normal|lenient)" }, 400);
+      sets.push("unknown_policy = ?"); params.push(v);
+    }
+    if (b.escalationThreshold !== undefined) { sets.push("escalation_threshold = ?"); params.push(Number(b.escalationThreshold)); }
+    if (b.refusalTopics !== undefined) { sets.push("refusal_topics = ?"); params.push(serializeJsonArr(b.refusalTopics)); }
+    if (b.topics !== undefined) { sets.push("topics = ?"); params.push(serializeJsonArr(b.topics)); }
+    if (b.useStandardAnswers !== undefined) { sets.push("use_standard_answers = ?"); params.push(b.useStandardAnswers ? 1 : 0); }
+    if (b.standardAnswerScope !== undefined) {
+      const v = asBotScope(b.standardAnswerScope);
+      if (v === null) return c.json({ error: "invalid standardAnswerScope (all|service)" }, 400);
+      sets.push("standard_answer_scope = ?"); params.push(v);
+    }
+    if (b.model !== undefined) {
+      const m = (b.model ?? "").trim();
+      if (!m) return c.json({ error: "model cannot be empty" }, 400);
+      sets.push("model = ?"); params.push(m);
+    }
+    if (b.temperature !== undefined) { sets.push("temperature = ?"); params.push(Number(b.temperature)); }
+    if (b.maxTokens !== undefined) { sets.push("max_tokens = ?"); params.push(Number(b.maxTokens)); }
+
+    if (!sets.length) return c.json({ error: "no updatable fields" }, 400);
+    const [res] = await conn.query(
+      `UPDATE hp_bot SET ${sets.join(", ")} WHERE id = ? AND status = 1`,
+      [...params, id],
+    );
+    if ((res as unknown as { affectedRows: number }).affectedRows === 0) return c.json({ error: "not found" }, 404);
+    const [rows] = await conn.query(`${BOT_SELECT} WHERE b.id = ?`, [id]);
+    return c.json(toBotDto((rows as BotRaw[])[0]));
+  }),
+);
+
+/** DELETE /admin/bots/:id — soft delete(status=-1). */
+app.delete("/admin/bots/:id", requireAuth, requireRole(ROLE_LEVEL.admin), async (c) =>
+  withConn(c, async (conn) => {
+    const id = Number(c.req.param("id"));
+    if (!Number.isInteger(id)) return c.json({ error: "invalid id" }, 400);
+    const [res] = await conn.query(`UPDATE hp_bot SET status = -1 WHERE id = ? AND status = 1`, [id]);
+    if ((res as unknown as { affectedRows: number }).affectedRows === 0) return c.json({ error: "not found" }, 404);
+    return c.json({ ok: true, id });
+  }),
+);
+
 export default app;
