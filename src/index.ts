@@ -308,6 +308,259 @@ async function analyzeAndStoreImage(
   }
 }
 
+// ─────────────────────────────────────────────────────────────
+// 일회용 마이그레이션 — 005 hp_announce 신설 + hp_topic 24토픽 재시드 + hp_service 7재시드 + hp_bot 재매핑.
+//   정본: migrations/005_announce_and_service_reseed.sql (1구획 hp_announce CREATE),
+//         malgn-helper-mng/docs/TOPIC-CATALOG.md §4 (hp_topic 24토픽 + step soft-delete),
+//         migrations/004_bots.sql (hp_bot 시드의 service 슬러그 참조 → 재매핑 동반).
+//   MySQL 5.6 은 멱등 보조구문(IF NOT EXISTS 일부)이 제약 → SHOW/SELECT 로 존재 확인 후 분기.
+//   ?confirm=yes 1회 호출 후 라우트 제거. 재호출 시 0 변경(멱등).
+// ─────────────────────────────────────────────────────────────
+app.post("/admin/migrate/005-announce-topic", async (c) =>
+  withConn(c, async (conn) => {
+    if (c.req.query("confirm") !== "yes") return c.json({ error: "add ?confirm=yes" }, 400);
+
+    const warnings: string[] = [];
+
+    // ── 0) 적용 전 hp_service 전체 백업 로그(소규모) ──
+    const [svcBackupRows] = await conn.query(
+      `SELECT id, slug, name, note, sort_order, active, status FROM hp_service ORDER BY id`,
+    );
+    const serviceBackup = svcBackupRows as Array<{
+      id: number; slug: string; name: string; note: string | null;
+      sort_order: number; active: number; status: number;
+    }>;
+
+    // ╔═══ 1. hp_announce 생성 (없으면) — 005 CREATE TABLE 그대로, 비파괴 ═══╗
+    let announceCreated = false;
+    const [annTblRows] = await conn.query(`SHOW TABLES LIKE 'hp_announce'`);
+    if ((annTblRows as unknown[]).length === 0) {
+      await conn.query(
+        `CREATE TABLE hp_announce (
+          id                   INT NOT NULL AUTO_INCREMENT,
+          title                VARCHAR(150) NOT NULL,
+          label                VARCHAR(100) NULL,
+          question             TEXT NULL,
+          body                 TEXT NOT NULL,
+          scope                ENUM('common','service') NOT NULL DEFAULT 'service',
+          topic_id             INT NULL,
+          service_id           INT NULL,
+          tags                 LONGTEXT NULL,
+          approval_status      ENUM('draft','reviewing','approved','rejected','archived') NOT NULL DEFAULT 'draft',
+          approved_by          VARCHAR(100) NULL,
+          approved_at          DATETIME NULL,
+          rejection_reason     VARCHAR(255) NULL,
+          merged_into_id       INT NULL,
+          source_uncovered_id  INT NULL,
+          source_post_id       INT NULL,
+          created_by           VARCHAR(100) NULL,
+          usage_count          INT NOT NULL DEFAULT 0,
+          last_used_at         DATETIME NULL,
+          status               TINYINT NOT NULL DEFAULT 1,
+          created_at           DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at           DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          PRIMARY KEY (id),
+          KEY idx_approval (approval_status, status),
+          KEY idx_scope_topic (scope, topic_id, service_id, status),
+          KEY idx_merged (merged_into_id),
+          KEY idx_source_post (source_post_id),
+          KEY idx_usage (status, usage_count),
+          FULLTEXT KEY idx_announce_ft (title, body)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='표준 안내답변(직원 작성 공지·정책 안내) 카탈로그'`,
+      );
+      announceCreated = true;
+    }
+
+    // ╔═══ 2. hp_topic 24토픽 시드 (TOPIC-CATALOG §4) + 002 레거시 토픽 soft-delete ═══╗
+    // TOPIC-CATALOG §3 매핑표: 정본 24토픽에 1:1 생존자가 없는 002 옛 슬러그를 soft-delete.
+    //   enrollment·certificate 는 정본과 동일 slug → 아래 시드의 ON DUPLICATE 가 갱신(보존).
+    //   나머지(login/payment/refund/content/schedule/technical=common, step/lms-global=service)는 폐기.
+    await conn.query(
+      `UPDATE hp_topic SET status = -1
+        WHERE status = 1
+          AND ( (scope = 'common'  AND slug IN ('login','payment','refund','content','schedule','technical'))
+             OR (scope = 'service' AND slug IN ('step','lms-global')) )`,
+    );
+    type TopicSeed = [slug: string, scope: "common" | "service", label: string, description: string, sort: number];
+    const TOPICS: TopicSeed[] = [
+      // common (20)
+      ["payment-refund", "common", "결제/환불", "결제·환불·세금계산서·가상계좌 처리", 10],
+      ["system-error", "common", "시스템 오류", "접속 장애·서버 오류·에러 메시지", 20],
+      ["homepage-design", "common", "홈페이지 관리", "메인·배너·메뉴·디자인 노출 수정", 30],
+      ["login-account", "common", "로그인/회원가입", "ID·비밀번호·본인인증·계정 이슈", 40],
+      ["course-management", "common", "강의 관리", "강의 등록·수정·삭제·자료 업로드", 50],
+      ["enrollment", "common", "수강 관리", "수강신청·수강생 등록·수강완료/취소", 60],
+      ["member-management", "common", "회원 관리", "회원정보 일괄·삭제·필수항목 변경", 70],
+      ["video-playback", "common", "동영상 재생", "플레이어·인코딩·재생 오류", 80],
+      ["certificate", "common", "수료증 관리", "수료증·수강확인증 발급·기준·양식", 90],
+      ["exam-evaluation", "common", "시험/평가", "시험·평가·채점·문제은행·과제", 100],
+      ["board-notice", "common", "게시판/공지", "공지·게시판·카테고리·팝업", 110],
+      ["site-domain", "common", "사이트/도메인", "도메인·호스팅·서버·네임서버", 120],
+      ["notification-send", "common", "알림/발송", "문자·SMS·메일·알림톡 발송", 130],
+      ["learning-progress", "common", "학습 진행", "진도율·수강완료 처리·미수료", 140],
+      ["mobile-access", "common", "모바일 접속", "모바일·앱·하이브리드앱·모바일 메뉴", 150],
+      ["remote-support", "common", "원격지원", "원격지원·기술지원 요청", 160],
+      ["contract-quote", "common", "계약/견적", "계약·견적·갱신·종료", 170],
+      ["coupon-point", "common", "쿠폰/포인트", "쿠폰·포인트·할인코드", 180],
+      ["usage-guide", "common", "사용법 안내", "매뉴얼·가이드·도움말", 190],
+      ["integration-api", "common", "연동/API", "API·SSO·SMS·뿌리오·카카오 연동", 200],
+      // service (4)
+      ["refund-employment-insurance", "service", "환급/고용보험", "고용보험 환급과정·안전보건진흥원·본인인증", 10],
+      ["public-procurement", "service", "공공/조달", "공공기관 조달·제출서류·약관·일괄등록", 20],
+      ["global-lms", "service", "글로벌 LMS", "영문페이지·영문 수료증·다국어", 30],
+      ["ott-subscription", "service", "OTT 서비스", "이용권·구독·자막·에피소드", 40],
+    ];
+    let topicsSeeded = 0;
+    for (const [slug, scope, label, description, sort] of TOPICS) {
+      const [r] = await conn.query(
+        `INSERT INTO hp_topic (slug, scope, label, description, sort_order, active, status)
+         VALUES (?, ?, ?, ?, ?, 1, 1)
+         ON DUPLICATE KEY UPDATE
+           label = VALUES(label), description = VALUES(description),
+           sort_order = VALUES(sort_order), active = VALUES(active), status = 1`,
+        [slug, scope, label, description, sort],
+      );
+      topicsSeeded += (r as { affectedRows?: number }).affectedRows ?? 0;
+    }
+    const [activeTopicRows] = await conn.query(
+      `SELECT COUNT(*) AS n FROM hp_topic WHERE status = 1`,
+    );
+    const activeTopicCount = Number((activeTopicRows as Array<{ n: number }>)[0].n);
+    if (activeTopicCount !== 24) {
+      warnings.push(`hp_topic active count = ${activeTopicCount} (expected 24)`);
+    }
+
+    // ╔═══ 3. hp_service 7재시드 (방식 A: 002 6종 soft-delete + 7종 INSERT) ═══╗
+    // slug→id 매핑 (재매핑 단계에서 사용). 재시드 전 옛 active id 확보.
+    const oldServiceBySlug = new Map<string, number>();
+    for (const s of serviceBackup) {
+      if (s.status === 1) oldServiceBySlug.set(s.slug, s.id);
+    }
+    // A-1) 002 6종 soft-delete
+    await conn.query(
+      `UPDATE hp_service SET status = -1
+        WHERE slug IN ('step','lms-general','lms-mixed','lms-private','lms-public-security','lms-global')
+          AND status = 1`,
+    );
+    // A-2) 7서비스 INSERT (slug UNIQUE → ON DUPLICATE 멱등·재활성)
+    type SvcSeed = [slug: string, name: string, note: string, sort: number];
+    const SERVICES: SvcSeed[] = [
+      ["ott", "OTT", "OTT 서비스", 10],
+      ["general", "범용", "맑은이러닝(범용 LMS) — 오픈전/후 포함", 20],
+      ["global", "글로벌", "글로벌이러닝(해외·영문)", 30],
+      ["public", "공공", "공공클라우드", 40],
+      ["maintenance", "유지보수", "유지보수 프로젝트", 50],
+      ["refund", "환급", "환급과정 유지보수(고용보험 환급)", 60],
+      ["standalone", "독립", "독립 LMS(온프레미스/단독)", 70],
+    ];
+    let serviceReseeded = 0;
+    for (const [slug, name, note, sort] of SERVICES) {
+      const [r] = await conn.query(
+        `INSERT INTO hp_service (slug, name, note, sort_order, active, status)
+         VALUES (?, ?, ?, ?, 1, 1)
+         ON DUPLICATE KEY UPDATE
+           name = VALUES(name), note = VALUES(note), sort_order = VALUES(sort_order),
+           active = VALUES(active), status = VALUES(status)`,
+        [slug, name, note, sort],
+      );
+      serviceReseeded += (r as { affectedRows?: number }).affectedRows ?? 0;
+    }
+    // 새 active service slug→id 조회
+    const [newSvcRows] = await conn.query(
+      `SELECT id, slug FROM hp_service WHERE status = 1`,
+    );
+    const newServiceBySlug = new Map<string, number>();
+    for (const r of newSvcRows as Array<{ id: number; slug: string }>) {
+      newServiceBySlug.set(r.slug, r.id);
+    }
+    const activeServiceCount = (newSvcRows as unknown[]).length;
+    if (activeServiceCount !== 7) {
+      warnings.push(`hp_service active count = ${activeServiceCount} (expected 7)`);
+    }
+
+    // ╔═══ 4. hp_bot.service_id 재매핑 (옛 slug → 새 slug) ═══╗
+    // 옛(soft-deleted) service id → 새 active service id 매핑.
+    //   lms-general → general / lms-global → global / lms-public-security → public
+    //   step/lms-mixed/lms-private 는 7종에 의미 대응 없음 → 보류(경고).
+    const SLUG_REMAP: Record<string, string> = {
+      "lms-general": "general",
+      "lms-global": "global",
+      "lms-public-security": "public",
+    };
+    const idRemap = new Map<number, number>(); // 옛 service id → 새 service id
+    for (const [oldSlug, newSlug] of Object.entries(SLUG_REMAP)) {
+      const oldId = oldServiceBySlug.get(oldSlug);
+      const newId = newServiceBySlug.get(newSlug);
+      if (oldId != null && newId != null && oldId !== newId) idRemap.set(oldId, newId);
+    }
+    const botRemapDetail: Array<{ botId: number; name: string; from: number; to: number }> = [];
+    const botHeld: Array<{ botId: number; name: string; serviceId: number }> = [];
+    let botsRemapped = 0;
+    if (idRemap.size > 0) {
+      // 옛 service id 를 가리키는 봇들 조회 (NULL=공통봇은 제외).
+      const oldIds = [...idRemap.keys()];
+      const [botRows] = await conn.query(
+        `SELECT id, name, service_id FROM hp_bot
+          WHERE status = 1 AND service_id IN (${oldIds.map(() => "?").join(",")})`,
+        oldIds,
+      );
+      for (const b of botRows as Array<{ id: number; name: string; service_id: number }>) {
+        const to = idRemap.get(b.service_id);
+        if (to == null) continue;
+        await conn.query(`UPDATE hp_bot SET service_id = ? WHERE id = ?`, [to, b.id]);
+        botRemapDetail.push({ botId: b.id, name: b.name, from: b.service_id, to });
+        botsRemapped += 1;
+      }
+    }
+    // 매핑 불명확(soft-deleted 옛 service 의 step/lms-mixed/lms-private 등)을 가리키는 봇 점검 → 보류.
+    const deletedSvcIds = serviceBackup
+      .filter((s) => ["step", "lms-mixed", "lms-private"].includes(s.slug))
+      .map((s) => s.id);
+    if (deletedSvcIds.length > 0) {
+      const [danglingRows] = await conn.query(
+        `SELECT id, name, service_id FROM hp_bot
+          WHERE status = 1 AND service_id IN (${deletedSvcIds.map(() => "?").join(",")})`,
+        deletedSvcIds,
+      );
+      for (const b of danglingRows as Array<{ id: number; name: string; service_id: number }>) {
+        botHeld.push({ botId: b.id, name: b.name, serviceId: b.service_id });
+        warnings.push(`hp_bot id=${b.id} (${b.name}) service_id=${b.service_id} 매핑 불명확 → 변경 보류`);
+      }
+    }
+    warnings.push("후속: migrations/004_bots.sql 시드 슬러그(lms-general/lms-public-security)를 7종으로 정본화 필요(파일 수정은 다음 작업).");
+
+    // ── 검증: active 봇 중 service_id 가 active service 를 못 가리키는 dangling 점검 ──
+    const [danglingBotRows] = await conn.query(
+      `SELECT b.id, b.name, b.service_id
+         FROM hp_bot b
+         LEFT JOIN hp_service s ON s.id = b.service_id AND s.status = 1
+        WHERE b.status = 1 AND b.service_id IS NOT NULL AND s.id IS NULL`,
+    );
+    const danglingBots = (danglingBotRows as Array<{ id: number; name: string; service_id: number }>).map(
+      (b) => ({ botId: b.id, name: b.name, serviceId: b.service_id }),
+    );
+    if (danglingBots.length > 0) {
+      warnings.push(`hp_bot dangling service_id ${danglingBots.length}건 (검증 후 수동 점검).`);
+    }
+
+    return c.json({
+      ok: true,
+      announceCreated,
+      topicsSeeded,
+      serviceReseeded,
+      botsRemapped,
+      activeTopicCount,
+      activeServiceCount,
+      serviceBackup,
+      serviceRemap: [...idRemap.entries()].map(([from, to]) => ({ from, to })),
+      botRemapDetail,
+      botHeld,
+      danglingBots,
+      warnings,
+    });
+  }),
+);
+
 // 프로젝트의 게시글 목록 (검색·필터·페이지네이션). 작성자 분류 칩 포함.
 app.get("/pms/projects/:id/posts", async (c) =>
   withConn(c, async (conn) => {
