@@ -2754,17 +2754,65 @@ app.patch("/standard-answers/:id", requireAuth, requireRole(ROLE_LEVEL.admin), a
       label?: string;
       question?: string;
       answer?: string;
+      // 003 분류 — 기존 항목도 수정 가능 (§2-1). scope 는 NOT NULL ENUM, topic/service/tags 는 NULL 허용.
+      scope?: string | null;
+      topicId?: number | null;
+      serviceId?: number | null;
+      tags?: unknown;
     }>();
+    const assetBase = c.env.PMS_ASSET_BASE || DEFAULT_PMS_ASSET_BASE;
     const sets: string[] = [];
     const params: any[] = [];
+    // 본문 — question/answer 는 POST 와 동일하게 이미지 경로 절대화.
     for (const k of ["label", "question", "answer"] as const) {
       const v = body[k];
       if (v !== undefined) {
-        const trimmed = String(v).trim();
+        let trimmed = String(v).trim();
         if (!trimmed) return c.json({ error: `${k} empty` }, 400);
+        if (k === "question" || k === "answer") trimmed = absolutizePmsAssets(trimmed, assetBase);
         sets.push(`${k} = ?`);
         params.push(trimmed);
       }
+    }
+    // 분류 — scope/topicId/serviceId/tags. 미지정(null/'')로 보내면 topic/service/tags 는 해제, scope 는 필수값이라 무시.
+    if (body.scope !== undefined && body.scope !== null && body.scope !== "") {
+      if (body.scope !== "common" && body.scope !== "service") {
+        return c.json({ error: "scope must be common|service" }, 400);
+      }
+      sets.push("scope = ?");
+      params.push(body.scope);
+    }
+    if (body.topicId !== undefined) {
+      if (body.topicId === null) {
+        sets.push("topic_id = ?");
+        params.push(null);
+      } else {
+        const tid = Number(body.topicId);
+        if (!Number.isInteger(tid)) return c.json({ error: "invalid topicId" }, 400);
+        const v = await validateTopic(conn, tid);
+        if (!v.ok) return c.json({ error: v.reason }, 400);
+        sets.push("topic_id = ?");
+        params.push(tid);
+      }
+    }
+    if (body.serviceId !== undefined) {
+      if (body.serviceId === null) {
+        sets.push("service_id = ?");
+        params.push(null);
+      } else {
+        const sid = Number(body.serviceId);
+        if (!Number.isInteger(sid)) return c.json({ error: "invalid serviceId" }, 400);
+        const v = await validateService(conn, sid);
+        if (!v.ok) return c.json({ error: v.reason }, 400);
+        sets.push("service_id = ?");
+        params.push(sid);
+      }
+    }
+    if (body.tags !== undefined) {
+      const tagsJson = serializeTags(body.tags);
+      if (tagsJson === undefined) return c.json({ error: "tags must be an array of strings" }, 400);
+      sets.push("tags = ?");
+      params.push(tagsJson);
     }
     if (!sets.length) return c.json({ error: "no fields" }, 400);
     params.push(id);
