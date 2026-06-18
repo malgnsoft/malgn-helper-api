@@ -308,6 +308,450 @@ async function analyzeAndStoreImage(
   }
 }
 
+// ─────────────────────────────────────────────────────────────
+// 일회용 큐레이션 — POST /admin/migrate/harvest-curate?confirm=yes
+//   PMS 문의에서 "표준답변 가치"가 높은 staff 답변/안내글을 LLM 가치평가로 추려 draft 등록.
+//   ⚠ 항상 approval_status='draft'(최종 승인은 사람). 읽기 tb_*(불변) · 쓰기 hp_*(draft).
+//   재사용: /pms/harvest/scan 스캔쿼리·제외룰·groupNameToServiceSlug·isAnnounceCandidate·토픽 LLM 분류,
+//           /pms/harvest/commit INSERT 로직(absolutizePmsAssets·중복 source_post_id 제외·private 제외).
+//   신규: ③가치평가(배치 LLM) — 명확성·정확성·재사용성·자기완결성 0~1 점수, score>=minScore 만 채택.
+//   멱등: 재실행해도 중복(source_post_id) 제외로 안전. 적용 후 라우트 제거 + 재배포.
+//   응답엔 본문 PII 미포함(집계·id만).
+// ─────────────────────────────────────────────────────────────
+type CurateBody = { limit?: number; perServiceCap?: number; minScore?: number };
+type CurateEvalResult = {
+  i: number;
+  score: number;
+  reason?: string;
+  label?: string;
+  title?: string;
+};
+app.post("/admin/migrate/harvest-curate", async (c) =>
+  withConn(c, async (conn) => {
+    if (c.req.query("confirm") !== "yes") return c.json({ error: "add ?confirm=yes" }, 400);
+    const t0 = Date.now();
+    const route = "POST /admin/migrate/harvest-curate";
+    const assetBase = c.env.PMS_ASSET_BASE || DEFAULT_PMS_ASSET_BASE;
+
+    const qLimit = c.req.query("limit");
+    const qCap = c.req.query("perServiceCap");
+    const qMin = c.req.query("minScore");
+    const b = await c.req.json<CurateBody>().catch((): CurateBody => ({}));
+    const limit = Math.min(Math.max(Number(qLimit ?? b.limit ?? 120) || 120, 1), 400);
+    const perServiceCap = Math.min(Math.max(Number(qCap ?? b.perServiceCap ?? 20) || 20, 1), 200);
+    const minScore = Math.min(Math.max(Number(qMin ?? b.minScore ?? 0.7) || 0.7, 0), 1);
+
+    if (!c.env.OPENAI_API_KEY) return c.json({ error: "OPENAI_API_KEY missing" }, 500);
+
+    // ── ① 대상 추출(읽기) — scan 제외룰 그대로. 2022~2026, 답변 있는 Q&A + staff 안내글 ──
+    const from14 = "20220101000000";
+    const to14 = "20261231235959";
+    const internalNames = [...HARVEST_INTERNAL_GROUP_NAMES];
+    const where: string[] = [
+      "p.status = 1",
+      "p.site_id = 1",
+      "p.reg_date BETWEEN ? AND ?",
+      "CHAR_LENGTH(p.content) >= ?",
+      "proj.name NOT REGEXP '^[0-9]+\\\\.'",
+    ];
+    const params: unknown[] = [from14, to14, HARVEST_MIN_CONTENT_LEN];
+    if (internalNames.length > 0) {
+      where.push(`(g.name IS NULL OR g.name NOT IN (${internalNames.map(() => "?").join(",")}))`);
+      params.push(...internalNames);
+    }
+    // 가치 있는 후보만: staff 답변(공개)이 있는 Q&A 이거나, staff 작성 안내글.
+    //   has_staff_answer / author_is_staff 둘 중 하나는 true 여야 의미가 있음 → 추출 단계에서 미리 좁힘.
+    where.push(
+      `(
+         EXISTS (
+           SELECT 1 FROM tb_post_comment cc
+            JOIN tb_user cu ON cu.id = cc.user_id
+            WHERE cc.post_id = p.id AND cc.status = 1 AND cc.private_yn != 'Y'
+              AND cc.content IS NOT NULL AND cc.content != ''
+              AND (cu.email LIKE '%@malgnsoft.com' OR cu.company = '맑은소프트')
+         )
+         OR (u.email LIKE '%@malgnsoft.com' OR u.company = '맑은소프트')
+       )`,
+    );
+    const whereSql = `WHERE ${where.join(" AND ")}`;
+
+    const [countRows] = await conn.query(
+      `SELECT COUNT(*) AS total
+         FROM tb_post p
+         JOIN tb_project proj ON proj.id = p.project_id
+    LEFT JOIN tb_project_group g ON g.id = proj.group_id AND g.status = 1
+    LEFT JOIN tb_user u ON u.id = p.user_id
+        ${whereSql}`,
+      params,
+    );
+    const scanned = Number((countRows as { total: number }[])[0]?.total ?? 0);
+
+    // 최신·본문 충실 우선: reg_date DESC. 넉넉히 fetch 후 서비스별 cap·총 limit 으로 조절.
+    const fetchCap = Math.min(limit * 4, 1500);
+    const [rows] = await conn.query(
+      `SELECT p.id, p.subject, p.content, p.project_id, p.reg_date,
+              g.name AS group_name,
+              (u.email LIKE '%@malgnsoft.com' OR u.company = '맑은소프트') AS author_is_staff,
+              EXISTS (
+                SELECT 1 FROM tb_post_comment cc
+                 JOIN tb_user cu ON cu.id = cc.user_id
+                 WHERE cc.post_id = p.id AND cc.status = 1 AND cc.private_yn != 'Y'
+                   AND cc.content IS NOT NULL AND cc.content != ''
+                   AND (cu.email LIKE '%@malgnsoft.com' OR cu.company = '맑은소프트')
+              ) AS has_staff_answer
+         FROM tb_post p
+         JOIN tb_project proj ON proj.id = p.project_id
+    LEFT JOIN tb_project_group g ON g.id = proj.group_id AND g.status = 1
+    LEFT JOIN tb_user u ON u.id = p.user_id
+        ${whereSql}
+     ORDER BY p.reg_date DESC, p.id DESC
+        LIMIT ${fetchCap}`,
+      params,
+    );
+    type CurRow = {
+      id: number;
+      subject: string | null;
+      content: string | null;
+      project_id: number;
+      reg_date: string;
+      group_name: string | null;
+      author_is_staff: number;
+      has_staff_answer: number;
+    };
+    const allRows = rows as CurRow[];
+
+    // ── ② 분류 — 서비스배정·안내글/Q&A 분기(결정적). 서비스 slug→id 해석 ──
+    const [svcRows] = await conn.query(
+      `SELECT id, slug FROM hp_service WHERE status = 1 AND active = 1`,
+    );
+    const slugToServiceId = new Map<string, number>();
+    for (const r of svcRows as { id: number; slug: string }[]) {
+      slugToServiceId.set(r.slug, Number(r.id));
+    }
+
+    type CurCand = {
+      row: CurRow;
+      serviceSlug: string | null;
+      serviceId: number | null;
+      type: "qa" | "announce";
+      hasAnswer: boolean;
+      topicId: number | null;
+      topicSlug: string | null;
+      score?: number;
+      label?: string;
+      announceTitle?: string;
+    };
+
+    // 서비스별 cap·총 limit 으로 편중 방지. slug 키(미매핑은 "__none").
+    const perSvcCount = new Map<string, number>();
+    const candidates: CurCand[] = [];
+    for (const r of allRows) {
+      if (candidates.length >= limit) break;
+      const serviceSlug = groupNameToServiceSlug(r.group_name);
+      const isStaff = Number(r.author_is_staff) === 1;
+      const hasAnswer = Number(r.has_staff_answer) === 1;
+      const isAnnounce = isAnnounceCandidate(null, isStaff, true);
+      // Q&A 인데 답변이 없으면 표준답변 불가 → 제외. announce 는 본문 자체가 콘텐츠.
+      if (!isAnnounce && !hasAnswer) continue;
+      const capKey = serviceSlug ?? "__none";
+      const used = perSvcCount.get(capKey) ?? 0;
+      if (used >= perServiceCap) continue;
+      perSvcCount.set(capKey, used + 1);
+      candidates.push({
+        row: r,
+        serviceSlug,
+        serviceId: serviceSlug ? (slugToServiceId.get(serviceSlug) ?? null) : null,
+        type: isAnnounce ? "announce" : "qa",
+        hasAnswer,
+        topicId: null,
+        topicSlug: null,
+      });
+    }
+
+    // LLM 비용 집계
+    let llmCostUsd = 0;
+    let llmPromptTokens = 0;
+    let llmCompletionTokens = 0;
+    let llmCalls = 0;
+    let llmModel: string | null = null;
+    let llmError: string | null = null;
+
+    function stripHtml(s: string, n: number): string {
+      return String(s ?? "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, n);
+    }
+
+    // ── ②-b 토픽 LLM 분류(배치) — scan 로직 동일. 라이브 hp_topic active 카탈로그 ──
+    const [topicRows] = await conn.query(
+      `SELECT id, slug, label, description, scope FROM hp_topic
+        WHERE status = 1 AND active = 1
+        ORDER BY scope, sort_order, id`,
+    );
+    const topicCatalog = topicRows as Array<{
+      id: number; slug: string; label: string; description: string | null; scope: SaScope;
+    }>;
+    const slugToTopicId = new Map<string, number>();
+    for (const t of topicCatalog) slugToTopicId.set(t.slug, Number(t.id));
+    const validTopicSlugs = new Set(topicCatalog.map((t) => t.slug));
+    const TOPIC_CONF = 0.6;
+    const BATCH = 15;
+
+    if (candidates.length > 0 && topicCatalog.length > 0) {
+      for (let start = 0; start < candidates.length; start += BATCH) {
+        const chunk = candidates.slice(start, start + BATCH);
+        const items = chunk.map((cand, j) => ({
+          i: j,
+          title: stripHtml(cand.row.subject ?? "", 120),
+          excerpt: stripHtml(cand.row.content ?? "", 120),
+        }));
+        try {
+          const llm = await callOpenAiJson<{
+            results: Array<{ i: number; topic_slug: string | null; confidence: number }>;
+          }>(c.env, {
+            model: c.env.LLM_MODEL_DEFAULT,
+            system: [
+              "너는 고객상담 문의를 사전 정의된 토픽 카탈로그 중 하나로 분류하는 분류기다.",
+              "각 항목(title + excerpt)을 읽고 가장 적합한 topic_slug 1개와 confidence(0~1)를 매겨라.",
+              "- topic_slug 는 반드시 카탈로그 slug 중 하나이거나, 적합한 것이 없으면 null.",
+              "- 이름·회사로 도메인 추정 금지. 본문 내용만 근거.",
+              "- 애매하면 confidence 를 낮게(<0.6), 정말 해당 없으면 topic_slug=null.",
+              '출력 JSON: {"results":[{"i":번호,"topic_slug":"slug 또는 null","confidence":0~1}]}',
+              "모든 입력 항목 i 에 대해 정확히 1개 결과를 반환하라.",
+              "",
+              "=== 토픽 카탈로그 ===",
+              ...topicCatalog.map((t) => `- ${t.slug} (${t.label}): ${t.description ?? ""}`),
+            ].join("\n"),
+            user: JSON.stringify({ items }),
+            maxTokens: Math.min(200 + items.length * 30, 4000),
+            temperature: 0,
+          });
+          llmModel = llm.model;
+          llmPromptTokens += llm.promptTokens;
+          llmCompletionTokens += llm.completionTokens;
+          llmCostUsd += llm.costUsd;
+          llmCalls += 1;
+          for (const res of llm.data.results ?? []) {
+            const idx = Number(res.i);
+            if (!Number.isInteger(idx) || idx < 0 || idx >= chunk.length) continue;
+            const slug = res.topic_slug;
+            const conf = typeof res.confidence === "number" ? res.confidence : 0;
+            if (slug && validTopicSlugs.has(slug) && conf >= TOPIC_CONF) {
+              chunk[idx].topicSlug = slug;
+              chunk[idx].topicId = slugToTopicId.get(slug) ?? null;
+            }
+          }
+        } catch (e) {
+          llmError = e instanceof Error ? e.message : String(e);
+        }
+      }
+    }
+
+    // ── ③ 가치평가(핵심) — 각 후보의 staff 답변/안내본문을 LLM 배치 평가 ──
+    // 명확성·정확성·재사용성(일반화)·자기완결성. 개별특정/일회성/불완전 답변은 저점.
+    // 평가에 쓸 본문(qa: staff 첫 답변, announce: 본문)을 먼저 수집(PII는 LLM 입력으로만, 응답엔 미포함).
+    const evalSources: Array<{ question: string; answer: string }> = [];
+    for (const cand of candidates) {
+      if (cand.type === "qa") {
+        const [ansRows] = await conn.query(
+          `SELECT c.content
+             FROM tb_post_comment c
+             JOIN tb_user cu ON cu.id = c.user_id
+            WHERE c.post_id = ? AND c.status = 1 AND c.private_yn != 'Y'
+              AND (cu.email LIKE '%@malgnsoft.com' OR cu.company = '맑은소프트')
+              AND c.content IS NOT NULL AND c.content != ''
+         ORDER BY c.reg_date ASC, c.id ASC
+            LIMIT 1`,
+          [cand.row.id],
+        );
+        const ans = String((ansRows as { content: string | null }[])[0]?.content ?? "").trim();
+        evalSources.push({ question: stripHtml(cand.row.content ?? "", 600), answer: stripHtml(ans, 800) });
+      } else {
+        evalSources.push({ question: "", answer: stripHtml(cand.row.content ?? "", 900) });
+      }
+    }
+
+    for (let start = 0; start < candidates.length; start += BATCH) {
+      const chunk = candidates.slice(start, start + BATCH);
+      const items = chunk.map((cand, j) => ({
+        i: j,
+        type: cand.type,
+        title: stripHtml(cand.row.subject ?? "", 120),
+        question: evalSources[start + j].question,
+        answer: evalSources[start + j].answer,
+      }));
+      try {
+        const llm = await callOpenAiJson<{ results: CurateEvalResult[] }>(c.env, {
+          model: c.env.LLM_MODEL_DEFAULT,
+          system: [
+            "너는 고객상담 지식베이스 큐레이터다. 각 항목이 '표준답변/표준안내글'로 등록할 가치가 있는지 0~1 점수로 평가한다.",
+            "평가 기준(모두 높을수록 고점):",
+            "- 명확성: 답변이 이해하기 쉽고 구체적인가.",
+            "- 정확성: 사실에 부합하고 모순이 없는가.",
+            "- 재사용성: 여러 고객에게 일반화 가능한 내용인가(특정 고객·특정 건에만 해당하면 저점).",
+            "- 자기완결성: 외부 맥락 없이 그 자체로 답이 되는가.",
+            "저점 사유 예: 개별 고객 특정, 일회성 처리, 불완전·단편 답변, '확인 후 연락드리겠습니다' 류.",
+            "각 항목에 score(0~1), reason(한 줄, PII 없이), label(<=40자 재사용 가능한 일반 주제 라벨), title(<=60자 제목)을 부여하라.",
+            "type=announce 는 question 이 비어있고 answer 가 안내 본문이다.",
+            '출력 JSON: {"results":[{"i":번호,"score":0~1,"reason":"사유","label":"라벨","title":"제목"}]}',
+            "모든 입력 항목 i 에 대해 정확히 1개 결과를 반환하라.",
+          ].join("\n"),
+          user: JSON.stringify({ items }),
+          maxTokens: Math.min(300 + items.length * 80, 4000),
+          temperature: 0,
+        });
+        llmModel = llm.model;
+        llmPromptTokens += llm.promptTokens;
+        llmCompletionTokens += llm.completionTokens;
+        llmCostUsd += llm.costUsd;
+        llmCalls += 1;
+        for (const res of llm.data.results ?? []) {
+          const idx = Number(res.i);
+          if (!Number.isInteger(idx) || idx < 0 || idx >= chunk.length) continue;
+          const score = typeof res.score === "number" ? res.score : 0;
+          chunk[idx].score = Math.min(Math.max(score, 0), 1);
+          chunk[idx].label = typeof res.label === "string" ? res.label.replace(/\s+/g, " ").trim().slice(0, 40) : undefined;
+          chunk[idx].announceTitle = typeof res.title === "string" ? res.title.replace(/\s+/g, " ").trim().slice(0, 60) : undefined;
+        }
+      } catch (e) {
+        llmError = e instanceof Error ? e.message : String(e);
+      }
+    }
+
+    // ── ④ 등록 — score>=minScore 만 draft 등록. 중복 source_post_id 제외 ──
+    const byService: Record<string, number> = {};
+    const byTopic: Record<string, number> = {};
+    const committed = { qa: 0, announce: 0 };
+    const skipped = { already: 0, no_answer: 0, low_score: 0, not_evaluated: 0, error: 0 };
+    let evaluated = 0;
+    let accepted = 0;
+    let scoreSum = 0;
+
+    function harvestLabelLocal(s: string): string {
+      const t = (s ?? "").replace(/\s+/g, " ").trim();
+      return t.length <= HARVEST_LABEL_MAX ? t : `${t.slice(0, HARVEST_LABEL_MAX - 1)}…`;
+    }
+
+    for (let idx = 0; idx < candidates.length; idx++) {
+      const cand = candidates[idx];
+      if (typeof cand.score !== "number") {
+        skipped.not_evaluated += 1;
+        continue;
+      }
+      evaluated += 1;
+      scoreSum += cand.score;
+      if (cand.score < minScore) {
+        skipped.low_score += 1;
+        continue;
+      }
+      accepted += 1;
+      const postId = cand.row.id;
+      try {
+        // 중복 차단 — 이미 등록된 source_post_id.
+        const [dupSa] = await conn.query(
+          `SELECT 1 FROM hp_standard_answer WHERE source_post_id = ? AND status = 1 LIMIT 1`,
+          [postId],
+        );
+        const [dupAn] = await conn.query(
+          `SELECT 1 FROM hp_announce WHERE source_post_id = ? AND status = 1 LIMIT 1`,
+          [postId],
+        );
+        if ((dupSa as unknown[]).length > 0 || (dupAn as unknown[]).length > 0) {
+          skipped.already += 1;
+          continue;
+        }
+
+        const scope: SaScope = cand.serviceId != null ? "service" : "common";
+        const svcKey = cand.serviceSlug ?? "__none";
+        const topKey = cand.topicSlug ?? "__none";
+        const title = String(cand.row.subject ?? "").trim();
+
+        if (cand.type === "qa") {
+          const src = evalSources[idx];
+          if (!src.answer) {
+            skipped.no_answer += 1;
+            continue;
+          }
+          // 절대화는 원본 raw 에서 다시(stripHtml 발췌 아님) — 본문 완전 보존.
+          const [ansRows] = await conn.query(
+            `SELECT c.content
+               FROM tb_post_comment c
+               JOIN tb_user cu ON cu.id = c.user_id
+              WHERE c.post_id = ? AND c.status = 1 AND c.private_yn != 'Y'
+                AND (cu.email LIKE '%@malgnsoft.com' OR cu.company = '맑은소프트')
+                AND c.content IS NOT NULL AND c.content != ''
+           ORDER BY c.reg_date ASC, c.id ASC
+              LIMIT 1`,
+            [postId],
+          );
+          const rawAnswer = String((ansRows as { content: string | null }[])[0]?.content ?? "").trim();
+          if (!rawAnswer) {
+            skipped.no_answer += 1;
+            continue;
+          }
+          const label = (cand.label && cand.label.length > 0 ? cand.label : harvestLabelLocal(title)) || `문의 #${postId}`;
+          const question = absolutizePmsAssets(String(cand.row.content ?? "").trim(), assetBase);
+          const answer = absolutizePmsAssets(rawAnswer, assetBase);
+          await conn.query(
+            `INSERT INTO hp_standard_answer
+               (label, question, answer, project_id, source_post_id, created_by,
+                scope, topic_id, service_id, approval_status)
+             VALUES (?, ?, ?, ?, ?, 'llm-curator', ?, ?, ?, 'draft')`,
+            [label.slice(0, 100), question, answer, cand.row.project_id ?? null, postId, scope, cand.topicId, cand.serviceId],
+          );
+          committed.qa += 1;
+        } else {
+          const bodyText = absolutizePmsAssets(String(cand.row.content ?? "").trim(), assetBase);
+          const annTitle = ((cand.announceTitle && cand.announceTitle.length > 0 ? cand.announceTitle : title) || `안내 #${postId}`).slice(0, 150);
+          await conn.query(
+            `INSERT INTO hp_announce
+               (title, label, question, body, source_post_id, created_by,
+                scope, topic_id, service_id, approval_status)
+             VALUES (?, ?, NULL, ?, ?, 'llm-curator', ?, ?, ?, 'draft')`,
+            [annTitle, cand.label ? cand.label.slice(0, 100) : null, bodyText, postId, scope, cand.topicId, cand.serviceId],
+          );
+          committed.announce += 1;
+        }
+        byService[svcKey] = (byService[svcKey] ?? 0) + 1;
+        byTopic[topKey] = (byTopic[topKey] ?? 0) + 1;
+      } catch {
+        skipped.error += 1;
+      }
+    }
+
+    // ── 감사 로그(hp_llm_log) — 비용/실패 1건 집계 기록 ──
+    try {
+      await conn.query(
+        `INSERT INTO hp_llm_log
+           (route, entity_type, entity_id, model, prompt_tokens, completion_tokens, cost_usd, latency_ms, cache_hit, error)
+         VALUES (?, 'harvest_curate', 0, ?, ?, ?, ?, ?, 0, ?)`,
+        [route, llmModel ?? "none", llmPromptTokens, llmCompletionTokens, llmCostUsd, Date.now() - t0, llmError],
+      );
+    } catch {
+      // 로그 실패는 응답을 막지 않는다.
+    }
+
+    const avgScore = evaluated > 0 ? Math.round((scoreSum / evaluated) * 1000) / 1000 : 0;
+    return c.json({
+      scanned,
+      candidates: candidates.length,
+      evaluated,
+      accepted,
+      committed,
+      byService,
+      byTopic,
+      avgScore,
+      acceptRate: evaluated > 0 ? Math.round((accepted / evaluated) * 1000) / 1000 : 0,
+      minScore,
+      limit,
+      perServiceCap,
+      llmCalls,
+      llmCostUsd: Math.round(llmCostUsd * 1e6) / 1e6,
+      llmModel,
+      llmError,
+      skipped,
+    });
+  }),
+);
+
 // 프로젝트의 게시글 목록 (검색·필터·페이지네이션). 작성자 분류 칩 포함.
 app.get("/pms/projects/:id/posts", async (c) =>
   withConn(c, async (conn) => {
