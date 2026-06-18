@@ -47,3 +47,69 @@ export function classifyUser(u: { email?: unknown; name?: unknown; company?: unk
   if (isPartner(u)) return "partner";
   return "customer";
 }
+
+// ── PMS 수집(harvest) 헬퍼 ──────────────────────────────
+// 정본: malgn-helper-mng/docs/PMS-INQUIRY-HARVEST.md §3-1(그룹→서비스 매핑) · §5-3(안내글/Q&A 분기)
+// 다음 harvest 단계(스캔·배정)에서 쓰는 순수 함수. DB/네트워크 의존 없음.
+
+/**
+ * 그룹명 정규화 — 전각 괄호→반각, 연속 공백 1개로, trim.
+ * PMS 그룹명은 운영자가 수기 입력하므로 공백/괄호 변형을 흡수한다(§3-2).
+ */
+function normGroupName(name: unknown): string {
+  return String(name ?? "")
+    .replace(/（/g, "(")
+    .replace(/）/g, ")")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * PMS `tb_project_group.name` → `hp_service.slug` 결정적 매핑 (HARVEST §3-1, A 규칙).
+ * 7서비스: ott / general / global / public / maintenance / refund / standalone.
+ * 미매핑(완료/진행/파트너·사내 게시판 등)은 null → 자동 배정 금지·보류(§3-3).
+ *
+ * ⚠ 문서 §3-1 "실측 DB 그룹명"이 정본. 사용자 지시 매핑 키와 실측이 다른 경우 모두 받아들이도록
+ *   동의어(예: 글로벌LMS/글로벌이러닝, 맑은이러닝(오픈전) 괄호 변형)를 함께 수용한다.
+ */
+const GROUP_SERVICE_MAP: Record<string, string> = {
+  // ott
+  "OTT 서비스": "ott",
+  "OTT서비스": "ott",
+  // general (범용) — 맑은이러닝 / 오픈전 / 종료
+  "맑은이러닝 서비스": "general",
+  "맑은이러닝 서비스(오픈전)": "general",
+  "맑은이러닝 종료": "general",
+  // global — 실측 글로벌LMS, 문서 표기 글로벌이러닝 동의어 수용
+  "글로벌LMS 서비스": "global",
+  "글로벌이러닝 서비스": "global",
+  "글로벌이러닝": "global",
+  // public
+  "공공클라우드 서비스": "public",
+  // maintenance
+  "유지보수 프로젝트": "maintenance",
+  // refund
+  "환급과정 유지보수": "refund",
+  // standalone
+  "독립LMS 서비스": "standalone",
+};
+
+export function groupNameToServiceSlug(name: unknown): string | null {
+  const key = normGroupName(name);
+  if (!key) return null;
+  return GROUP_SERVICE_MAP[key] ?? null;
+}
+
+/**
+ * 안내글 후보 판정 (HARVEST §5-3, C 규칙).
+ * staff(직원) 작성 + 게시글의 첫 글이면 안내글(공지·정책 안내) 트랙.
+ * 그 외(고객/협력사 작성, 또는 첫 글 아님)는 Q&A 트랙.
+ * isStaff 판정은 호출부가 `isStaff(...)`(classify.ts) 결과를 넘긴다.
+ */
+export function isAnnounceCandidate(
+  _post: unknown,
+  isStaffAuthor: boolean,
+  isFirstPost: boolean,
+): boolean {
+  return isStaffAuthor === true && isFirstPost === true;
+}

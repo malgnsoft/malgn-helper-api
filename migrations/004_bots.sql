@@ -87,10 +87,12 @@ CREATE TABLE IF NOT EXISTS hp_bot (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='서비스별 챗봇(봇) 페르소나·답변범위·모델 설정';
 
 -- ============================================================
--- 시드 — 기존 hp_service 슬러그(step/lms-general/lms-mixed/lms-private/lms-public-security/lms-global)
+-- 시드 — hp_service 7서비스 슬러그(ott/general/global/public/maintenance/refund/standalone)
 --   에 맞춘 봇 2개 + 공통봇(service_id NULL) 1개. service_id 는 슬러그 서브쿼리로 해석.
---   ⚠ use-bots.ts SEED_BOTS 의 슬러그(lms-refund/lms-public/lms-security/lms-hybrid)는 정본 카탈로그에
---     없으므로 사용하지 않는다(BOTS-PLAN §1 슬러그 정본화).
+--   ⚠ 슬러그 정본화 (2026-06-18, PMS-INQUIRY-HARVEST §4-2 · 005 재시드 정합):
+--     002 옛 슬러그(lms-general/lms-public-security)는 005 에서 7서비스(general/public)로 재매핑됐다.
+--     본 시드는 재실행 시 봇 누락을 막기 위해 새 슬러그('general'/'public')를 참조한다.
+--     (use-bots.ts SEED_BOTS 의 lms-refund/lms-public/lms-security/lms-hybrid 도 사용하지 않는다.)
 --   멱등: name 으로 ON DUPLICATE 보정 불가(UNIQUE 없음)하므로, 재실행 시 중복 방지를 위해
 --   '존재하지 않을 때만 INSERT' 하도록 NOT EXISTS 가드를 둔다.
 -- ============================================================
@@ -111,13 +113,13 @@ SELECT
 FROM DUAL
 WHERE NOT EXISTS (SELECT 1 FROM hp_bot WHERE name = '공통 상담봇' AND service_id IS NULL AND status = 1);
 
--- 2) 범용 LMS 일반봇 (service_id = hp_service 'lms-general')
+-- 2) 범용 LMS 일반봇 (service_id = hp_service 'general')
 INSERT INTO hp_bot
   (service_id, name, avatar, description, bot_status, tone, traits, greeting, system_prompt,
    visibility, unknown_policy, escalation_threshold, refusal_topics, topics,
    use_standard_answers, standard_answer_scope, model, temperature, max_tokens)
 SELECT
-  (SELECT id FROM hp_service WHERE slug = 'lms-general' AND status = 1 LIMIT 1),
+  (SELECT id FROM hp_service WHERE slug = 'general' AND status = 1 LIMIT 1),
   'LMS 일반 상담봇', '📘',
   '범용 LMS 사용법 전반을 안내하는 서비스 전용 봇.', 'active',
   'friendly', '["공감적","단계별 안내","신속함"]',
@@ -126,21 +128,21 @@ SELECT
   'public', 'strict', 0.50, '["환불 금액 확정"]', '["로그인","수강신청","진도","과제"]',
   1, 'all', 'openai/gpt-4.1-mini', 0.30, 2048
 FROM DUAL
-WHERE EXISTS (SELECT 1 FROM hp_service WHERE slug = 'lms-general' AND status = 1)
+WHERE EXISTS (SELECT 1 FROM hp_service WHERE slug = 'general' AND status = 1)
   AND NOT EXISTS (
     SELECT 1 FROM hp_bot
      WHERE name = 'LMS 일반 상담봇'
-       AND service_id = (SELECT id FROM hp_service WHERE slug = 'lms-general' AND status = 1 LIMIT 1)
+       AND service_id = (SELECT id FROM hp_service WHERE slug = 'general' AND status = 1 LIMIT 1)
        AND status = 1
   );
 
--- 3) 공공 보안 전용봇 (service_id = hp_service 'lms-public-security')
+-- 3) 공공 보안 전용봇 (service_id = hp_service 'public')
 INSERT INTO hp_bot
   (service_id, name, avatar, description, bot_status, tone, traits, greeting, system_prompt,
    visibility, unknown_policy, escalation_threshold, refusal_topics, topics,
    use_standard_answers, standard_answer_scope, model, temperature, max_tokens)
 SELECT
-  (SELECT id FROM hp_service WHERE slug = 'lms-public-security' AND status = 1 LIMIT 1),
+  (SELECT id FROM hp_service WHERE slug = 'public' AND status = 1 LIMIT 1),
   '공공 보안 전용봇', '🏛️',
   '공공기관 보안 과정 대상 격식체 봇. 보안·개인정보 안내를 신중히 처리.', 'draft',
   'formal', '["공식적","차분함","보수적(추측 자제)"]',
@@ -149,10 +151,10 @@ SELECT
   'internal', 'normal', 0.60, '["내부 시스템 구조 노출","개인정보 조회"]', '["보안 인증","접근 권한","감사 로그"]',
   1, 'service', 'openai/gpt-4.1-mini', 0.20, 2048
 FROM DUAL
-WHERE EXISTS (SELECT 1 FROM hp_service WHERE slug = 'lms-public-security' AND status = 1)
+WHERE EXISTS (SELECT 1 FROM hp_service WHERE slug = 'public' AND status = 1)
   AND NOT EXISTS (
     SELECT 1 FROM hp_bot
      WHERE name = '공공 보안 전용봇'
-       AND service_id = (SELECT id FROM hp_service WHERE slug = 'lms-public-security' AND status = 1 LIMIT 1)
+       AND service_id = (SELECT id FROM hp_service WHERE slug = 'public' AND status = 1 LIMIT 1)
        AND status = 1
   );

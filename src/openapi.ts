@@ -37,6 +37,7 @@ export const openapiSpec = {
     { name: "wbs", description: "WBS Live Tracker — R2 단일 JSON 영속화" },
     { name: "pms", description: "PMS 게시판 연동 (Hyperdrive → MySQL)" },
     { name: "standard-answers", description: "표준 답변 카탈로그 — 챗봇 응답 1순위 소스 (hp_standard_answer)" },
+    { name: "announces", description: "표준 안내답변 — 직원 작성 공지·안내 카탈로그 (hp_announce)" },
     { name: "admin", description: "운영 도구 (LLM 비용·호출 집계 등)" },
     { name: "db", description: "탐색용 임시 엔드포인트 (안정화 후 제거 예정)" },
   ],
@@ -588,6 +589,139 @@ export const openapiSpec = {
           "200": { description: "병합 완료", content: { "application/json": { example: { ok: true, primaryId: 2, secondaryId: 1, usageCount: 7 } } } },
           "400": { description: "intoId 누락 / self 병합" },
           "404": { description: "primary/secondary 없음" },
+        },
+      },
+    },
+
+    "/announces": {
+      get: {
+        tags: ["announces"],
+        summary: "표준 안내답변 목록·검색 (hp_announce)",
+        description:
+          "직원 작성 공지·안내(안내글) 카탈로그. 분류 필터(`scope/topicId/serviceId/approvalStatus`) + `search`(title/label/body/question LIKE). " +
+          "응답 행에 `topic_slug/topic_label/service_slug/service_name`(LEFT JOIN) + `tags`(배열) + **`answer`(=body 매핑, admin SA UI 재사용)** 포함. 가드 developer↑.",
+        parameters: [
+          { name: "search", in: "query", required: false, schema: { type: "string" }, description: "title/label/body/question LIKE (레거시 q 호환)" },
+          { name: "scope", in: "query", required: false, schema: { type: "string", enum: ["common", "service"] } },
+          { name: "topicId", in: "query", required: false, schema: { type: "integer" } },
+          { name: "serviceId", in: "query", required: false, schema: { type: "integer" } },
+          { name: "approvalStatus", in: "query", required: false, schema: { type: "string", enum: ["draft", "reviewing", "approved", "rejected", "archived"] } },
+          { name: "limit", in: "query", required: false, schema: { type: "integer", default: 20, maximum: 100 } },
+          { name: "offset", in: "query", required: false, schema: { type: "integer", default: 0 } },
+        ],
+        responses: { "200": { description: "목록", content: { "application/json": { example: { total: 0, limit: 20, offset: 0, rows: [] } } } } },
+      },
+      post: {
+        tags: ["announces"],
+        summary: "표준 안내답변 저장 (항상 draft)",
+        description:
+          "안내글 채택분 `hp_announce` INSERT. **항상 `approval_status='draft'`**(§3-4). " +
+          "`title`/`body` 필수, `question` 선택(NULL 허용). 본문은 `body` 우선, 없으면 `answer`(SA UI 별칭) 수용. " +
+          "이미지 경로 절대화(`absolutizePmsAssets`). 분류(`scope/topicId/serviceId/tags`) 선택 — `topicId/serviceId` 존재·active 검증. " +
+          "가드 `requireServiceToken`(PMS 임베드).",
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                required: ["title", "body"],
+                properties: {
+                  title: { type: "string", maxLength: 150, description: "안내 주제/제목" },
+                  label: { type: ["string", "null"], maxLength: 100, description: "분류 라벨(선택)" },
+                  question: { type: ["string", "null"], maxLength: 10000, description: "안내글엔 없을 수 있음(NULL 허용)" },
+                  body: { type: "string", maxLength: 10000, description: "안내 본문(= 답변 콘텐츠)" },
+                  answer: { type: ["string", "null"], description: "body 별칭(admin SA UI 호환)" },
+                  sourcePostId: { type: ["integer", "null"], description: "파생 PMS tb_post.id(staff 첫 글)" },
+                  createdBy: { type: ["string", "null"], description: "저장 직원 email" },
+                  scope: { type: ["string", "null"], enum: ["common", "service", null] },
+                  topicId: { type: ["integer", "null"], description: "hp_topic.id (앱 검증)" },
+                  serviceId: { type: ["integer", "null"], description: "hp_service.id (scope=service)" },
+                  tags: { type: ["array", "null"], items: { type: "string" } },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          "201": { description: "생성", content: { "application/json": { example: { ok: true, id: 1, approvalStatus: "draft" } } } },
+          "400": { description: "title/body 누락 / 길이 초과 / 분류 검증 실패" },
+        },
+      },
+    },
+
+    "/announces/{id}": {
+      get: {
+        tags: ["announces"],
+        summary: "표준 안내답변 단건",
+        description: "`tags` 배열 + `answer`(=body 매핑) 동봉.",
+        parameters: [{ name: "id", in: "path", required: true, schema: { type: "integer", minimum: 1 } }],
+        responses: { "200": { description: "OK" }, "404": { description: "없음" } },
+      },
+      patch: {
+        tags: ["announces"],
+        summary: "표준 안내답변 부분 수정",
+        description: "`title/label/body(answer)/question` + 분류(`scope/topicId/serviceId/tags`) 중 보낸 필드만 갱신. body 이미지 절대화. 가드 admin.",
+        parameters: [{ name: "id", in: "path", required: true, schema: { type: "integer", minimum: 1 } }],
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                properties: {
+                  title: { type: "string", maxLength: 150 },
+                  label: { type: ["string", "null"], maxLength: 100 },
+                  body: { type: "string", maxLength: 10000 },
+                  answer: { type: ["string", "null"], description: "body 별칭" },
+                  question: { type: ["string", "null"], maxLength: 10000 },
+                  scope: { type: ["string", "null"], enum: ["common", "service", null] },
+                  topicId: { type: ["integer", "null"] },
+                  serviceId: { type: ["integer", "null"] },
+                  tags: { type: ["array", "null"], items: { type: "string" } },
+                },
+              },
+            },
+          },
+        },
+        responses: { "200": { description: "OK" }, "400": { description: "필드 없음/빈 값" } },
+      },
+      delete: {
+        tags: ["announces"],
+        summary: "표준 안내답변 soft-delete (status=-1)",
+        parameters: [{ name: "id", in: "path", required: true, schema: { type: "integer", minimum: 1 } }],
+        responses: { "200": { description: "OK" } },
+      },
+    },
+
+    "/announces/{id}/transition": {
+      patch: {
+        tags: ["announces"],
+        summary: "안내답변 승인 워크플로 상태 전이 (§3-2/§3-3)",
+        description:
+          "SA 전이표 재사용: draft→reviewing/rejected · reviewing→approved/rejected · approved→archived · rejected→draft · archived→reviewing. " +
+          "위반 시 422. `approved` 시 `approved_by`(세션)·`approved_at=NOW()`. `rejected` 시 `reason` 필수. 가드 developer↑.",
+        parameters: [{ name: "id", in: "path", required: true, schema: { type: "integer", minimum: 1 } }],
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                required: ["to"],
+                properties: {
+                  to: { type: "string", enum: ["draft", "reviewing", "approved", "rejected", "archived"] },
+                  reason: { type: "string", description: "rejected 시 필수" },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          "200": { description: "전이 완료", content: { "application/json": { example: { ok: true, id: 1, from: "reviewing", to: "approved" } } } },
+          "400": { description: "잘못된 to / 반려 사유 누락" },
+          "404": { description: "없음" },
+          "422": { description: "전이표 위반" },
         },
       },
     },

@@ -2964,6 +2964,363 @@ app.post("/standard-answers/:id/merge", requireAuth, requireRole(ROLE_LEVEL.admi
   }),
 );
 
+// ── 표준 안내답변 (hp_announce) ───────────────────────
+// 정본: malgn-helper-mng/docs/PMS-INQUIRY-HARVEST.md §5-3 (안내글 vs Q&A 분기 · 별도 테이블)
+//        STANDARD-ANSWER-CURATION.md §2-1(분류 축) · §3(승인 워크플로 — SA 와 공유)
+// 005 마이그레이션(운영 적용 완료)이 신설한 hp_announce:
+//   title(NOT NULL)·label·question(NULL)·body(NOT NULL)·scope·topic_id·service_id·tags(LONGTEXT)
+//   ·approval_status·approved_by·approved_at·rejection_reason·merged_into_id·source_uncovered_id
+//   ·source_post_id·created_by·usage_count·last_used_at·status·created_at·updated_at
+//
+// SA(hp_standard_answer)와 동형 — 분류·승인 라이프사이클·전이표(SA_TRANSITIONS)·tags 직렬화를 그대로 공유한다.
+// 다른 점: 질문(question) 대신 title 이 식별자(질문 NULL 허용), 본문은 body(NOT NULL).
+//   admin 의 SA UI 재사용을 위해 조회 응답에서 body 를 answer 로도 매핑한다(body↔answer 동형 처리).
+//
+// 가드 방침 (SA 와 동일):
+//  - GET(목록·상세): developer↑ (카탈로그 전량 노출 방지).
+//  - POST: requireServiceToken (PMS 임베드가 "표준 안내답변으로 저장"에서 호출. 항상 draft).
+//  - PATCH(본문 수정)·DELETE: admin (파괴적 변경).
+//  - PATCH /:id/transition: developer↑ (SA 전이표·권한 재사용).
+
+/** hp_topic 존재·active 검증 (announce 용 — SA validateTopic 과 동일 시그니처, scope 동반). */
+// (validateTopic / validateService / parseTags / serializeTags / SA_TRANSITIONS / SA_APPROVALS 재사용)
+
+// 목록 + 검색. 필터: scope / topicId / serviceId / approvalStatus / search.
+// topic·service slug/label LEFT JOIN. tags 배열화. body→answer 매핑(admin SA UI 재사용).
+app.get("/announces", requireAuth, requireRole(ROLE_LEVEL.developer), async (c) =>
+  withConn(c, async (conn) => {
+    const q = (c.req.query("search") ?? c.req.query("q") ?? "").trim();
+    const scopeQ = c.req.query("scope");
+    const topicIdQ = c.req.query("topicId");
+    const serviceIdQ = c.req.query("serviceId");
+    const approvalQ = c.req.query("approvalStatus");
+    const limit = Math.min(parseInt(c.req.query("limit") ?? "20", 10) || 20, 100);
+    const offset = Math.max(parseInt(c.req.query("offset") ?? "0", 10) || 0, 0);
+
+    const where: string[] = ["an.status = 1"];
+    const params: unknown[] = [];
+    if (scopeQ === "common" || scopeQ === "service") {
+      where.push("an.scope = ?");
+      params.push(scopeQ);
+    }
+    if (topicIdQ) {
+      where.push("an.topic_id = ?");
+      params.push(parseInt(topicIdQ, 10));
+    }
+    if (serviceIdQ) {
+      where.push("an.service_id = ?");
+      params.push(parseInt(serviceIdQ, 10));
+    }
+    if (approvalQ && (SA_APPROVALS as readonly string[]).includes(approvalQ)) {
+      where.push("an.approval_status = ?");
+      params.push(approvalQ);
+    }
+    if (q) {
+      // 안내글은 질문이 NULL 일 수 있어 title/label/body/question 을 모두 검색.
+      where.push("(an.title LIKE ? OR an.label LIKE ? OR an.body LIKE ? OR an.question LIKE ?)");
+      const like = `%${q}%`;
+      params.push(like, like, like, like);
+    }
+    const whereSql = `WHERE ${where.join(" AND ")}`;
+
+    const [countRows] = await conn.query(
+      `SELECT COUNT(*) AS total FROM hp_announce an ${whereSql}`,
+      params,
+    );
+    const total = Number((countRows as { total: number }[])[0]?.total ?? 0);
+
+    const [rows] = await conn.query(
+      `SELECT an.id, an.title, an.label, an.question, an.body, an.scope, an.topic_id, an.service_id,
+              an.tags, an.approval_status, an.approved_by, an.approved_at, an.rejection_reason,
+              an.merged_into_id, an.source_uncovered_id, an.source_post_id, an.created_by,
+              an.usage_count, an.last_used_at, an.created_at, an.updated_at,
+              t.slug AS topic_slug, t.label AS topic_label,
+              s.slug AS service_slug, s.name AS service_name
+         FROM hp_announce an
+         LEFT JOIN hp_topic   t ON t.id = an.topic_id   AND t.status = 1
+         LEFT JOIN hp_service s ON s.id = an.service_id AND s.status = 1
+         ${whereSql}
+     ORDER BY an.usage_count DESC, an.created_at DESC
+        LIMIT ${limit} OFFSET ${offset}`,
+      params,
+    );
+
+    // tags 배열화 + body→answer 매핑(admin SA UI 가 answer 필드를 그대로 소비).
+    const mapped = (rows as { tags: unknown; body: string }[]).map((r) => ({
+      ...r,
+      tags: parseTags(r.tags),
+      answer: r.body,
+    }));
+    return c.json({ total, limit, offset, rows: mapped });
+  }),
+);
+
+app.get("/announces/:id", requireAuth, requireRole(ROLE_LEVEL.developer), async (c) =>
+  withConn(c, async (conn) => {
+    const id = parseInt(c.req.param("id"), 10);
+    if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
+    const [rows] = await conn.query(
+      `SELECT an.*, t.slug AS topic_slug, t.label AS topic_label,
+              s.slug AS service_slug, s.name AS service_name
+         FROM hp_announce an
+         LEFT JOIN hp_topic   t ON t.id = an.topic_id   AND t.status = 1
+         LEFT JOIN hp_service s ON s.id = an.service_id AND s.status = 1
+        WHERE an.id = ? AND an.status = 1`,
+      [id],
+    );
+    const r = (rows as { tags?: unknown; body?: string }[])[0];
+    if (!r) return c.json({ error: "not found" }, 404);
+    // body→answer 매핑(SA UI 재사용).
+    return c.json({ ...r, tags: parseTags(r.tags), answer: r.body });
+  }),
+);
+
+// 저장 — 항상 draft. title/body 필수, question 선택. 이미지 절대화. SA POST 와 동일 가드.
+app.post("/announces", requireServiceToken, async (c) =>
+  withConn(c, async (conn) => {
+    const body = await c.req.json<{
+      title?: string;
+      label?: string | null;
+      question?: string | null;
+      body?: string;
+      // SA 호환: admin SA UI 가 answer 로 보낼 수 있어 body 별칭으로 수용.
+      answer?: string;
+      sourcePostId?: number | null;
+      createdBy?: string | null;
+      scope?: string | null;
+      topicId?: number | null;
+      serviceId?: number | null;
+      tags?: unknown;
+    }>();
+    const assetBase = c.env.PMS_ASSET_BASE || DEFAULT_PMS_ASSET_BASE;
+    const title = (body.title ?? "").trim();
+    // 본문은 body 우선, 없으면 answer(SA UI 별칭). 이미지 경로 절대화.
+    const rawBody = body.body ?? body.answer ?? "";
+    const announceBody = absolutizePmsAssets(String(rawBody).trim(), assetBase);
+    // question 은 선택 — 있으면 절대화, 없으면 NULL.
+    const rawQuestion = (body.question ?? "").trim();
+    const question = rawQuestion ? absolutizePmsAssets(rawQuestion, assetBase) : null;
+    const label = (body.label ?? "").trim() || null;
+
+    if (!title || !announceBody) {
+      return c.json({ error: "title, body required" }, 400);
+    }
+    if (title.length > 150) return c.json({ error: "title too long (<=150)" }, 400);
+    if (label && label.length > 100) return c.json({ error: "label too long (<=100)" }, 400);
+    if (announceBody.length > 10000) return c.json({ error: "body too long (<=10000)" }, 400);
+    if (question && question.length > 10000) return c.json({ error: "question too long (<=10000)" }, 400);
+
+    // 분류 검증 (§2-1). scope 미지정이면 'service' DB default.
+    let scope: SaScope | null = null;
+    if (body.scope != null) {
+      if (body.scope !== "common" && body.scope !== "service") {
+        return c.json({ error: "scope must be common|service" }, 400);
+      }
+      scope = body.scope;
+    }
+    let topicId: number | null = null;
+    if (body.topicId != null) {
+      const tid = Number(body.topicId);
+      if (!Number.isInteger(tid)) return c.json({ error: "invalid topicId" }, 400);
+      const v = await validateTopic(conn, tid);
+      if (!v.ok) return c.json({ error: v.reason }, 400);
+      topicId = tid;
+    }
+    let serviceId: number | null = null;
+    if (body.serviceId != null) {
+      const sid = Number(body.serviceId);
+      if (!Number.isInteger(sid)) return c.json({ error: "invalid serviceId" }, 400);
+      const v = await validateService(conn, sid);
+      if (!v.ok) return c.json({ error: v.reason }, 400);
+      serviceId = sid;
+    }
+    const tagsJson = serializeTags(body.tags);
+    if (tagsJson === undefined) return c.json({ error: "tags must be an array of strings" }, 400);
+
+    // 항상 draft 로 진입 (무검증 안내문 챗봇 직행 방지, §3-4).
+    const [ins] = await conn.query(
+      `INSERT INTO hp_announce
+         (title, label, question, body, source_post_id, created_by,
+          ${scope != null ? "scope, " : ""}topic_id, service_id, tags, approval_status)
+       VALUES (?, ?, ?, ?, ?, ?, ${scope != null ? "?, " : ""}?, ?, ?, 'draft')`,
+      [
+        title,
+        label,
+        question,
+        announceBody,
+        body.sourcePostId ?? null,
+        body.createdBy ?? null,
+        ...(scope != null ? [scope] : []),
+        topicId,
+        serviceId,
+        tagsJson,
+      ],
+    );
+    return c.json(
+      { ok: true, id: (ins as { insertId: number }).insertId, approvalStatus: "draft" },
+      201,
+    );
+  }),
+);
+
+// 본문 수정 — title/label/body/question + 분류(scope/topicId/serviceId/tags). 가드 admin.
+app.patch("/announces/:id", requireAuth, requireRole(ROLE_LEVEL.admin), async (c) =>
+  withConn(c, async (conn) => {
+    const id = parseInt(c.req.param("id"), 10);
+    if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
+    const body = await c.req.json<{
+      title?: string;
+      label?: string | null;
+      body?: string;
+      answer?: string; // SA UI 별칭
+      question?: string | null;
+      scope?: string | null;
+      topicId?: number | null;
+      serviceId?: number | null;
+      tags?: unknown;
+    }>();
+    const assetBase = c.env.PMS_ASSET_BASE || DEFAULT_PMS_ASSET_BASE;
+    const sets: string[] = [];
+    const params: unknown[] = [];
+
+    if (body.title !== undefined) {
+      const t = String(body.title).trim();
+      if (!t) return c.json({ error: "title empty" }, 400);
+      if (t.length > 150) return c.json({ error: "title too long (<=150)" }, 400);
+      sets.push("title = ?");
+      params.push(t);
+    }
+    // label 은 NULL 허용 — 빈 문자열/null 이면 해제.
+    if (body.label !== undefined) {
+      const l = body.label === null ? "" : String(body.label).trim();
+      sets.push("label = ?");
+      params.push(l || null);
+    }
+    // body 우선, answer(SA UI 별칭) 폴백 — 둘 중 보낸 것만 적용. 이미지 절대화.
+    if (body.body !== undefined || body.answer !== undefined) {
+      const raw = (body.body ?? body.answer ?? "").trim();
+      if (!raw) return c.json({ error: "body empty" }, 400);
+      sets.push("body = ?");
+      params.push(absolutizePmsAssets(raw, assetBase));
+    }
+    // question 은 NULL 허용 — null/빈문자 이면 해제, 있으면 절대화.
+    if (body.question !== undefined) {
+      const qraw = body.question === null ? "" : String(body.question).trim();
+      sets.push("question = ?");
+      params.push(qraw ? absolutizePmsAssets(qraw, assetBase) : null);
+    }
+    if (body.scope !== undefined && body.scope !== null && body.scope !== "") {
+      if (body.scope !== "common" && body.scope !== "service") {
+        return c.json({ error: "scope must be common|service" }, 400);
+      }
+      sets.push("scope = ?");
+      params.push(body.scope);
+    }
+    if (body.topicId !== undefined) {
+      if (body.topicId === null) {
+        sets.push("topic_id = ?");
+        params.push(null);
+      } else {
+        const tid = Number(body.topicId);
+        if (!Number.isInteger(tid)) return c.json({ error: "invalid topicId" }, 400);
+        const v = await validateTopic(conn, tid);
+        if (!v.ok) return c.json({ error: v.reason }, 400);
+        sets.push("topic_id = ?");
+        params.push(tid);
+      }
+    }
+    if (body.serviceId !== undefined) {
+      if (body.serviceId === null) {
+        sets.push("service_id = ?");
+        params.push(null);
+      } else {
+        const sid = Number(body.serviceId);
+        if (!Number.isInteger(sid)) return c.json({ error: "invalid serviceId" }, 400);
+        const v = await validateService(conn, sid);
+        if (!v.ok) return c.json({ error: v.reason }, 400);
+        sets.push("service_id = ?");
+        params.push(sid);
+      }
+    }
+    if (body.tags !== undefined) {
+      const tagsJson = serializeTags(body.tags);
+      if (tagsJson === undefined) return c.json({ error: "tags must be an array of strings" }, 400);
+      sets.push("tags = ?");
+      params.push(tagsJson);
+    }
+    if (!sets.length) return c.json({ error: "no fields" }, 400);
+    params.push(id);
+    const [result] = await conn.query(
+      `UPDATE hp_announce SET ${sets.join(", ")} WHERE id = ? AND status = 1`,
+      params,
+    );
+    return c.json({
+      ok: true,
+      affected: (result as { affectedRows?: number }).affectedRows,
+      changed: (result as { changedRows?: number }).changedRows,
+    });
+  }),
+);
+
+// soft-delete (status=-1). 가드 admin.
+app.delete("/announces/:id", requireAuth, requireRole(ROLE_LEVEL.admin), async (c) =>
+  withConn(c, async (conn) => {
+    const id = parseInt(c.req.param("id"), 10);
+    if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
+    await conn.query(`UPDATE hp_announce SET status = -1 WHERE id = ?`, [id]);
+    return c.json({ ok: true });
+  }),
+);
+
+// 승인 워크플로 상태 전이 (§3-2/§3-3) — SA 전이표(SA_TRANSITIONS)·권한 재사용. 가드 developer↑.
+app.patch("/announces/:id/transition", requireAuth, requireRole(ROLE_LEVEL.developer), async (c) =>
+  withConn(c, async (conn) => {
+    const id = parseInt(c.req.param("id"), 10);
+    if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
+    type TransBody = { to?: string; reason?: string };
+    const reqBody = await c.req.json<TransBody>().catch((): TransBody => ({}));
+    const to = reqBody.to;
+    if (!to || !(SA_APPROVALS as readonly string[]).includes(to)) {
+      return c.json({ error: "to must be one of draft|reviewing|approved|rejected|archived" }, 400);
+    }
+    const target = to as SaApproval;
+
+    const [rows] = await conn.query(
+      `SELECT id, approval_status FROM hp_announce WHERE id = ? AND status = 1`,
+      [id],
+    );
+    const cur = (rows as { approval_status: SaApproval }[])[0];
+    if (!cur) return c.json({ error: "not found" }, 404);
+    const from = cur.approval_status;
+
+    if (!SA_TRANSITIONS[from]?.includes(target)) {
+      return c.json({ error: `invalid transition: ${from} -> ${target}`, from, allowed: SA_TRANSITIONS[from] ?? [] }, 422);
+    }
+
+    const reason = (reqBody.reason ?? "").trim();
+    if (target === "rejected" && !reason) {
+      return c.json({ error: "rejection_reason required for rejected (§3-4)" }, 400);
+    }
+
+    const sets: string[] = ["approval_status = ?"];
+    const params: unknown[] = [target];
+    if (target === "approved") {
+      sets.push("approved_by = ?", "approved_at = NOW()");
+      params.push(c.get("session").email ?? null);
+    }
+    if (target === "rejected") {
+      sets.push("rejection_reason = ?", "approved_by = ?");
+      params.push(reason, c.get("session").email ?? null);
+    }
+    params.push(id);
+    await conn.query(
+      `UPDATE hp_announce SET ${sets.join(", ")} WHERE id = ? AND status = 1`,
+      params,
+    );
+    return c.json({ ok: true, id, from, to: target });
+  }),
+);
+
 // 게시글(문의) 1건 + 작성자 + (공개) 댓글 흐름.
 // 직원/고객 구분은 email 도메인(@malgnsoft.com) 기준. private_yn='Y' 댓글 본문은 마스킹.
 app.get("/pms/posts/:id", async (c) =>
