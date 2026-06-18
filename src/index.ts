@@ -3682,6 +3682,236 @@ app.post(
     }),
 );
 
+// POST /pms/harvest/commit (developer↑) — scan 후보 중 사람이 선택·분류 보정한 것만 draft 등록.
+//   HARVEST §5-6·§5-7 — ⑤가치판단(채택) → ⑥draft 등록(분류·유형 태깅 확정).
+//   읽기 tb_*(SELECT만, PMS 원본 불변) · 쓰기 hp_* 만(항상 approval_status='draft').
+//   item별 독립 처리(한 건 실패가 전체 롤백 아님). 응답엔 본문 PII 미포함(postId·id·reason만).
+type HarvestCommitItem = {
+  postId?: number;
+  type?: "qa" | "announce";
+  serviceId?: number | null;
+  topicId?: number | null;
+  scope?: "common" | "service";
+};
+type HarvestCommitBody = { items?: HarvestCommitItem[] };
+
+type HarvestCommitted = {
+  postId: number;
+  table: "standard_answer" | "announce";
+  id: number;
+};
+type HarvestSkipped = {
+  postId: number;
+  reason: "already" | "no_answer" | "bad_classification" | "not_found" | "bad_item";
+};
+
+// 안전 상한 — 자동 대량 등록 금지(사람이 선택·보정한 명시분만).
+const HARVEST_COMMIT_MAX_ITEMS = 200;
+// 제목 라벨 절단 길이(80자 이내 요약/절단). hp_standard_answer.label 컬럼은 <=100.
+const HARVEST_LABEL_MAX = 80;
+
+function harvestLabel(title: string): string {
+  const t = (title ?? "").replace(/\s+/g, " ").trim();
+  if (t.length <= HARVEST_LABEL_MAX) return t;
+  return `${t.slice(0, HARVEST_LABEL_MAX - 1)}…`;
+}
+
+app.post(
+  "/pms/harvest/commit",
+  requireAuth,
+  requireRole(ROLE_LEVEL.developer),
+  async (c) =>
+    withConn(c, async (conn) => {
+      const session = c.get("session");
+      const createdBy = session?.email ?? null;
+      const assetBase = c.env.PMS_ASSET_BASE || DEFAULT_PMS_ASSET_BASE;
+
+      const b = await c.req.json<HarvestCommitBody>().catch((): HarvestCommitBody => ({}));
+      const items = Array.isArray(b.items) ? b.items : null;
+      if (!items || items.length === 0) {
+        return c.json({ error: "items required (non-empty array)" }, 400);
+      }
+      if (items.length > HARVEST_COMMIT_MAX_ITEMS) {
+        return c.json(
+          { error: `too many items (max ${HARVEST_COMMIT_MAX_ITEMS})` },
+          400,
+        );
+      }
+
+      const committed: HarvestCommitted[] = [];
+      const skipped: HarvestSkipped[] = [];
+
+      for (const item of items) {
+        const postId = Number(item?.postId);
+        // 잘못된 item 하나가 전체를 막지 않게 — postId 불량은 0으로 표기하고 skip.
+        if (!Number.isInteger(postId) || postId <= 0) {
+          skipped.push({ postId: Number.isFinite(postId) ? postId : 0, reason: "bad_item" });
+          continue;
+        }
+        const type = item?.type;
+        if (type !== "qa" && type !== "announce") {
+          skipped.push({ postId, reason: "bad_item" });
+          continue;
+        }
+
+        try {
+          // 1) 중복 차단 — 이미 등록(status=1)된 source_post_id 면 skip.
+          const [dupSa] = await conn.query(
+            `SELECT 1 FROM hp_standard_answer WHERE source_post_id = ? AND status = 1 LIMIT 1`,
+            [postId],
+          );
+          const [dupAn] = await conn.query(
+            `SELECT 1 FROM hp_announce WHERE source_post_id = ? AND status = 1 LIMIT 1`,
+            [postId],
+          );
+          if ((dupSa as unknown[]).length > 0 || (dupAn as unknown[]).length > 0) {
+            skipped.push({ postId, reason: "already" });
+            continue;
+          }
+
+          // 2) tb_post 조회(원본 불변, SELECT만). site_id=1·status=1.
+          const [postRows] = await conn.query(
+            `SELECT p.id, p.subject, p.content, p.project_id
+               FROM tb_post p
+              WHERE p.id = ? AND p.status = 1 AND p.site_id = 1`,
+            [postId],
+          );
+          const post = (postRows as {
+            id: number;
+            subject: string | null;
+            content: string | null;
+            project_id: number;
+          }[])[0];
+          if (!post) {
+            skipped.push({ postId, reason: "not_found" });
+            continue;
+          }
+
+          // 분류 검증 — scope.
+          let scope: SaScope | null = null;
+          if (item.scope != null) {
+            if (item.scope !== "common" && item.scope !== "service") {
+              skipped.push({ postId, reason: "bad_classification" });
+              continue;
+            }
+            scope = item.scope;
+          }
+          // topic_id / service_id 존재·active 검증(미지정 null 허용). 불량이면 그 item만 skip.
+          let topicId: number | null = null;
+          if (item.topicId != null) {
+            const tid = Number(item.topicId);
+            if (!Number.isInteger(tid)) {
+              skipped.push({ postId, reason: "bad_classification" });
+              continue;
+            }
+            const v = await validateTopic(conn, tid);
+            if (!v.ok) {
+              skipped.push({ postId, reason: "bad_classification" });
+              continue;
+            }
+            topicId = tid;
+          }
+          let serviceId: number | null = null;
+          if (item.serviceId != null) {
+            const sid = Number(item.serviceId);
+            if (!Number.isInteger(sid)) {
+              skipped.push({ postId, reason: "bad_classification" });
+              continue;
+            }
+            const v = await validateService(conn, sid);
+            if (!v.ok) {
+              skipped.push({ postId, reason: "bad_classification" });
+              continue;
+            }
+            serviceId = sid;
+          }
+
+          const title = String(post.subject ?? "").trim();
+
+          if (type === "qa") {
+            // 3) staff 첫 답변(tb_post_comment) 조회 — 비공개 제외, 가장 이른 staff 댓글.
+            const [ansRows] = await conn.query(
+              `SELECT c.content
+                 FROM tb_post_comment c
+                 JOIN tb_user cu ON cu.id = c.user_id
+                WHERE c.post_id = ? AND c.status = 1
+                  AND c.private_yn != 'Y'
+                  AND (cu.email LIKE '%@malgnsoft.com' OR cu.company = '맑은소프트')
+                  AND c.content IS NOT NULL AND c.content != ''
+             ORDER BY c.reg_date ASC, c.id ASC
+                LIMIT 1`,
+              [postId],
+            );
+            const rawAnswer = String((ansRows as { content: string | null }[])[0]?.content ?? "").trim();
+            if (!rawAnswer) {
+              // 답변 없으면 표준답변 불가(§5-6 (a)).
+              skipped.push({ postId, reason: "no_answer" });
+              continue;
+            }
+
+            const label = harvestLabel(title) || `문의 #${postId}`;
+            const question = absolutizePmsAssets(String(post.content ?? "").trim(), assetBase);
+            const answer = absolutizePmsAssets(rawAnswer, assetBase);
+
+            const [ins] = await conn.query(
+              `INSERT INTO hp_standard_answer
+                 (label, question, answer, project_id, source_post_id, created_by,
+                  ${scope != null ? "scope, " : ""}topic_id, service_id, approval_status)
+               VALUES (?, ?, ?, ?, ?, ?, ${scope != null ? "?, " : ""}?, ?, 'draft')`,
+              [
+                label,
+                question,
+                answer,
+                post.project_id ?? null,
+                postId,
+                createdBy,
+                ...(scope != null ? [scope] : []),
+                topicId,
+                serviceId,
+              ],
+            );
+            committed.push({
+              postId,
+              table: "standard_answer",
+              id: (ins as { insertId: number }).insertId,
+            });
+          } else {
+            // type === "announce" — 본문 자체가 안내 콘텐츠(질문-답변 쌍 아님). question=NULL.
+            const bodyText = absolutizePmsAssets(String(post.content ?? "").trim(), assetBase);
+            // hp_announce.title 컬럼 <=150 — 초과분 절단.
+            const announceTitle = (title || `안내 #${postId}`).slice(0, 150);
+
+            const [ins] = await conn.query(
+              `INSERT INTO hp_announce
+                 (title, question, body, source_post_id, created_by,
+                  ${scope != null ? "scope, " : ""}topic_id, service_id, approval_status)
+               VALUES (?, NULL, ?, ?, ?, ${scope != null ? "?, " : ""}?, ?, 'draft')`,
+              [
+                announceTitle,
+                bodyText,
+                postId,
+                createdBy,
+                ...(scope != null ? [scope] : []),
+                topicId,
+                serviceId,
+              ],
+            );
+            committed.push({
+              postId,
+              table: "announce",
+              id: (ins as { insertId: number }).insertId,
+            });
+          }
+        } catch {
+          // 한 건의 실패가 전체를 롤백하지 않는다 — bad_item 으로 표기하고 계속.
+          skipped.push({ postId, reason: "bad_item" });
+        }
+      }
+
+      return c.json({ committed, skipped });
+    }),
+);
+
 app.put("/wbs", async (c) => {
   const text = await c.req.text();
   try {
