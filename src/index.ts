@@ -13,7 +13,7 @@ import {
   BUSINESS_START_HOUR,
   BUSINESS_END_HOUR,
 } from "./business-hours";
-import { classifyUser, isPartner } from "./classify";
+import { classifyUser, isPartner, groupNameToServiceSlug, isAnnounceCandidate } from "./classify";
 
 type Bindings = {
   R2: R2Bucket;
@@ -3384,6 +3384,302 @@ app.get("/pms/posts/:id", async (c) =>
       },
     });
   }),
+);
+
+// ── PMS 문의 수집 — 스캔/미리보기 파이프라인 ──────────────
+// 정본: malgn-helper-mng/docs/PMS-INQUIRY-HARVEST.md §5(단계별 절차) · TOPIC-CATALOG.md(24토픽)
+//
+// POST /pms/harvest/scan (developer↑) — 기간·그룹 스캔으로 수집 후보를 미리보기 생성.
+//   파이프라인: ①스캔(제외 룰) → ②서비스 자동 배정 → ③안내글/Q&A 분기 → ④토픽 LLM 배치 분류 → ⑤후보 반환.
+//
+// ⚠ dryRun=true 가 기본 — hp_* 에 절대 쓰지 않는다(미리보기만). 실제 draft 등록은 이번 범위 밖.
+//   읽기 전용(tb_* SELECT). 본문 PII 는 응답에 덤프하지 않는다(제목·메타·분류만; 본문은 LLM 입력으로만 잠깐 사용).
+
+// HARVEST §5-2 — 사내 게시판 그룹명 화이트리스트(숫자 prefix 없는 사내 게시판). 운영자 편집 가능 데이터 후보.
+const HARVEST_INTERNAL_GROUP_NAMES = new Set<string>([
+  "보고/결재",
+  "이러닝컨설팅팀",
+  "종료/마감/보관",
+  "이러닝개발팀",
+  "학습조직",
+  "이러닝사업팀",
+  "몽골개발팀",
+]);
+
+// HARVEST §5-2 — 본문 최소 길이(Q&A 가치 판단 전 1차 부실 필터).
+const HARVEST_MIN_CONTENT_LEN = 20;
+
+type HarvestScanBody = {
+  from?: string;
+  to?: string;
+  groupId?: number;
+  limit?: number;
+  offset?: number;
+  dryRun?: boolean;
+};
+
+type HarvestTopicSlug = { slug: string; label: string; description: string };
+
+type HarvestCandidate = {
+  postId: number;
+  title: string;
+  groupName: string | null;
+  serviceSlug: string | null; // 미매핑(보류)이면 null
+  serviceId: number | null;   // hp_service 에서 slug→id 해석(재시드 전이면 null 가능)
+  harvestStatus: "ok" | "hold_service"; // §3-3 미매핑 보류 표시
+  type: "announce" | "qa";
+  topicSlug: string | null;       // 저신뢰·미분류 보류면 null
+  topicConfidence: number | null; // 0~1
+  hasAnswer: boolean;             // staff 답변(tb_post_comment) 존재 여부
+};
+
+// reg_date(varchar14 'YYYYMMDDHHMMSS') 비교용으로 'YYYY-MM-DD' → 'YYYYMMDD000000' / 'YYYYMMDD235959'.
+function harvestDateTo14(d: string, end: boolean): string | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(d ?? "").trim());
+  if (!m) return null;
+  return end ? `${m[1]}${m[2]}${m[3]}235959` : `${m[1]}${m[2]}${m[3]}000000`;
+}
+
+app.post(
+  "/pms/harvest/scan",
+  requireAuth,
+  requireRole(ROLE_LEVEL.developer),
+  rateLimitLlm,
+  async (c) =>
+    withConn(c, async (conn) => {
+      const t0 = Date.now();
+      const route = "POST /pms/harvest/scan";
+      const b = await c.req.json<HarvestScanBody>().catch((): HarvestScanBody => ({}));
+
+      const from14 = harvestDateTo14(b.from ?? "2022-01-01", false) ?? "20220101000000";
+      const to14 = harvestDateTo14(b.to ?? "2026-12-31", true) ?? "20261231235959";
+      const limit = Math.min(Math.max(Number(b.limit ?? 50) || 50, 1), 200);
+      const offset = Math.max(Number(b.offset ?? 0) || 0, 0);
+      const groupId =
+        b.groupId !== undefined && Number.isFinite(Number(b.groupId)) ? Number(b.groupId) : null;
+      // dryRun 기본 true. 명시적으로 false 를 줘도 이번 범위에선 쓰지 않으므로 미리보기로 강제하되, 응답에 표기.
+      const dryRunRequested = b.dryRun !== false;
+
+      // ── ① 스캔 (제외 룰 적용) ────────────────────────────
+      // 제외: 본문 20자 미만 / 사내 업무 게시판(프로젝트명 숫자 prefix) / 사내 그룹 화이트리스트.
+      //   site_id=1(메인) 한정. tb_post.status=1.
+      const where: string[] = [
+        "p.status = 1",
+        "p.site_id = 1",
+        "p.reg_date BETWEEN ? AND ?",
+        "CHAR_LENGTH(p.content) >= ?",
+        // 사내 업무 게시판: 프로젝트명 숫자 prefix(예: '01. ', '09. ') 제외
+        "proj.name NOT REGEXP '^[0-9]+\\\\.'",
+      ];
+      const params: unknown[] = [from14, to14, HARVEST_MIN_CONTENT_LEN];
+
+      // 사내 그룹 화이트리스트 제외 (그룹명 기준)
+      const internalNames = [...HARVEST_INTERNAL_GROUP_NAMES];
+      if (internalNames.length > 0) {
+        where.push(`(g.name IS NULL OR g.name NOT IN (${internalNames.map(() => "?").join(",")}))`);
+        params.push(...internalNames);
+      }
+      if (groupId !== null) {
+        where.push("proj.group_id = ?");
+        params.push(groupId);
+      }
+      const whereSql = `WHERE ${where.join(" AND ")}`;
+
+      const [countRows] = await conn.query(
+        `SELECT COUNT(*) AS total
+           FROM tb_post p
+           JOIN tb_project proj ON proj.id = p.project_id
+      LEFT JOIN tb_project_group g ON g.id = proj.group_id AND g.status = 1
+          ${whereSql}`,
+        params,
+      );
+      const scanned = Number((countRows as { total: number }[])[0]?.total ?? 0);
+
+      // 후보 페이지 — staff 판정·그룹명·답변(staff 댓글) 유무 조인.
+      const [rows] = await conn.query(
+        `SELECT p.id, p.subject, p.content, p.project_id, p.reg_date,
+                g.name AS group_name,
+                (u.email LIKE '%@malgnsoft.com' OR u.company = '맑은소프트') AS author_is_staff,
+                EXISTS (
+                  SELECT 1 FROM tb_post_comment cc
+                   JOIN tb_user cu ON cu.id = cc.user_id
+                   WHERE cc.post_id = p.id AND cc.status = 1
+                     AND (cu.email LIKE '%@malgnsoft.com' OR cu.company = '맑은소프트')
+                ) AS has_staff_answer
+           FROM tb_post p
+           JOIN tb_project proj ON proj.id = p.project_id
+      LEFT JOIN tb_project_group g ON g.id = proj.group_id AND g.status = 1
+      LEFT JOIN tb_user u ON u.id = p.user_id
+          ${whereSql}
+       ORDER BY p.reg_date DESC, p.id DESC
+          LIMIT ${limit} OFFSET ${offset}`,
+        params,
+      );
+
+      type ScanRow = {
+        id: number;
+        subject: string | null;
+        content: string | null;
+        project_id: number;
+        reg_date: string;
+        group_name: string | null;
+        author_is_staff: number;
+        has_staff_answer: number;
+      };
+      const scanRows = rows as ScanRow[];
+
+      // ── ②·③ 서비스 자동 배정 + 안내글/Q&A 분기 (결정적) ──
+      // service slug → id 해석(라이브 hp_service). 재시드 전이면 slug 매칭 안 돼 null.
+      const [svcRows] = await conn.query(
+        `SELECT id, slug FROM hp_service WHERE status = 1 AND active = 1`,
+      );
+      const slugToServiceId = new Map<string, number>();
+      for (const r of svcRows as { id: number; slug: string }[]) {
+        slugToServiceId.set(r.slug, Number(r.id));
+      }
+
+      const candidates: HarvestCandidate[] = scanRows.map((r) => {
+        const serviceSlug = groupNameToServiceSlug(r.group_name);
+        // PMS 모델: tb_post 가 스레드 루트(문의/안내), 댓글이 답변 → 각 post 는 첫 글(isFirstPost=true).
+        const isAnnounce = isAnnounceCandidate(null, Number(r.author_is_staff) === 1, true);
+        return {
+          postId: Number(r.id),
+          title: r.subject ?? "",
+          groupName: r.group_name ?? null,
+          serviceSlug,
+          serviceId: serviceSlug ? (slugToServiceId.get(serviceSlug) ?? null) : null,
+          harvestStatus: serviceSlug ? "ok" : "hold_service",
+          type: isAnnounce ? "announce" : "qa",
+          topicSlug: null,
+          topicConfidence: null,
+          hasAnswer: Number(r.has_staff_answer) === 1,
+        };
+      });
+
+      // ── ④ 토픽 LLM 분류 (배치 1회 호출) ──────────────────
+      // 라이브 hp_topic 카탈로그(active) 입력. 제목 + 짧은 본문 발췌(120자)만 LLM 입력(PII 최소화).
+      let llmCostUsd = 0;
+      let llmPromptTokens = 0;
+      let llmCompletionTokens = 0;
+      let llmModel: string | null = null;
+      let llmLatencyMs: number | null = null;
+      let llmError: string | null = null;
+      const confidenceThreshold = 0.6; // HARVEST §5-5 기본 임계(저신뢰 보류)
+
+      if (candidates.length > 0 && c.env.OPENAI_API_KEY) {
+        const [topicRows] = await conn.query(
+          `SELECT slug, label, description FROM hp_topic
+            WHERE status = 1 AND active = 1
+            ORDER BY scope, sort_order, id`,
+        );
+        const catalog = (topicRows as HarvestTopicSlug[]).map((t) => ({
+          slug: t.slug,
+          label: t.label,
+          description: t.description ?? "",
+        }));
+        const validSlugs = new Set(catalog.map((t) => t.slug));
+
+        // LLM 입력 아이템: 본문은 발췌(120자)만. 응답엔 본문 미포함.
+        const items = candidates.map((cand, i) => {
+          const src = scanRows[i];
+          const excerpt = String(src.content ?? "")
+            .replace(/<[^>]+>/g, " ")
+            .replace(/\s+/g, " ")
+            .trim()
+            .slice(0, 120);
+          return { i, title: cand.title.slice(0, 120), excerpt };
+        });
+
+        try {
+          const llm = await callOpenAiJson<{
+            results: Array<{ i: number; topic_slug: string | null; confidence: number }>;
+          }>(c.env, {
+            model: c.env.LLM_MODEL_DEFAULT,
+            system: [
+              "너는 고객상담 문의를 사전 정의된 토픽 카탈로그 중 하나로 분류하는 분류기다.",
+              "각 항목(title + excerpt)을 읽고 가장 적합한 topic_slug 1개와 confidence(0~1)를 매겨라.",
+              "규칙:",
+              "- topic_slug 는 반드시 아래 카탈로그의 slug 중 하나이거나, 적합한 것이 없으면 null.",
+              "- 이름·회사로 도메인 추정 금지. 본문(title/excerpt) 내용만 근거.",
+              "- 애매하면 confidence 를 낮게(<0.6) 주고, 정말 해당 없으면 topic_slug=null.",
+              "출력 JSON: {\"results\":[{\"i\":번호,\"topic_slug\":\"slug 또는 null\",\"confidence\":0~1}]}",
+              "모든 입력 항목 i 에 대해 정확히 1개 결과를 반환하라.",
+              "",
+              "=== 토픽 카탈로그 ===",
+              ...catalog.map((t) => `- ${t.slug} (${t.label}): ${t.description}`),
+            ].join("\n"),
+            user: JSON.stringify({ items }),
+            maxTokens: Math.min(200 + items.length * 30, 4000),
+            temperature: 0,
+          });
+          llmModel = llm.model;
+          llmPromptTokens = llm.promptTokens;
+          llmCompletionTokens = llm.completionTokens;
+          llmLatencyMs = llm.latencyMs;
+          llmCostUsd = llm.costUsd;
+
+          for (const res of llm.data.results ?? []) {
+            const idx = Number(res.i);
+            if (!Number.isInteger(idx) || idx < 0 || idx >= candidates.length) continue;
+            const slug = res.topic_slug;
+            const conf = typeof res.confidence === "number" ? res.confidence : 0;
+            if (slug && validSlugs.has(slug) && conf >= confidenceThreshold) {
+              candidates[idx].topicSlug = slug;
+              candidates[idx].topicConfidence = conf;
+            } else {
+              // 저신뢰·미분류·카탈로그 외 → 보류(null) + 신뢰도만 참고로 기록
+              candidates[idx].topicSlug = null;
+              candidates[idx].topicConfidence = slug ? conf : null;
+            }
+          }
+        } catch (e) {
+          llmError = e instanceof Error ? e.message : String(e);
+        }
+      }
+
+      // ── 감사 로그 (hp_llm_log) — 미리보기여도 LLM 호출 비용/실패는 기록 ──
+      try {
+        await conn.query(
+          `INSERT INTO hp_llm_log
+             (route, entity_type, entity_id, model, prompt_tokens, completion_tokens, cost_usd, latency_ms, cache_hit, error)
+           VALUES (?, 'harvest_scan', 0, ?, ?, ?, ?, ?, 0, ?)`,
+          [
+            route,
+            llmModel ?? "none",
+            llmPromptTokens,
+            llmCompletionTokens,
+            llmCostUsd,
+            llmLatencyMs ?? (Date.now() - t0),
+            llmError,
+          ],
+        );
+      } catch {
+        // 로그 실패는 응답을 막지 않는다.
+      }
+
+      // ── ⑤ 후보 반환 (본문 PII 미포함) ────────────────────
+      return c.json({
+        dryRun: true, // 이번 범위는 항상 미리보기 — hp_* 미기록
+        dryRunRequested,
+        scanned,
+        from: from14,
+        to: to14,
+        limit,
+        offset,
+        returned: candidates.length,
+        confidenceThreshold,
+        candidates,
+        llm: {
+          model: llmModel,
+          promptTokens: llmPromptTokens,
+          completionTokens: llmCompletionTokens,
+          costUsd: llmCostUsd,
+          latencyMs: llmLatencyMs,
+          error: llmError,
+        },
+        llmCostUsd,
+      });
+    }),
 );
 
 app.put("/wbs", async (c) => {
