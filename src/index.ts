@@ -29,6 +29,7 @@ type Bindings = {
   PMS_SERVICE_TOKEN?: string; // wrangler secret — PMS 프록시 공유 시크릿(미설정 시 가드 통과)
   SERVICE_TOKEN_ENFORCE?: string; // vars "1"이면 secret 설정+토큰 불일치 시 401
   RL_LLM?: RateLimit; // Cloudflare Rate Limiting binding (LLM generate)
+  ANALYSIS_TOKEN?: string; // TEMP — 일회용 토픽 분석 라우트 가드(분석 후 제거)
 };
 
 /** Cloudflare Rate Limiting binding 형상 (workers-types 미포함 시 대비 인라인). */
@@ -105,7 +106,7 @@ const requireAuth: MiddlewareHandler<{
   Variables: { session: SessionPayload };
 }> = async (c, next) => {
   const token = getCookie(c, SESSION_COOKIE);
-  if (!token) return c.json({ error: "unauthorized" }, 401);
+  if (!token) return c.json({ error: "로그인이 필요합니다." }, 401);
   try {
     // sign은 default(HS256) → verify에도 alg 명시 (hono v4 verify는 3번째 인자 필수)
     const payload = (await jwtVerify(token, c.env.JWT_SECRET, "HS256")) as unknown as SessionPayload;
@@ -113,7 +114,7 @@ const requireAuth: MiddlewareHandler<{
     await next();
   } catch {
     deleteCookie(c, SESSION_COOKIE, { path: "/" });
-    return c.json({ error: "invalid or expired session" }, 401);
+    return c.json({ error: "세션이 만료되었습니다. 다시 로그인해 주세요." }, 401);
   }
 };
 
@@ -125,8 +126,8 @@ const requireRole = (
   Variables: { session: SessionPayload };
 }> => async (c, next) => {
   const s = c.get("session");
-  if (!s) return c.json({ error: "unauthorized" }, 401);
-  if ((s.level ?? 0) < minLevel) return c.json({ error: "forbidden: insufficient role" }, 403);
+  if (!s) return c.json({ error: "로그인이 필요합니다." }, 401);
+  if ((s.level ?? 0) < minLevel) return c.json({ error: "접근 권한이 없습니다." }, 403);
   await next();
 };
 
@@ -3200,7 +3201,7 @@ app.post("/auth/login", async (c) =>
     const body = await c.req.json<{ loginId?: string; password?: string }>().catch(() => ({}));
     const loginId = (body.loginId ?? "").trim();
     const password = body.password ?? "";
-    if (!loginId || !password) return c.json({ error: "loginId, password required" }, 400);
+    if (!loginId || !password) return c.json({ error: "아이디와 비밀번호를 입력하세요." }, 400);
 
     const passHash = await sha256Hex(password);
     const [rows] = await conn.query(
@@ -3211,13 +3212,13 @@ app.post("/auth/login", async (c) =>
       [loginId, passHash],
     );
     const user = (rows as any[])[0];
-    if (!user) return c.json({ error: "invalid credentials" }, 401);
+    if (!user) return c.json({ error: "아이디 또는 비밀번호가 올바르지 않습니다." }, 401);
 
     // 직원 검증 (메모리 룰)
     const isStaff =
       (typeof user.email === "string" && user.email.endsWith("@malgnsoft.com")) ||
       user.company === "맑은소프트";
-    if (!isStaff) return c.json({ error: "forbidden: staff only" }, 403);
+    if (!isStaff) return c.json({ error: "맑은소프트 직원 계정만 로그인할 수 있습니다." }, 403);
 
     const now = Math.floor(Date.now() / 1000);
     const payload: SessionPayload = {
@@ -3263,7 +3264,7 @@ app.post("/auth/logout", (c) => {
 /** GET /auth/me — 현재 세션 사용자 (미인증 시 401) */
 app.get("/auth/me", async (c) => {
   const token = getCookie(c, SESSION_COOKIE);
-  if (!token) return c.json({ error: "unauthorized" }, 401);
+  if (!token) return c.json({ error: "로그인이 필요합니다." }, 401);
   try {
     const payload = (await jwtVerify(token, c.env.JWT_SECRET)) as unknown as SessionPayload;
     return c.json({
@@ -3279,7 +3280,7 @@ app.get("/auth/me", async (c) => {
     });
   } catch {
     deleteCookie(c, SESSION_COOKIE, { path: "/" });
-    return c.json({ error: "invalid or expired session" }, 401);
+    return c.json({ error: "세션이 만료되었습니다. 다시 로그인해 주세요." }, 401);
   }
 });
 
@@ -4160,6 +4161,237 @@ app.delete("/admin/bots/:id", requireAuth, requireRole(ROLE_LEVEL.admin), async 
     const [res] = await conn.query(`UPDATE hp_bot SET status = -1 WHERE id = ? AND status = 1`, [id]);
     if ((res as unknown as { affectedRows: number }).affectedRows === 0) return c.json({ error: "not found" }, 404);
     return c.json({ ok: true, id });
+  }),
+);
+
+// ═══════════════════════════════════════════════════════════════════════
+// TEMP — PMS 문의 토픽 분석(일회용, 읽기 전용). 분석 후 라우트+ANALYSIS_TOKEN secret 제거.
+//   가드: ?token=<ANALYSIS_TOKEN secret> 상수시간 비교. SELECT/집계만. PMS 데이터 변경 없음.
+//   phase=counts  : 연도×그룹 분포 + staff/customer 비중(COUNT)
+//   phase=titles  : 제목 키워드 빈도 + 제목 샘플(서버 집계, 원문 PII 최소)
+// ═══════════════════════════════════════════════════════════════════════
+const analysisGuard = (c: { req: { query: (k: string) => string | undefined }; env: Bindings }): boolean => {
+  const expected = c.env.ANALYSIS_TOKEN;
+  if (!expected) return false;
+  const provided = c.req.query("token") ?? "";
+  return timingSafeEqual(provided, expected);
+};
+
+// 본문/사내 게시판 제외 룰(PMS-INQUIRY-HARVEST §5-2): 프로젝트명 '^숫자.' 사내 게시판 제외.
+const HARVEST_EXCLUDE_PROJECT_REGEXP = "^[0-9]+[.]";
+
+app.get("/admin/migrate/topic-analysis", async (c) =>
+  withConn(c, async (conn) => {
+    if (!analysisGuard(c)) return c.json({ error: "unauthorized" }, 401);
+    const phase = c.req.query("phase") ?? "counts";
+    // 분석 대상 공통 WHERE: status=1, 기간, 본문 20자 이상, 사내 게시판 그룹/프로젝트 제외.
+    // staff 판정은 작성자 user의 email/company (classify.ts isStaff 룰과 동일 SQL).
+    const SINCE = "20220101000000";
+    const UNTIL = "20261231235959";
+
+    if (phase === "counts") {
+      // 1) 전체 규모(대상 필터 적용 전/후)
+      const [rawTotal] = await conn.query(
+        `SELECT COUNT(*) AS n FROM tb_post WHERE status = 1`,
+      );
+      const [scopedTotal] = await conn.query(
+        `SELECT COUNT(*) AS n
+           FROM tb_post p
+           JOIN tb_project pr ON pr.id = p.project_id
+      LEFT JOIN tb_project_group g ON g.id = pr.group_id AND g.status = 1
+          WHERE p.status = 1
+            AND p.reg_date BETWEEN ? AND ?
+            AND CHAR_LENGTH(p.content) >= 20
+            AND pr.name NOT REGEXP ?`,
+        [SINCE, UNTIL, HARVEST_EXCLUDE_PROJECT_REGEXP],
+      );
+
+      // 2) 연도 × 그룹 분포 + staff 비중
+      const [byYearGroup] = await conn.query(
+        `SELECT LEFT(p.reg_date, 4) AS yr,
+                COALESCE(g.name, '(미분류)') AS group_name,
+                COUNT(*) AS n,
+                SUM(CASE WHEN (u.email LIKE '%@malgnsoft.com' OR u.company = '맑은소프트') THEN 1 ELSE 0 END) AS staff_n
+           FROM tb_post p
+           JOIN tb_project pr ON pr.id = p.project_id
+      LEFT JOIN tb_project_group g ON g.id = pr.group_id AND g.status = 1
+      LEFT JOIN tb_user u ON u.id = p.user_id
+          WHERE p.status = 1
+            AND p.reg_date BETWEEN ? AND ?
+            AND CHAR_LENGTH(p.content) >= 20
+            AND pr.name NOT REGEXP ?
+       GROUP BY yr, group_name
+       ORDER BY yr, n DESC`,
+        [SINCE, UNTIL, HARVEST_EXCLUDE_PROJECT_REGEXP],
+      );
+
+      // 3) 그룹별 합계(서비스 매핑 검증용)
+      const [byGroup] = await conn.query(
+        `SELECT COALESCE(g.name, '(미분류)') AS group_name,
+                COUNT(*) AS n,
+                SUM(CASE WHEN (u.email LIKE '%@malgnsoft.com' OR u.company = '맑은소프트') THEN 1 ELSE 0 END) AS staff_n,
+                SUM(CASE WHEN p.comm_cnt > 0 THEN 1 ELSE 0 END) AS answered_n
+           FROM tb_post p
+           JOIN tb_project pr ON pr.id = p.project_id
+      LEFT JOIN tb_project_group g ON g.id = pr.group_id AND g.status = 1
+      LEFT JOIN tb_user u ON u.id = p.user_id
+          WHERE p.status = 1
+            AND p.reg_date BETWEEN ? AND ?
+            AND CHAR_LENGTH(p.content) >= 20
+            AND pr.name NOT REGEXP ?
+       GROUP BY group_name
+       ORDER BY n DESC`,
+        [SINCE, UNTIL, HARVEST_EXCLUDE_PROJECT_REGEXP],
+      );
+
+      return c.json({
+        rawTotalPosts: Number((rawTotal as any[])[0]?.n ?? 0),
+        scopedTotal: Number((scopedTotal as any[])[0]?.n ?? 0),
+        byYearGroup: (byYearGroup as any[]).map((r) => ({
+          year: r.yr, groupName: r.group_name, n: Number(r.n), staffN: Number(r.staff_n),
+        })),
+        byGroup: (byGroup as any[]).map((r) => ({
+          groupName: r.group_name, n: Number(r.n), staffN: Number(r.staff_n), answeredN: Number(r.answered_n),
+        })),
+      });
+    }
+
+    if (phase === "titles") {
+      // 고객(비staff) 문의 제목만 추출 — 토픽 도출 입력. PII 최소화 위해 제목만.
+      const groupParam = c.req.query("group");
+      const params: any[] = [SINCE, UNTIL, HARVEST_EXCLUDE_PROJECT_REGEXP];
+      let groupSql = "";
+      if (groupParam) { groupSql = "AND g.name = ?"; params.push(groupParam); }
+      const limit = Math.min(parseInt(c.req.query("limit") ?? "4000", 10) || 4000, 8000);
+      const offset = Math.max(parseInt(c.req.query("offset") ?? "0", 10) || 0, 0);
+      const staffParam = c.req.query("staff"); // 'only' | 'exclude' | undefined(all)
+      let staffSql = "";
+      if (staffParam === "exclude") staffSql = "AND NOT (u.email LIKE '%@malgnsoft.com' OR u.company = '맑은소프트')";
+      if (staffParam === "only") staffSql = "AND (u.email LIKE '%@malgnsoft.com' OR u.company = '맑은소프트')";
+
+      const [rows] = await conn.query(
+        `SELECT p.subject AS subject,
+                COALESCE(g.name, '(미분류)') AS group_name,
+                LEFT(p.reg_date, 4) AS yr,
+                p.comm_cnt AS comm_cnt,
+                (u.email LIKE '%@malgnsoft.com' OR u.company = '맑은소프트') AS is_staff
+           FROM tb_post p
+           JOIN tb_project pr ON pr.id = p.project_id
+      LEFT JOIN tb_project_group g ON g.id = pr.group_id AND g.status = 1
+      LEFT JOIN tb_user u ON u.id = p.user_id
+          WHERE p.status = 1
+            AND p.reg_date BETWEEN ? AND ?
+            AND CHAR_LENGTH(p.content) >= 20
+            AND pr.name NOT REGEXP ?
+            AND CHAR_LENGTH(TRIM(COALESCE(p.subject, ''))) >= 2
+            ${groupSql}
+            ${staffSql}
+       ORDER BY p.id
+          LIMIT ${limit} OFFSET ${offset}`,
+        params,
+      );
+
+      // 서버측 키워드 빈도(2글자 이상 한글/영문 토큰). 제목 원문은 샘플만 반환.
+      const titles = (rows as any[]).map((r) => ({
+        subject: String(r.subject ?? ""), group: r.group_name, year: r.yr,
+        answered: Number(r.comm_cnt) > 0, staff: r.is_staff === 1,
+      }));
+      const freq = new Map<string, number>();
+      const STOP = new Set(["문의","관련","드립니다","합니다","해주세요","부탁","요청","질문","드려요","건의","대한","대해","있습니다","입니다","어떻게","가능","확인","처리","문제"]);
+      for (const t of titles) {
+        const toks = t.subject.replace(/[\[\]()_\-.,?!~:;/]/g, " ").split(/\s+/).filter(Boolean);
+        const seen = new Set<string>();
+        for (let tok of toks) {
+          tok = tok.trim();
+          if (tok.length < 2) continue;
+          if (STOP.has(tok)) continue;
+          if (/^[0-9]+$/.test(tok)) continue;
+          if (seen.has(tok)) continue; // 제목 내 1회만
+          seen.add(tok);
+          freq.set(tok, (freq.get(tok) ?? 0) + 1);
+        }
+      }
+      const topKeywords = [...freq.entries()].sort((a, b) => b[1] - a[1]).slice(0, 200)
+        .map(([k, n]) => ({ keyword: k, n }));
+
+      return c.json({
+        returned: titles.length, limit, offset,
+        topKeywords,
+        // 샘플 제목(균등 추출) — LLM 토픽 명명 입력. 최대 600개.
+        sampleTitles: titles.filter((_, i) => i % Math.max(1, Math.floor(titles.length / 600)) === 0).slice(0, 600),
+      });
+    }
+
+    if (phase === "cluster") {
+      // 키워드 빈도 + 샘플 제목을 LLM에 넘겨 토픽 20~40개 군집·명명.
+      // 입력은 POST body로 받는다(키워드/샘플은 클라이언트가 전 배치를 병합해 전달 — 토큰 절약).
+      const body = await c.req.json<{
+        keywords?: Array<{ keyword: string; n: number }>;
+        samples?: string[];
+        groupHints?: Array<{ group: string; n: number; staffN: number }>;
+      }>().catch(() => ({} as Record<string, never>));
+      const keywords = (body as { keywords?: Array<{ keyword: string; n: number }> }).keywords ?? [];
+      const samples = (body as { samples?: string[] }).samples ?? [];
+      const groupHints = (body as { groupHints?: Array<{ group: string; n: number; staffN: number }> }).groupHints ?? [];
+
+      const llm = await callOpenAiJson<{
+        topics: Array<{
+          slug: string; scope: "common" | "service"; label: string; description: string;
+          examples: string[]; keywords: string[]; est_share: number; service_hint?: string;
+        }>;
+      }>(c.env, {
+        model: c.env.LLM_MODEL_DEFAULT,
+        system: [
+          "너는 한국 이러닝/LMS SaaS 고객상담 데이터 분석가다.",
+          "PMS 고객 문의 '제목' 키워드 빈도와 샘플 제목을 받아, 표준답변 분류 체계(hp_topic) 토픽 카탈로그를 만든다.",
+          "규칙:",
+          "- 토픽 22~36개. 너무 잘게 쪼개지 말고 상담 분류로 실용적인 단위로.",
+          "- 각 토픽: slug(소문자 ASCII, 하이픈), scope('common'=전 서비스 공통: 로그인/결제/계정/오류 등 | 'service'=특정 서비스 도메인: 환급/공공보안/글로벌 등), label(한글 10자 이내), description(한 줄), examples(일반화된 예시 질문 2~3개, 실제 업체명·개인정보 절대 금지), keywords(이 토픽에 묶이는 입력 키워드 5~10개), est_share(전체 대비 추정 비중 0~1).",
+          "- 업체명/기관명/사람이름(예: 플로즈, 콜러스, 안전보건진흥원 등 고유명사)은 토픽이 아니다 — 무시하거나 일반 토픽으로 흡수.",
+          "- examples는 마스킹·일반화. 원문 PII 복사 금지.",
+          "- est_share 합은 대략 1.0 근처(중복 허용, 정확할 필요 없음).",
+          '출력 JSON: {"topics":[{"slug","scope","label","description","examples":[],"keywords":[],"est_share","service_hint?"}]}',
+        ].join("\n"),
+        user: JSON.stringify({ keywordFreq: keywords, sampleTitles: samples, groupDistribution: groupHints }).slice(0, 60000),
+        maxTokens: 8000,
+        temperature: 0.3,
+        timeoutMs: 120_000,
+      });
+      return c.json({ model: llm.model, costUsd: llm.costUsd, promptTokens: llm.promptTokens, completionTokens: llm.completionTokens, topics: llm.data.topics });
+    }
+
+    if (phase === "consolidate") {
+      // 1차 군집(priorTopics) + 서비스 그룹별 신호(serviceGroupSignals)를 받아
+      // 중복 토픽 병합 + scope(common/service) 재판정 + service 특화 토픽 보강.
+      const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+      const llm = await callOpenAiJson<{
+        topics: Array<{
+          slug: string; scope: "common" | "service"; label: string; description: string;
+          examples: string[]; keywords: string[]; est_share: number; service_hint?: string;
+        }>;
+        notes?: string;
+      }>(c.env, {
+        model: c.env.LLM_MODEL_DEFAULT,
+        system: [
+          "너는 한국 이러닝/LMS SaaS 고객상담 표준답변 분류 체계 설계자다.",
+          "입력: priorTopics(1차 군집된 토픽 후보) + serviceGroupSignals(환급/공공/글로벌/OTT 그룹별 키워드·샘플).",
+          "할 일:",
+          "1) priorTopics 중 의미 중복(예: 시험 2개, 회원/회원가입 2개, 게시판/팝업배너 2개)을 병합해 정리.",
+          "2) scope 재판정: 환급/공공/글로벌의 신호가 일반 LMS와 같은 토픽(오류·수정·홈페이지·수료증·강의)이면 그건 common 유지. OTT(이용권·구독·자막·에피소드)처럼 도메인이 다르면 service 토픽 신설.",
+          "3) 서비스 특화 토픽 보강: refund(고용보험 환급과정·안전보건진흥원·과정 차수·본인인증), ott(이용권/구독/자막/에피소드), public(공공 보안·개인정보·제출서류) 등 신호가 뚜렷한 것만 service로.",
+          "최종 토픽 24~34개. 각: slug(ASCII,하이픈), scope, label(한글 10자내), description, examples(일반화 2~3개·PII금지), keywords, est_share(0~1), service_hint?(service일 때 대상 서비스).",
+          "업체/기관 고유명사는 토픽 아님.",
+          '출력 JSON: {"topics":[...], "notes":"병합/판정 요약"}',
+        ].join("\n"),
+        user: JSON.stringify(body).slice(0, 60000),
+        maxTokens: 8000,
+        temperature: 0.2,
+        timeoutMs: 120_000,
+      });
+      return c.json({ model: llm.model, costUsd: llm.costUsd, promptTokens: llm.promptTokens, completionTokens: llm.completionTokens, topics: llm.data.topics, notes: llm.data.notes });
+    }
+
+    return c.json({ error: "unknown phase" }, 400);
   }),
 );
 
