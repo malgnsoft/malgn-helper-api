@@ -29,6 +29,7 @@ type Bindings = {
   PMS_SERVICE_TOKEN?: string; // wrangler secret — PMS 프록시 공유 시크릿(미설정 시 가드 통과)
   SERVICE_TOKEN_ENFORCE?: string; // vars "1"이면 secret 설정+토큰 불일치 시 401
   RL_LLM?: RateLimit; // Cloudflare Rate Limiting binding (LLM generate)
+  MIGRATE_TOKEN?: string; // 일회용 마이그레이션 가드(secret) — 실행 후 secret 삭제 + 라우트 제거
 };
 
 /** Cloudflare Rate Limiting binding 형상 (workers-types 미포함 시 대비 인라인). */
@@ -117,6 +118,66 @@ function paragraphsToHtml(text: string): string {
     parts.push(`<p>${escapeHtml(ln)}</p>`);
   }
   return parts.join("");
+}
+
+// ── 이미지/링크 자산 보존 토큰화 (수집 마스킹 경로용) ──────────────────────────
+// 배경: htmlToParagraphs 가 <img> 포함 모든 태그를 제거 → V2 마스킹 경로에서 이미지 0% 소실.
+// 해결: 텍스트로 환원하기 전에 <img>·<a>·<figure>·<figcaption> 을 플레이스홀더 토큰(⟦HPASSET_n⟧)으로 치환 →
+//   텍스트만 태그 제거(htmlToParagraphs) → (마스킹 LLM 은 토큰을 그대로 보존) →
+//   복원 단계서 토큰을 원본 자산 HTML 로 되돌리고 absolutizePmsAssets 로 절대화.
+// 토큰은 영숫자·기호(<,> 없음)라 htmlToParagraphs 의 태그 제거·줄처리·escapeHtml 를 무사 통과한다.
+// 마스킹 LLM 입력 텍스트엔 토큰만 노출(이미지 src URL 미노출 → 토큰=텍스트, PII 영향 없음).
+const HP_ASSET_TOKEN_RE = /⟦HPASSET_(\d+)⟧/g;
+
+type AssetTokenized = { text: string; tokens: string[] };
+
+// HTML 에서 <img>(self-closing 포함)·<a>…</a>·<figure>…</figure>·<figcaption>…</figcaption> 을
+// 토큰으로 치환하고, 토큰별 원본 HTML 배열을 함께 반환. 그 뒤 htmlToParagraphs 로 텍스트화.
+//   - <a>/<figure>/<figcaption> 은 컨테이너 — 내부 텍스트도 토큰에 흡수(링크 라벨·캡션 보존).
+//   - 중첩(figure>img) 은 바깥(figure)을 먼저 매칭해 통째 토큰화(내부 img 토큰화 생략) → 원본 그대로 보존.
+function tokenizeAssets(html: string): AssetTokenized {
+  let s = String(html ?? "");
+  const tokens: string[] = [];
+  const push = (frag: string): string => {
+    const i = tokens.length;
+    tokens.push(frag);
+    return `⟦HPASSET_${i}⟧`;
+  };
+  // 1) figure(캡션·이미지 래퍼) 통째 — 내부 img/figcaption 포함.
+  s = s.replace(/<figure\b[^>]*>[\s\S]*?<\/figure>/gi, (m) => push(m));
+  // 2) 남은 figcaption 단독.
+  s = s.replace(/<figcaption\b[^>]*>[\s\S]*?<\/figcaption>/gi, (m) => push(m));
+  // 3) 이미지를 감싼 링크(a>img) — 링크째 보존(클릭 시 원본 보기).
+  s = s.replace(/<a\b[^>]*>\s*(?:<img\b[^>]*\/?>)\s*<\/a>/gi, (m) => push(m));
+  // 4) 단독 img(self-closing 허용).
+  s = s.replace(/<img\b[^>]*\/?>/gi, (m) => push(m));
+  // 5) 남은 일반 링크 — 텍스트 라벨 포함 통째.
+  s = s.replace(/<a\b[^>]*>[\s\S]*?<\/a>/gi, (m) => push(m));
+  // 토큰을 줄 경계로 분리(앞뒤 \n) → htmlToParagraphs 가 독립 단락으로 처리 → 복원 시 자산이 한 줄에.
+  s = s.replace(HP_ASSET_TOKEN_RE, (m) => `\n${m}\n`);
+  return { text: htmlToParagraphs(s), tokens };
+}
+
+// paragraphsToHtml 산출물(escape 완료) 안의 토큰을 원본 자산 HTML 로 복원.
+//   - 토큰만 든 <p>⟦HPASSET_n⟧</p> → 원본 자산 HTML (figure/img/a) 로 통째 교체.
+//   - 텍스트 중간 토큰 → 자산 HTML 인라인 삽입.
+// 복원은 paragraphsToHtml(escape) 이후에 해야 자산 HTML 의 <,> 가 escape 되지 않는다.
+function restoreAssetTokens(html: string, tokens: string[]): string {
+  let s = String(html ?? "");
+  // 토큰만 든 <p> 래퍼 제거(자산을 단락 래핑하지 않고 그대로).
+  s = s.replace(/<p>\s*(⟦HPASSET_\d+⟧)\s*<\/p>/g, "$1");
+  s = s.replace(HP_ASSET_TOKEN_RE, (_m, idx: string) => {
+    const i = Number(idx);
+    return Number.isInteger(i) && i >= 0 && i < tokens.length ? tokens[i] : "";
+  });
+  return s;
+}
+
+// 마스킹된 단락 텍스트(토큰 보존) → 저장 HTML. paragraphsToHtml 래핑 → 토큰 복원 → 자산 절대화.
+function paragraphsToHtmlWithAssets(text: string, tokens: string[], assetBase: string): string {
+  const wrapped = paragraphsToHtml(text);
+  const restored = restoreAssetTokens(wrapped, tokens);
+  return absolutizePmsAssets(restored, assetBase);
 }
 
 app.use(
@@ -364,6 +425,763 @@ async function analyzeAndStoreImage(
     return null; // 분석 실패 — 흐름은 진행, 다음 번 호출에서 재시도 가능
   }
 }
+
+// ═════════════════════════════════════════════════════════════════
+// 일회용 마이그레이션 가드 — MIGRATE_TOKEN(secret) Bearer 일치 시 통과.
+//   배경: 큐레이션 재실행은 admin 자격이 필요하나 무인 실행(CLI)이라 임시 토큰 가드 사용.
+//   선례(94c4d7f): migrateGuard/MIGRATE_TOKEN/?confirm 임시 사용 → 실행 후 라우트 제거 + 재배포(404) + secret 삭제.
+//   secret 값은 코드·로그·git 에 남기지 않는다(wrangler secret put MIGRATE_TOKEN).
+// ═════════════════════════════════════════════════════════════════
+const migrateGuard: MiddlewareHandler<{
+  Bindings: Bindings;
+  Variables: { session: SessionPayload };
+}> = async (c, next) => {
+  const expected = c.env.MIGRATE_TOKEN;
+  if (!expected) return c.json({ error: "migrate disabled" }, 404);
+  const auth = c.req.header("authorization") ?? "";
+  const m = /^Bearer\s+(.+)$/.exec(auth);
+  const provided = m ? m[1] : "";
+  if (!provided || !timingSafeEqual(provided, expected)) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  await next();
+};
+
+// ─────────────────────────────────────────────────────────────
+// 일회용 ① — POST /admin/migrate/purge-curated?confirm=yes
+//   자동 수집분(created_by IN ('llm-curator','llm-curator-v2')) hp_standard_answer + hp_announce 를
+//   status=-1 로 soft-delete(복구 가능). 수동/시드 등 다른 created_by 는 보존.
+//   ?dry=1 → 건수만(쓰기 없음). 멱등(이미 status=-1 은 제외). 응답엔 본문 PII 미포함(집계만).
+// ─────────────────────────────────────────────────────────────
+const CURATED_CREATED_BY = ["llm-curator", "llm-curator-v2"];
+app.post("/admin/migrate/purge-curated", migrateGuard, async (c) =>
+  withConn(c, async (conn) => {
+    const dry = c.req.query("dry") === "1";
+    if (!dry && c.req.query("confirm") !== "yes") {
+      return c.json({ error: "add ?confirm=yes (or ?dry=1 for preview)" }, 400);
+    }
+    const inList = CURATED_CREATED_BY.map(() => "?").join(",");
+    const [saCnt] = await conn.query(
+      `SELECT COUNT(*) AS n FROM hp_standard_answer WHERE status = 1 AND created_by IN (${inList})`,
+      CURATED_CREATED_BY,
+    );
+    const [anCnt] = await conn.query(
+      `SELECT COUNT(*) AS n FROM hp_announce WHERE status = 1 AND created_by IN (${inList})`,
+      CURATED_CREATED_BY,
+    );
+    const saTarget = Number((saCnt as { n: number }[])[0]?.n ?? 0);
+    const anTarget = Number((anCnt as { n: number }[])[0]?.n ?? 0);
+    if (dry) {
+      return c.json({ dry: true, target: { standard_answer: saTarget, announce: anTarget, total: saTarget + anTarget } });
+    }
+    const [saUp] = await conn.query(
+      `UPDATE hp_standard_answer SET status = -1 WHERE status = 1 AND created_by IN (${inList})`,
+      CURATED_CREATED_BY,
+    );
+    const [anUp] = await conn.query(
+      `UPDATE hp_announce SET status = -1 WHERE status = 1 AND created_by IN (${inList})`,
+      CURATED_CREATED_BY,
+    );
+    const saDeleted = (saUp as { affectedRows: number }).affectedRows;
+    const anDeleted = (anUp as { affectedRows: number }).affectedRows;
+    return c.json({
+      dry: false,
+      softDeleted: { standard_answer: saDeleted, announce: anDeleted, total: saDeleted + anDeleted },
+      note: "status=-1 (복구 가능). created_by IN ('llm-curator','llm-curator-v2') 한정.",
+    });
+  }),
+);
+
+// ─────────────────────────────────────────────────────────────
+// 일회용 ② — POST /admin/migrate/harvest-curate-v3?confirm=yes
+//   이미지 보존 재큐레이션(처음부터). V2 파이프라인 재사용 + ⑤마스킹에서 자산 토큰화로 <img> 보존.
+//   created_by='llm-curator-v3'. ⚠ 읽기 tb_*(불변) · 쓰기 hp_*. 멱등(source_post_id 중복 제외).
+//   파이프라인: ①추출 → ②분류(서비스/안내분기/토픽) → ③가치평가 → ④중복제거 → ⑤마스킹(이미지 토큰 보존)
+//             → ⑥3관점 패널(cs/planner/it) → ⑦등록(approved/draft).
+//   스크린샷 속 PII 는 자동 제외하지 않음(사람 검수 전제). 응답엔 본문 PII 미포함(집계·id·점수만).
+//   limit≤120 청크 멱등 분할 — 중단돼도 재개(롤백 없음). 적용 완료 후 라우트 제거 + 재배포(404).
+// ─────────────────────────────────────────────────────────────
+type CurateV3Body = {
+  limit?: number;
+  perServiceCap?: number;
+  minValue?: number;
+  approveThreshold?: number;
+};
+function v3NormTokens(s: string): Set<string> {
+  const cleaned = String(s ?? "")
+    .replace(/<[^>]+>/g, " ")
+    .toLowerCase()
+    .replace(/[^0-9a-z가-힣\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return new Set(cleaned.split(" ").filter((t) => t.length >= 2));
+}
+function v3Jaccard(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 && b.size === 0) return 1;
+  if (a.size === 0 || b.size === 0) return 0;
+  let inter = 0;
+  for (const t of a) if (b.has(t)) inter += 1;
+  const union = a.size + b.size - inter;
+  return union > 0 ? inter / union : 0;
+}
+app.post("/admin/migrate/harvest-curate-v3", migrateGuard, async (c) =>
+  withConn(c, async (conn) => {
+    if (c.req.query("confirm") !== "yes") return c.json({ error: "add ?confirm=yes" }, 400);
+    const t0 = Date.now();
+    const route = "POST /admin/migrate/harvest-curate-v3";
+    const assetBase = c.env.PMS_ASSET_BASE || DEFAULT_PMS_ASSET_BASE;
+
+    const qLimit = c.req.query("limit");
+    const qCap = c.req.query("perServiceCap");
+    const qMin = c.req.query("minValue");
+    const qApprove = c.req.query("approveThreshold");
+    const b = await c.req.json<CurateV3Body>().catch((): CurateV3Body => ({}));
+    // limit 상한 120(청크 멱등 분할).
+    const limit = Math.min(Math.max(Number(qLimit ?? b.limit ?? 120) || 120, 1), 120);
+    const perServiceCap = Math.min(Math.max(Number(qCap ?? b.perServiceCap ?? 160) || 160, 1), 600);
+    const minValue = Math.min(Math.max(Number(qMin ?? b.minValue ?? 0.7) || 0.7, 0), 1);
+    const approveThreshold = Math.min(Math.max(Number(qApprove ?? b.approveThreshold ?? 0.72) || 0.72, 0), 1);
+    const orderMode = (c.req.query("order") ?? "recent") === "rand" ? "rand" : "recent";
+    const DEDUP_SIM = 0.8;
+    const PANEL_MIN = 0.6;
+
+    if (!c.env.OPENAI_API_KEY) return c.json({ error: "OPENAI_API_KEY missing" }, 500);
+
+    // ── ① 추출(읽기) — V1/V2 scan 제외룰 동일. 2022~2026, staff 답변 있는 Q&A + staff 안내글 ──
+    const from14 = "20220101000000";
+    const to14 = "20261231235959";
+    const internalNames = [...HARVEST_INTERNAL_GROUP_NAMES];
+    const where: string[] = [
+      "p.status = 1",
+      "p.site_id = 1",
+      "p.reg_date BETWEEN ? AND ?",
+      "CHAR_LENGTH(p.content) >= ?",
+      "proj.name NOT REGEXP '^[0-9]+\\\\.'",
+    ];
+    const params: unknown[] = [from14, to14, HARVEST_MIN_CONTENT_LEN];
+    if (internalNames.length > 0) {
+      where.push(`(g.name IS NULL OR g.name NOT IN (${internalNames.map(() => "?").join(",")}))`);
+      params.push(...internalNames);
+    }
+    where.push(
+      `(
+         EXISTS (
+           SELECT 1 FROM tb_post_comment cc
+            JOIN tb_user cu ON cu.id = cc.user_id
+            WHERE cc.post_id = p.id AND cc.status = 1 AND cc.private_yn != 'Y'
+              AND cc.content IS NOT NULL AND cc.content != ''
+              AND (cu.email LIKE '%@malgnsoft.com' OR cu.company = '맑은소프트')
+         )
+         OR (u.email LIKE '%@malgnsoft.com' OR u.company = '맑은소프트')
+       )`,
+    );
+    // 멱등 — 이미 등록(status=1)된 source_post_id 제외(어떤 created_by 든). 재실행/청크 분할 안전.
+    where.push(
+      `p.id NOT IN (SELECT source_post_id FROM hp_standard_answer WHERE source_post_id IS NOT NULL AND status = 1)`,
+    );
+    where.push(
+      `p.id NOT IN (SELECT source_post_id FROM hp_announce WHERE source_post_id IS NOT NULL AND status = 1)`,
+    );
+    const whereSql = `WHERE ${where.join(" AND ")}`;
+
+    const [countRows] = await conn.query(
+      `SELECT COUNT(*) AS total
+         FROM tb_post p
+         JOIN tb_project proj ON proj.id = p.project_id
+    LEFT JOIN tb_project_group g ON g.id = proj.group_id AND g.status = 1
+    LEFT JOIN tb_user u ON u.id = p.user_id
+        ${whereSql}`,
+      params,
+    );
+    const scanned = Number((countRows as { total: number }[])[0]?.total ?? 0);
+
+    const fetchCap = Math.min(limit * 4, 1500);
+    const [rows] = await conn.query(
+      `SELECT p.id, p.subject, p.content, p.project_id, p.reg_date,
+              g.name AS group_name,
+              (u.email LIKE '%@malgnsoft.com' OR u.company = '맑은소프트') AS author_is_staff,
+              EXISTS (
+                SELECT 1 FROM tb_post_comment cc
+                 JOIN tb_user cu ON cu.id = cc.user_id
+                 WHERE cc.post_id = p.id AND cc.status = 1 AND cc.private_yn != 'Y'
+                   AND cc.content IS NOT NULL AND cc.content != ''
+                   AND (cu.email LIKE '%@malgnsoft.com' OR cu.company = '맑은소프트')
+              ) AS has_staff_answer
+         FROM tb_post p
+         JOIN tb_project proj ON proj.id = p.project_id
+    LEFT JOIN tb_project_group g ON g.id = proj.group_id AND g.status = 1
+    LEFT JOIN tb_user u ON u.id = p.user_id
+        ${whereSql}
+     ORDER BY ${orderMode === "rand" ? "RAND()" : "p.reg_date DESC, p.id DESC"}
+        LIMIT ${fetchCap}`,
+      params,
+    );
+    type CurRow = {
+      id: number;
+      subject: string | null;
+      content: string | null;
+      project_id: number;
+      reg_date: string;
+      group_name: string | null;
+      author_is_staff: number;
+      has_staff_answer: number;
+    };
+    const allRows = rows as CurRow[];
+
+    // ── ② 분류 — 서비스배정·안내글/Q&A 분기. 서비스 slug→id 해석 ──
+    const [svcRows] = await conn.query(
+      `SELECT id, slug FROM hp_service WHERE status = 1 AND active = 1`,
+    );
+    const slugToServiceId = new Map<string, number>();
+    for (const r of svcRows as { id: number; slug: string }[]) {
+      slugToServiceId.set(r.slug, Number(r.id));
+    }
+
+    type CurCand = {
+      row: CurRow;
+      serviceSlug: string | null;
+      serviceId: number | null;
+      type: "qa" | "announce";
+      hasAnswer: boolean;
+      topicId: number | null;
+      topicSlug: string | null;
+      value?: number;
+      label?: string;
+      announceTitle?: string;
+      // ⑤ 마스킹본(단락 텍스트, 자산 토큰 보존) + 토큰 원본 자산 HTML
+      maskedQuestion?: string;
+      maskedAnswer?: string;
+      maskedBody?: string;
+      maskedTitle?: string;
+      qTokens?: string[];
+      aTokens?: string[];
+      bodyTokens?: string[];
+      imgCount?: number; // 보존된 <img> 수(보고용)
+      masked?: boolean;
+      blocked?: boolean;
+      panel?: { cs: number; planner: number; it: number; reject: boolean };
+      approval?: "approved" | "draft";
+    };
+
+    const perSvcCount = new Map<string, number>();
+    const candidates: CurCand[] = [];
+    for (const r of allRows) {
+      if (candidates.length >= limit) break;
+      const serviceSlug = groupNameToServiceSlug(r.group_name);
+      const isStaff = Number(r.author_is_staff) === 1;
+      const hasAnswer = Number(r.has_staff_answer) === 1;
+      const isAnnounce = isAnnounceCandidate(null, isStaff, true);
+      if (!isAnnounce && !hasAnswer) continue;
+      const capKey = serviceSlug ?? "__none";
+      const used = perSvcCount.get(capKey) ?? 0;
+      if (used >= perServiceCap) continue;
+      perSvcCount.set(capKey, used + 1);
+      candidates.push({
+        row: r,
+        serviceSlug,
+        serviceId: serviceSlug ? (slugToServiceId.get(serviceSlug) ?? null) : null,
+        type: isAnnounce ? "announce" : "qa",
+        hasAnswer,
+        topicId: null,
+        topicSlug: null,
+      });
+    }
+
+    let llmCostUsd = 0;
+    let llmPromptTokens = 0;
+    let llmCompletionTokens = 0;
+    let llmCalls = 0;
+    let llmModel: string | null = null;
+    let llmError: string | null = null;
+
+    function stripHtml(s: string, n: number): string {
+      return String(s ?? "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, n);
+    }
+
+    // qa: staff 첫 답변 raw HTML(원본 — 자산 토큰화 대상) / announce: 본문.
+    const evalSources: Array<{ question: string; answer: string; rawAnswer: string }> = [];
+    for (const cand of candidates) {
+      if (cand.type === "qa") {
+        const [ansRows] = await conn.query(
+          `SELECT c.content
+             FROM tb_post_comment c
+             JOIN tb_user cu ON cu.id = c.user_id
+            WHERE c.post_id = ? AND c.status = 1 AND c.private_yn != 'Y'
+              AND (cu.email LIKE '%@malgnsoft.com' OR cu.company = '맑은소프트')
+              AND c.content IS NOT NULL AND c.content != ''
+         ORDER BY c.reg_date ASC, c.id ASC
+            LIMIT 1`,
+          [cand.row.id],
+        );
+        const ans = String((ansRows as { content: string | null }[])[0]?.content ?? "").trim();
+        evalSources.push({
+          question: stripHtml(cand.row.content ?? "", 600),
+          answer: stripHtml(ans, 800),
+          rawAnswer: ans,
+        });
+      } else {
+        evalSources.push({ question: "", answer: stripHtml(cand.row.content ?? "", 900), rawAnswer: "" });
+      }
+    }
+
+    const BATCH = 15;
+
+    // ── ②-b 토픽 LLM 분류(배치) — 라이브 hp_topic active 카탈로그 ──
+    const [topicRows] = await conn.query(
+      `SELECT id, slug, label, description, scope FROM hp_topic
+        WHERE status = 1 AND active = 1
+        ORDER BY scope, sort_order, id`,
+    );
+    const topicCatalog = topicRows as Array<{
+      id: number; slug: string; label: string; description: string | null; scope: SaScope;
+    }>;
+    const slugToTopicId = new Map<string, number>();
+    for (const t of topicCatalog) slugToTopicId.set(t.slug, Number(t.id));
+    const validTopicSlugs = new Set(topicCatalog.map((t) => t.slug));
+    const TOPIC_CONF = 0.6;
+
+    if (candidates.length > 0 && topicCatalog.length > 0) {
+      for (let start = 0; start < candidates.length; start += BATCH) {
+        const chunk = candidates.slice(start, start + BATCH);
+        const items = chunk.map((cand, j) => ({
+          i: j,
+          title: stripHtml(cand.row.subject ?? "", 120),
+          excerpt: stripHtml(cand.row.content ?? "", 120),
+        }));
+        try {
+          const llm = await callOpenAiJson<{
+            results: Array<{ i: number; topic_slug: string | null; confidence: number }>;
+          }>(c.env, {
+            model: c.env.LLM_MODEL_DEFAULT,
+            system: [
+              "너는 고객상담 문의를 사전 정의된 토픽 카탈로그 중 하나로 분류하는 분류기다.",
+              "각 항목(title + excerpt)을 읽고 가장 적합한 topic_slug 1개와 confidence(0~1)를 매겨라.",
+              "- topic_slug 는 반드시 카탈로그 slug 중 하나이거나, 적합한 것이 없으면 null.",
+              "- 이름·회사로 도메인 추정 금지. 본문 내용만 근거.",
+              "- 애매하면 confidence 를 낮게(<0.6), 정말 해당 없으면 topic_slug=null.",
+              '출력 JSON: {"results":[{"i":번호,"topic_slug":"slug 또는 null","confidence":0~1}]}',
+              "모든 입력 항목 i 에 대해 정확히 1개 결과를 반환하라.",
+              "",
+              "=== 토픽 카탈로그 ===",
+              ...topicCatalog.map((t) => `- ${t.slug} (${t.label}): ${t.description ?? ""}`),
+            ].join("\n"),
+            user: JSON.stringify({ items }),
+            maxTokens: Math.min(200 + items.length * 30, 4000),
+            temperature: 0,
+          });
+          llmModel = llm.model;
+          llmPromptTokens += llm.promptTokens;
+          llmCompletionTokens += llm.completionTokens;
+          llmCostUsd += llm.costUsd;
+          llmCalls += 1;
+          for (const res of llm.data.results ?? []) {
+            const idx = Number(res.i);
+            if (!Number.isInteger(idx) || idx < 0 || idx >= chunk.length) continue;
+            const slug = res.topic_slug;
+            const conf = typeof res.confidence === "number" ? res.confidence : 0;
+            if (slug && validTopicSlugs.has(slug) && conf >= TOPIC_CONF) {
+              chunk[idx].topicSlug = slug;
+              chunk[idx].topicId = slugToTopicId.get(slug) ?? null;
+            }
+          }
+        } catch (e) {
+          llmError = e instanceof Error ? e.message : String(e);
+        }
+      }
+    }
+
+    // ── ③ 가치평가(배치) — value(0~1). value>=minValue 만 다음 단계 ──
+    let evaluated = 0;
+    let valueSum = 0;
+    for (let start = 0; start < candidates.length; start += BATCH) {
+      const chunk = candidates.slice(start, start + BATCH);
+      const items = chunk.map((cand, j) => ({
+        i: j,
+        type: cand.type,
+        title: stripHtml(cand.row.subject ?? "", 120),
+        question: evalSources[start + j].question,
+        answer: evalSources[start + j].answer,
+      }));
+      try {
+        const llm = await callOpenAiJson<{
+          results: Array<{ i: number; value: number; reason?: string; label?: string; title?: string }>;
+        }>(c.env, {
+          model: c.env.LLM_MODEL_DEFAULT,
+          system: [
+            "너는 고객상담 지식베이스 큐레이터다. 각 항목이 '표준답변/표준안내글'로 등록할 가치가 있는지 0~1(value)로 평가한다.",
+            "평가 기준(모두 높을수록 고점): 명확성·정확성·재사용성(일반화)·자기완결성.",
+            "저점 사유 예: 개별 고객 특정, 일회성 처리, 불완전·단편 답변, '확인 후 연락드리겠습니다' 류.",
+            "각 항목에 value(0~1), reason(한 줄, PII 없이), label(<=40자 일반 주제 라벨), title(<=60자 제목)을 부여하라.",
+            "type=announce 는 question 이 비어있고 answer 가 안내 본문이다.",
+            '출력 JSON: {"results":[{"i":번호,"value":0~1,"reason":"사유","label":"라벨","title":"제목"}]}',
+            "모든 입력 항목 i 에 대해 정확히 1개 결과를 반환하라.",
+          ].join("\n"),
+          user: JSON.stringify({ items }),
+          maxTokens: Math.min(300 + items.length * 80, 4000),
+          temperature: 0,
+        });
+        llmModel = llm.model;
+        llmPromptTokens += llm.promptTokens;
+        llmCompletionTokens += llm.completionTokens;
+        llmCostUsd += llm.costUsd;
+        llmCalls += 1;
+        for (const res of llm.data.results ?? []) {
+          const idx = Number(res.i);
+          if (!Number.isInteger(idx) || idx < 0 || idx >= chunk.length) continue;
+          const v = typeof res.value === "number" ? res.value : 0;
+          chunk[idx].value = Math.min(Math.max(v, 0), 1);
+          chunk[idx].label = typeof res.label === "string" ? res.label.replace(/\s+/g, " ").trim().slice(0, 40) : undefined;
+          chunk[idx].announceTitle = typeof res.title === "string" ? res.title.replace(/\s+/g, " ").trim().slice(0, 60) : undefined;
+        }
+      } catch (e) {
+        llmError = e instanceof Error ? e.message : String(e);
+      }
+    }
+
+    const survivors: CurCand[] = [];
+    for (const cand of candidates) {
+      if (typeof cand.value !== "number") continue;
+      evaluated += 1;
+      valueSum += cand.value;
+      if (cand.value >= minValue) survivors.push(cand);
+    }
+
+    // ── ④ 중복 제거 — survivors 간 질문/제목 정규화 자카드 ≥ DEDUP_SIM → 대표 1건(value 최고)만 ──
+    survivors.sort((a, b) => (b.value ?? 0) - (a.value ?? 0));
+    const kept: CurCand[] = [];
+    const keptTokens: Array<{ svc: string; tokens: Set<string> }> = [];
+    let deduped = 0;
+    for (const cand of survivors) {
+      const idx = candidates.indexOf(cand);
+      const keyText =
+        cand.type === "qa"
+          ? `${cand.row.subject ?? ""} ${evalSources[idx]?.question ?? ""}`
+          : `${cand.row.subject ?? ""} ${evalSources[idx]?.answer ?? ""}`;
+      const tokens = v3NormTokens(keyText);
+      const svc = cand.serviceSlug ?? "__none";
+      let isDup = false;
+      for (const k of keptTokens) {
+        if (k.svc !== svc) continue;
+        if (v3Jaccard(tokens, k.tokens) >= DEDUP_SIM) {
+          isDup = true;
+          break;
+        }
+      }
+      if (isDup) {
+        deduped += 1;
+        continue;
+      }
+      kept.push(cand);
+      keptTokens.push({ svc, tokens });
+    }
+
+    // ── ⑤ 마스킹(이미지 보존) — 본문을 자산 토큰화(<img>/<a>/<figure>→토큰) 후 텍스트만 마스킹 LLM 에 ──
+    //   마스킹 LLM 입력은 토큰 포함 단락 텍스트. system 에 "⟦HPASSET_n⟧ 토큰 그대로 보존" 지시.
+    //   등록 시 paragraphsToHtmlWithAssets 로 토큰→원본 자산 HTML 복원 + 절대화 → 이미지 보존.
+    let masked = 0;
+    let blockedPii = 0;
+    let maskFailed = 0;
+    let imagesPreserved = 0;
+    const MASK_BATCH = 3;
+    const countImg = (toks: string[] | undefined): number =>
+      (toks ?? []).filter((t) => /<img\b/i.test(t)).length;
+    for (let start = 0; start < kept.length; start += MASK_BATCH) {
+      const chunk = kept.slice(start, start + MASK_BATCH);
+      const items = chunk.map((cand, j) => {
+        const idx = candidates.indexOf(cand);
+        const src = evalSources[idx];
+        if (cand.type === "qa") {
+          const qTok = tokenizeAssets(cand.row.content ?? "");
+          const aTok = tokenizeAssets(src?.rawAnswer ?? "");
+          cand.qTokens = qTok.tokens;
+          cand.aTokens = aTok.tokens;
+          return { i: j, type: "qa", title: stripHtml(cand.row.subject ?? "", 150), question: qTok.text.slice(0, 4000), answer: aTok.text.slice(0, 4500) };
+        }
+        const bTok = tokenizeAssets(cand.row.content ?? "");
+        cand.bodyTokens = bTok.tokens;
+        return { i: j, type: "announce", title: stripHtml(cand.row.subject ?? "", 150), body: bTok.text.slice(0, 5000) };
+      });
+      try {
+        const llm = await callOpenAiJson<{
+          results: Array<{
+            i: number;
+            title?: string;
+            question?: string;
+            answer?: string;
+            body?: string;
+            has_unique_id?: boolean;
+          }>;
+        }>(c.env, {
+          model: c.env.LLM_MODEL_DEFAULT,
+          system: [
+            "너는 고객상담 지식베이스에 등록할 본문에서 개인·업체 식별정보를 마스킹하는 비식별화기다.",
+            "각 항목의 title/question/answer/body 텍스트에서 아래를 마스킹하라(의미·문맥·기술 내용은 보존):",
+            "- 업체명·기관명·고객사명 → ○○○ (예: '△△상사' → '○○○', 'OO공단' → '○○○')",
+            "- 사람 이름 → ○○○ (직함은 보존, 예: '김철수 과장' → '○○○ 과장')",
+            "- 전화·휴대폰·이메일·주소·계좌번호·카드번호·사업자등록번호 → ○○○ (값 전체 치환)",
+            "주민등록번호 등 고유식별정보(여권·운전면허·외국인등록번호 포함)가 있으면 그 값을 제거하고 has_unique_id=true 로 표시하라.",
+            "마스킹할 식별정보가 없으면 원문을 그대로 반환하라. 일반 용어·제품명·메뉴명·기능명은 마스킹하지 마라.",
+            "입력 텍스트의 줄바꿈(\\n)·문단 구조를 그대로 유지하라. 단락을 합치거나 한 줄로 만들지 말고, 원문의 줄 구분을 출력에도 보존하라.",
+            "본문에 ⟦HPASSET_숫자⟧ 형태의 토큰(이미지·링크 자리표시자)이 있으면 그 토큰을 글자 하나도 바꾸지 말고 같은 위치에 그대로 보존하라. 토큰을 번역·삭제·요약하지 마라.",
+            '출력 JSON: {"results":[{"i":번호,"title":"...","question":"...","answer":"...","body":"...","has_unique_id":false}]}',
+            "qa 항목은 title/question/answer, announce 항목은 title/body 를 반환하라. 모든 입력 i 에 정확히 1개 결과.",
+          ].join("\n"),
+          user: JSON.stringify({ items }),
+          maxTokens: Math.min(1200 + items.length * 1800, 12000),
+          temperature: 0,
+          timeoutMs: 55_000,
+        });
+        llmModel = llm.model;
+        llmPromptTokens += llm.promptTokens;
+        llmCompletionTokens += llm.completionTokens;
+        llmCostUsd += llm.costUsd;
+        llmCalls += 1;
+        for (const res of llm.data.results ?? []) {
+          const idx = Number(res.i);
+          if (!Number.isInteger(idx) || idx < 0 || idx >= chunk.length) continue;
+          const cand = chunk[idx];
+          if (res.has_unique_id === true) {
+            cand.blocked = true;
+            continue;
+          }
+          if (typeof res.title === "string" && res.title.trim()) cand.maskedTitle = res.title.trim().slice(0, 150);
+          if (cand.type === "qa") {
+            if (typeof res.question === "string" && res.question.trim()) cand.maskedQuestion = res.question.trim();
+            if (typeof res.answer === "string" && res.answer.trim()) cand.maskedAnswer = res.answer.trim();
+            cand.masked = !!cand.maskedQuestion && !!cand.maskedAnswer;
+          } else {
+            if (typeof res.body === "string" && res.body.trim()) cand.maskedBody = res.body.trim();
+            cand.masked = !!cand.maskedBody;
+          }
+        }
+      } catch (e) {
+        llmError = e instanceof Error ? e.message : String(e);
+      }
+    }
+    for (const cand of kept) {
+      if (cand.blocked) blockedPii += 1;
+      else if (cand.masked) masked += 1;
+      else maskFailed += 1;
+    }
+    const toPanel = kept.filter((cand) => cand.masked && !cand.blocked);
+
+    // ── ⑥ 3관점 패널 승인(cs/planner/it) — 모두≥PANEL_MIN AND 평균≥approveThreshold → approved ──
+    let panelCsSum = 0;
+    let panelPlannerSum = 0;
+    let panelItSum = 0;
+    let panelCount = 0;
+    for (let start = 0; start < toPanel.length; start += BATCH) {
+      const chunk = toPanel.slice(start, start + BATCH);
+      const items = chunk.map((cand, j) => {
+        const idx = candidates.indexOf(cand);
+        const src = evalSources[idx];
+        const qText = cand.type === "qa" ? (cand.maskedQuestion ?? stripHtml(cand.row.content ?? "", 800)) : "";
+        const aText = cand.type === "qa" ? (cand.maskedAnswer ?? stripHtml(src?.rawAnswer ?? "", 900)) : (cand.maskedBody ?? stripHtml(cand.row.content ?? "", 1000));
+        return {
+          i: j,
+          type: cand.type,
+          topic: cand.topicSlug ?? "(미분류)",
+          service: cand.serviceSlug ?? "(공통)",
+          title: cand.maskedTitle ?? stripHtml(cand.row.subject ?? "", 120),
+          question: stripHtml(qText, 700),
+          answer: stripHtml(aText, 900),
+        };
+      });
+      try {
+        const llm = await callOpenAiJson<{
+          results: Array<{ i: number; cs: number; planner: number; it: number; reject?: boolean }>;
+        }>(c.env, {
+          model: c.env.LLM_MODEL_DEFAULT,
+          system: [
+            "너는 표준답변/안내글 후보를 3명의 전문가 페르소나로 동시에 심사하는 승인 패널이다. 각 페르소나가 0~1 점수를 매긴다.",
+            "1) cs (CS 운영자): 고객 실효성·문의 빈도/대표성·상담 톤·완결성·재사용성. 일회성/회피/불완전 답변은 저점.",
+            "2) planner (기획자): 정책 정합·분류(서비스/토픽) 적절성·지식베이스 재사용 가치.",
+            "3) it (IT 전문가): 기술 정확성·최신성(구버전/폐기 기능 안내 아님)·안전성·오해 소지 없음.",
+            "어느 한 관점이라도 '명백히 등록 부적합'(틀린 정보·일회성·심한 미완결·고객 특정으로 일반화 불가)이면 reject=true.",
+            "마스킹은 이미 적용됨(○ 치환). 본문 속 ⟦HPASSET_n⟧ 토큰은 이미지·링크 자리표시자이니 무시하고 평가하라(감점 사유 아님). 남은 식별정보가 보이면 cs 를 낮추고 reject 고려.",
+            '출력 JSON: {"results":[{"i":번호,"cs":0~1,"planner":0~1,"it":0~1,"reject":false}]}',
+            "모든 입력 i 에 정확히 1개 결과를 반환하라.",
+          ].join("\n"),
+          user: JSON.stringify({ items }),
+          maxTokens: Math.min(300 + items.length * 60, 5000),
+          temperature: 0,
+        });
+        llmModel = llm.model;
+        llmPromptTokens += llm.promptTokens;
+        llmCompletionTokens += llm.completionTokens;
+        llmCostUsd += llm.costUsd;
+        llmCalls += 1;
+        for (const res of llm.data.results ?? []) {
+          const idx = Number(res.i);
+          if (!Number.isInteger(idx) || idx < 0 || idx >= chunk.length) continue;
+          const cs = Math.min(Math.max(typeof res.cs === "number" ? res.cs : 0, 0), 1);
+          const planner = Math.min(Math.max(typeof res.planner === "number" ? res.planner : 0, 0), 1);
+          const it = Math.min(Math.max(typeof res.it === "number" ? res.it : 0, 0), 1);
+          chunk[idx].panel = { cs, planner, it, reject: res.reject === true };
+        }
+      } catch (e) {
+        llmError = e instanceof Error ? e.message : String(e);
+      }
+    }
+
+    const registrable: CurCand[] = [];
+    let rejectedByPanel = 0;
+    let notPaneled = 0;
+    for (const cand of toPanel) {
+      const p = cand.panel;
+      if (!p) {
+        notPaneled += 1;
+        continue;
+      }
+      panelCsSum += p.cs;
+      panelPlannerSum += p.planner;
+      panelItSum += p.it;
+      panelCount += 1;
+      if (p.reject) {
+        rejectedByPanel += 1;
+        continue;
+      }
+      const avg = (p.cs + p.planner + p.it) / 3;
+      const allPass = p.cs >= PANEL_MIN && p.planner >= PANEL_MIN && p.it >= PANEL_MIN;
+      cand.approval = allPass && avg >= approveThreshold ? "approved" : "draft";
+      registrable.push(cand);
+    }
+
+    // ── ⑦ 등록 — qa→hp_standard_answer / announce→hp_announce. 마스킹본+자산복원·분류·승인상태. 중복 제외 ──
+    const byService: Record<string, number> = {};
+    const byTopic: Record<string, number> = {};
+    const committed = { qa: 0, announce: 0 };
+    let approvedCount = 0;
+    let draftCount = 0;
+    let withImageCount = 0;
+    const skipped = { already: 0, no_answer: 0, error: 0, mask_failed: maskFailed, blocked_pii: blockedPii, panel_reject: rejectedByPanel, not_paneled: notPaneled };
+
+    function harvestLabelLocal(s: string): string {
+      const t = (s ?? "").replace(/\s+/g, " ").trim();
+      return t.length <= HARVEST_LABEL_MAX ? t : `${t.slice(0, HARVEST_LABEL_MAX - 1)}…`;
+    }
+
+    for (const cand of registrable) {
+      const postId = cand.row.id;
+      const approval = cand.approval ?? "draft";
+      try {
+        const [dupSa] = await conn.query(
+          `SELECT 1 FROM hp_standard_answer WHERE source_post_id = ? AND status = 1 LIMIT 1`,
+          [postId],
+        );
+        const [dupAn] = await conn.query(
+          `SELECT 1 FROM hp_announce WHERE source_post_id = ? AND status = 1 LIMIT 1`,
+          [postId],
+        );
+        if ((dupSa as unknown[]).length > 0 || (dupAn as unknown[]).length > 0) {
+          skipped.already += 1;
+          continue;
+        }
+
+        const scope: SaScope = cand.serviceId != null ? "service" : "common";
+        const svcKey = cand.serviceSlug ?? "__none";
+        const topKey = cand.topicSlug ?? "__none";
+        const rawTitle = String(cand.row.subject ?? "").trim();
+        const approvedBy = approval === "approved" ? "agent-panel" : null;
+        const approvedAtSql = approval === "approved" ? "NOW()" : "NULL";
+
+        if (cand.type === "qa") {
+          const answerSource = cand.maskedAnswer ?? "";
+          const questionSource = cand.maskedQuestion ?? "";
+          if (!answerSource.trim() || !questionSource.trim()) {
+            skipped.no_answer += 1;
+            continue;
+          }
+          const label = (cand.label && cand.label.length > 0 ? cand.label : harvestLabelLocal(cand.maskedTitle ?? rawTitle)) || `문의 #${postId}`;
+          // 마스킹본(\n 보존, 자산 토큰 포함)을 <p> 래핑 → 토큰을 원본 <img>/<a>/<figure> 로 복원 → PMS 자산 절대화.
+          const question = paragraphsToHtmlWithAssets(questionSource, cand.qTokens ?? [], assetBase);
+          const answer = paragraphsToHtmlWithAssets(answerSource, cand.aTokens ?? [], assetBase);
+          const imgN = countImg(cand.qTokens) + countImg(cand.aTokens);
+          imagesPreserved += imgN;
+          if (imgN > 0) withImageCount += 1;
+          await conn.query(
+            `INSERT INTO hp_standard_answer
+               (label, question, answer, project_id, source_post_id, created_by,
+                scope, topic_id, service_id, approval_status, approved_by, approved_at)
+             VALUES (?, ?, ?, ?, ?, 'llm-curator-v3', ?, ?, ?, ?, ?, ${approvedAtSql})`,
+            [label.slice(0, 100), question, answer, cand.row.project_id ?? null, postId, scope, cand.topicId, cand.serviceId, approval, approvedBy],
+          );
+          committed.qa += 1;
+        } else {
+          const bodySource = cand.maskedBody ?? "";
+          if (!bodySource.trim()) {
+            skipped.no_answer += 1;
+            continue;
+          }
+          const bodyText = paragraphsToHtmlWithAssets(bodySource, cand.bodyTokens ?? [], assetBase);
+          const imgN = countImg(cand.bodyTokens);
+          imagesPreserved += imgN;
+          if (imgN > 0) withImageCount += 1;
+          const annTitle = ((cand.maskedTitle ?? (cand.announceTitle && cand.announceTitle.length > 0 ? cand.announceTitle : rawTitle)) || `안내 #${postId}`).slice(0, 150);
+          await conn.query(
+            `INSERT INTO hp_announce
+               (title, label, question, body, source_post_id, created_by,
+                scope, topic_id, service_id, approval_status, approved_by, approved_at)
+             VALUES (?, ?, NULL, ?, ?, 'llm-curator-v3', ?, ?, ?, ?, ?, ${approvedAtSql})`,
+            [annTitle, cand.label ? cand.label.slice(0, 100) : null, bodyText, postId, scope, cand.topicId, cand.serviceId, approval, approvedBy],
+          );
+          committed.announce += 1;
+        }
+        if (approval === "approved") approvedCount += 1;
+        else draftCount += 1;
+        byService[svcKey] = (byService[svcKey] ?? 0) + 1;
+        byTopic[topKey] = (byTopic[topKey] ?? 0) + 1;
+      } catch {
+        skipped.error += 1;
+      }
+    }
+
+    try {
+      await conn.query(
+        `INSERT INTO hp_llm_log
+           (route, entity_type, entity_id, model, prompt_tokens, completion_tokens, cost_usd, latency_ms, cache_hit, error)
+         VALUES (?, 'harvest_curate_v3', 0, ?, ?, ?, ?, ?, 0, ?)`,
+        [route, llmModel ?? "none", llmPromptTokens, llmCompletionTokens, llmCostUsd, Date.now() - t0, llmError],
+      );
+    } catch {
+      // 로그 실패는 응답을 막지 않는다.
+    }
+
+    const committedTotal = committed.qa + committed.announce;
+    const r3 = (n: number) => Math.round(n * 1000) / 1000;
+    return c.json({
+      scanned,
+      candidates: candidates.length,
+      evaluated,
+      survivors: survivors.length,
+      deduped,
+      masked,
+      approved: approvedCount,
+      draft: draftCount,
+      committed,
+      withImage: withImageCount, // 이미지 1개 이상 보존된 등록 건수
+      imagesPreserved,           // 보존된 <img> 총 개수
+      imagePreserveRate: committedTotal > 0 ? r3(withImageCount / committedTotal) : 0,
+      byService,
+      byTopic,
+      panelAvg: {
+        cs: panelCount > 0 ? r3(panelCsSum / panelCount) : 0,
+        planner: panelCount > 0 ? r3(panelPlannerSum / panelCount) : 0,
+        it: panelCount > 0 ? r3(panelItSum / panelCount) : 0,
+      },
+      valueAvg: evaluated > 0 ? r3(valueSum / evaluated) : 0,
+      minValue,
+      approveThreshold,
+      limit,
+      perServiceCap,
+      llmCalls,
+      llmCostUsd: Math.round(llmCostUsd * 1e6) / 1e6,
+      llmModel,
+      llmError,
+      skipped,
+    });
+  }),
+);
 
 // 프로젝트의 게시글 목록 (검색·필터·페이지네이션). 작성자 분류 칩 포함.
 app.get("/pms/projects/:id/posts", async (c) =>
