@@ -524,8 +524,56 @@ function v3Jaccard(a: Set<string>, b: Set<string>): number {
   const union = a.size + b.size - inter;
   return union > 0 ? inter / union : 0;
 }
+// 동시성 제한 배치 실행 — 다수 LLM 배치를 병렬(최대 conc개)로 돌려 wall-clock 단축(Workers 시간한도 회피).
+//   tasks: 각 배치를 처리하는 async 함수 배열. 각 task 내부는 단일 await chain 이라 공유 누적(+=)은 안전(JS 단일 스레드).
+async function runConcurrent(tasks: Array<() => Promise<void>>, conc: number): Promise<void> {
+  let next = 0;
+  const workers = Array.from({ length: Math.min(conc, tasks.length) }, async () => {
+    while (true) {
+      const i = next++;
+      if (i >= tasks.length) break;
+      await tasks[i]();
+    }
+  });
+  await Promise.all(workers);
+}
 app.post("/admin/migrate/harvest-curate-v3", migrateGuard, async (c) =>
   withConn(c, async (conn) => {
+    // ?stats=1 — LLM 없이 현재 v3 누적/이미지 보존 집계만(재개 판단용).
+    if (c.req.query("stats") === "1") {
+      const [saAgg] = await conn.query(
+        `SELECT
+            COUNT(*) AS total,
+            SUM(approval_status='approved') AS approved,
+            SUM(approval_status='draft') AS draft,
+            SUM(answer LIKE '%<img%' OR question LIKE '%<img%') AS with_image
+           FROM hp_standard_answer WHERE status = 1 AND created_by = 'llm-curator-v3'`,
+      );
+      const [anAgg] = await conn.query(
+        `SELECT
+            COUNT(*) AS total,
+            SUM(approval_status='approved') AS approved,
+            SUM(approval_status='draft') AS draft,
+            SUM(body LIKE '%<img%') AS with_image
+           FROM hp_announce WHERE status = 1 AND created_by = 'llm-curator-v3'`,
+      );
+      const sa = (saAgg as Record<string, number>[])[0] ?? {};
+      const an = (anAgg as Record<string, number>[])[0] ?? {};
+      const saTotal = Number(sa.total ?? 0);
+      const anTotal = Number(an.total ?? 0);
+      const saImg = Number(sa.with_image ?? 0);
+      const anImg = Number(an.with_image ?? 0);
+      const tot = saTotal + anTotal;
+      return c.json({
+        stats: true,
+        standard_answer: { total: saTotal, approved: Number(sa.approved ?? 0), draft: Number(sa.draft ?? 0), withImage: saImg },
+        announce: { total: anTotal, approved: Number(an.approved ?? 0), draft: Number(an.draft ?? 0), withImage: anImg },
+        total: tot,
+        approved: Number(sa.approved ?? 0) + Number(an.approved ?? 0),
+        withImage: saImg + anImg,
+        imagePreserveRate: tot > 0 ? Math.round(((saImg + anImg) / tot) * 1000) / 1000 : 0,
+      });
+    }
     if (c.req.query("confirm") !== "yes") return c.json({ error: "add ?confirm=yes" }, 400);
     const t0 = Date.now();
     const route = "POST /admin/migrate/harvest-curate-v3";
@@ -536,8 +584,8 @@ app.post("/admin/migrate/harvest-curate-v3", migrateGuard, async (c) =>
     const qMin = c.req.query("minValue");
     const qApprove = c.req.query("approveThreshold");
     const b = await c.req.json<CurateV3Body>().catch((): CurateV3Body => ({}));
-    // limit 상한 120(청크 멱등 분할).
-    const limit = Math.min(Math.max(Number(qLimit ?? b.limit ?? 120) || 120, 1), 120);
+    // limit 상한 120(청크 멱등 분할). 기본 60 — Workers wall-clock 한도 내 1청크 완주.
+    const limit = Math.min(Math.max(Number(qLimit ?? b.limit ?? 60) || 60, 1), 120);
     const perServiceCap = Math.min(Math.max(Number(qCap ?? b.perServiceCap ?? 160) || 160, 1), 600);
     const minValue = Math.min(Math.max(Number(qMin ?? b.minValue ?? 0.7) || 0.7, 0), 1);
     const approveThreshold = Math.min(Math.max(Number(qApprove ?? b.approveThreshold ?? 0.72) || 0.72, 0), 1);
@@ -740,9 +788,12 @@ app.post("/admin/migrate/harvest-curate-v3", migrateGuard, async (c) =>
     const validTopicSlugs = new Set(topicCatalog.map((t) => t.slug));
     const TOPIC_CONF = 0.6;
 
+    const LLM_CONC = 6; // 동시 LLM 배치 수(병렬)
     if (candidates.length > 0 && topicCatalog.length > 0) {
+      const tasks: Array<() => Promise<void>> = [];
       for (let start = 0; start < candidates.length; start += BATCH) {
         const chunk = candidates.slice(start, start + BATCH);
+        tasks.push(async () => {
         const items = chunk.map((cand, j) => ({
           i: j,
           title: stripHtml(cand.row.subject ?? "", 120),
@@ -787,14 +838,19 @@ app.post("/admin/migrate/harvest-curate-v3", migrateGuard, async (c) =>
         } catch (e) {
           llmError = e instanceof Error ? e.message : String(e);
         }
+        });
       }
+      await runConcurrent(tasks, LLM_CONC);
     }
 
     // ── ③ 가치평가(배치) — value(0~1). value>=minValue 만 다음 단계 ──
     let evaluated = 0;
     let valueSum = 0;
+    {
+    const tasks: Array<() => Promise<void>> = [];
     for (let start = 0; start < candidates.length; start += BATCH) {
       const chunk = candidates.slice(start, start + BATCH);
+      tasks.push(async () => {
       const items = chunk.map((cand, j) => ({
         i: j,
         type: cand.type,
@@ -836,6 +892,9 @@ app.post("/admin/migrate/harvest-curate-v3", migrateGuard, async (c) =>
       } catch (e) {
         llmError = e instanceof Error ? e.message : String(e);
       }
+      });
+    }
+    await runConcurrent(tasks, LLM_CONC);
     }
 
     const survivors: CurCand[] = [];
@@ -885,8 +944,11 @@ app.post("/admin/migrate/harvest-curate-v3", migrateGuard, async (c) =>
     const MASK_BATCH = 3;
     const countImg = (toks: string[] | undefined): number =>
       (toks ?? []).filter((t) => /<img\b/i.test(t)).length;
+    {
+    const tasks: Array<() => Promise<void>> = [];
     for (let start = 0; start < kept.length; start += MASK_BATCH) {
       const chunk = kept.slice(start, start + MASK_BATCH);
+      tasks.push(async () => {
       const items = chunk.map((cand, j) => {
         const idx = candidates.indexOf(cand);
         const src = evalSources[idx];
@@ -957,6 +1019,9 @@ app.post("/admin/migrate/harvest-curate-v3", migrateGuard, async (c) =>
       } catch (e) {
         llmError = e instanceof Error ? e.message : String(e);
       }
+      });
+    }
+    await runConcurrent(tasks, LLM_CONC);
     }
     for (const cand of kept) {
       if (cand.blocked) blockedPii += 1;
@@ -970,8 +1035,11 @@ app.post("/admin/migrate/harvest-curate-v3", migrateGuard, async (c) =>
     let panelPlannerSum = 0;
     let panelItSum = 0;
     let panelCount = 0;
+    {
+    const tasks: Array<() => Promise<void>> = [];
     for (let start = 0; start < toPanel.length; start += BATCH) {
       const chunk = toPanel.slice(start, start + BATCH);
+      tasks.push(async () => {
       const items = chunk.map((cand, j) => {
         const idx = candidates.indexOf(cand);
         const src = evalSources[idx];
@@ -1022,6 +1090,9 @@ app.post("/admin/migrate/harvest-curate-v3", migrateGuard, async (c) =>
       } catch (e) {
         llmError = e instanceof Error ? e.message : String(e);
       }
+      });
+    }
+    await runConcurrent(tasks, LLM_CONC);
     }
 
     const registrable: CurCand[] = [];
@@ -5004,6 +5075,82 @@ app.post("/auth/login", async (c) =>
       httpOnly: true,
       secure: true,
       sameSite: "None", // admin·api가 다른 origin (cross-site)
+      path: "/",
+      maxAge: SESSION_TTL_SECONDS,
+    });
+
+    return c.json({
+      ok: true,
+      user: {
+        id: user.id,
+        loginId: user.login_id,
+        name: user.name,
+        email: user.email,
+        company: user.company,
+        level: user.level,
+      },
+    });
+  }),
+);
+
+/**
+ * GET /auth/sso — 맑은오피스 SSO 핸드오프.
+ * 맑은오피스가 `/slogin?ek=<해시>&id=<email>` 으로 브라우저를 보내고, admin /slogin 이 이 엔드포인트를 호출.
+ * ek = SHA-256( `${email}_${yyyyMMdd(KST)}_MALGNHELPER` ) — 단방향 해시(맑은오피스 m.encrypt(...,"SHA-256")와 동일).
+ * 검증 성공 시 tb_user(email) 직원 계정으로 세션 쿠키(로그인과 동일) 발급.
+ */
+app.get("/auth/sso", async (c) =>
+  withConn(c, async (conn) => {
+    const ek = (c.req.query("ek") ?? "").trim().toLowerCase();
+    const id = (c.req.query("id") ?? "").trim(); // email
+    if (!ek || !id) return c.json({ error: "ek, id 파라미터가 필요합니다." }, 400);
+
+    // 맑은오피스(KST)의 yyyyMMdd 기준. 자정 경계·시차 허용 위해 오늘/어제 모두 대조.
+    const kstYmd = (offsetDays: number) => {
+      const d = new Date(Date.now() + 9 * 3600_000 + offsetDays * 86400_000);
+      return d.toISOString().slice(0, 10).replace(/-/g, "");
+    };
+    const expected = await Promise.all(
+      [0, -1].map((o) => sha256Hex(`${id}_${kstYmd(o)}_MALGNHELPER`)),
+    );
+    if (!expected.some((h) => h.toLowerCase() === ek)) {
+      return c.json({ error: "유효하지 않은 SSO 토큰입니다." }, 401);
+    }
+
+    const [rows] = await conn.query(
+      `SELECT id, login_id, name, email, company, level, status
+         FROM tb_user
+        WHERE email = ? AND status = 1
+        ORDER BY id
+        LIMIT 1`,
+      [id],
+    );
+    const user = (rows as any[])[0];
+    if (!user) return c.json({ error: "등록된 사용자가 아닙니다." }, 403);
+
+    // 직원 검증 (로그인과 동일 — admin 은 직원 전용)
+    const isStaff =
+      (typeof user.email === "string" && user.email.endsWith("@malgnsoft.com")) ||
+      user.company === "맑은소프트";
+    if (!isStaff) return c.json({ error: "맑은소프트 직원 계정만 로그인할 수 있습니다." }, 403);
+
+    const now = Math.floor(Date.now() / 1000);
+    const payload: SessionPayload = {
+      sub: user.id,
+      loginId: user.login_id,
+      name: user.name ?? "",
+      email: user.email ?? "",
+      company: user.company ?? "",
+      level: user.level ?? 0,
+      iat: now,
+      exp: now + SESSION_TTL_SECONDS,
+    };
+    const token = await jwtSign(payload, c.env.JWT_SECRET);
+
+    setCookie(c, SESSION_COOKIE, token, {
+      httpOnly: true,
+      secure: true,
+      sameSite: "None",
       path: "/",
       maxAge: SESSION_TTL_SECONDS,
     });
