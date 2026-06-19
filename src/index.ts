@@ -397,7 +397,7 @@ function jaccard(a: Set<string>, b: Set<string>): number {
   const union = a.size + b.size - inter;
   return union > 0 ? inter / union : 0;
 }
-app.post("/admin/migrate/harvest-curate-v2", async (c) =>
+app.post("/admin/migrate/harvest-curate-v2", requireAuth, requireRole(ROLE_LEVEL.admin), async (c) =>
   withConn(c, async (conn) => {
     if (c.req.query("confirm") !== "yes") return c.json({ error: "add ?confirm=yes" }, 400);
     const t0 = Date.now();
@@ -1053,7 +1053,7 @@ app.post("/admin/migrate/harvest-curate-v2", async (c) =>
 //   ?dry=1 → 대상 건수·샘플만(쓰기 없음). ?limit=&offset= 페이지네이션. 적용 후 라우트 제거 + 재배포 전제.
 //   ⚠ 무인증 일회용. 응답엔 본문 PII 미포함(id·postId·집계만).
 // ───────────────────────────────────────────────────────────────────────────────
-app.post("/admin/migrate/reflow-harvest", async (c) =>
+app.post("/admin/migrate/reflow-harvest", requireAuth, requireRole(ROLE_LEVEL.admin), async (c) =>
   withConn(c, async (conn) => {
     const dry = c.req.query("dry") === "1";
     if (!dry && c.req.query("confirm") !== "yes") {
