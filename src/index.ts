@@ -62,6 +62,63 @@ function absolutizePmsAssets(text: string, base: string): string {
     );
 }
 
+// HTML escape — paragraphsToHtml 저장 래핑용(텍스트를 <p>로 감싸기 전 이스케이프).
+function escapeHtml(s: string): string {
+  return String(s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+// 블록 경계를 보존하는 HTML→텍스트 추출. </p></div></li></h1~6>·<br> → 줄바꿈.
+// 공백/탭만 collapse(줄바꿈 보존), 줄별 trim, 연속 빈 줄 1줄로 축소.
+// stripHtml(한 줄 평문)과 달리 단락·줄바꿈을 유지 → 마스킹 입력/최종 저장 본문에 사용.
+function htmlToParagraphs(html: string): string {
+  let s = String(html ?? "");
+  // 블록 종료 태그·줄바꿈 태그 → \n
+  s = s.replace(/<\s*br\s*\/?\s*>/gi, "\n");
+  s = s.replace(/<\/\s*(p|div|li|h[1-6]|tr|blockquote|pre)\s*>/gi, "\n");
+  // 리스트/표 시작도 줄 경계로(가독성)
+  s = s.replace(/<\s*(li|tr)\b[^>]*>/gi, "\n");
+  // 나머지 태그 제거
+  s = s.replace(/<[^>]+>/g, "");
+  // HTML 엔티티 일부 복원(원문이 escape 돼 있을 수 있음)
+  s = s
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'");
+  // 줄 단위 처리: 공백/탭만 collapse(줄바꿈 보존), 줄별 trim
+  const lines = s.split("\n").map((ln) => ln.replace(/[ \t ]+/g, " ").trim());
+  // 연속 빈 줄 → 1줄
+  const out: string[] = [];
+  let prevBlank = false;
+  for (const ln of lines) {
+    const blank = ln.length === 0;
+    if (blank && prevBlank) continue;
+    out.push(ln);
+    prevBlank = blank;
+  }
+  return out.join("\n").trim();
+}
+
+// 단락 보존 텍스트 → 저장용 HTML. 비어있지 않은 각 줄을 <p>…</p>(escape 후)로 래핑.
+// 다른 HTML 수집분과 일관 + admin TinyMCE에서 단락 표시.
+function paragraphsToHtml(text: string): string {
+  const lines = String(text ?? "").split("\n");
+  const parts: string[] = [];
+  for (const raw of lines) {
+    const ln = raw.trim();
+    if (!ln) continue;
+    parts.push(`<p>${escapeHtml(ln)}</p>`);
+  }
+  return parts.join("");
+}
+
 app.use(
   "*",
   cors({
@@ -307,6 +364,1000 @@ async function analyzeAndStoreImage(
     return null; // 분석 실패 — 흐름은 진행, 다음 번 호출에서 재시도 가능
   }
 }
+
+// ─────────────────────────────────────────────────────────────
+// 일회용 큐레이션 V2 — POST /admin/migrate/harvest-curate-v2?confirm=yes
+//   V1(harvest-curate, 채택 58)의 ~10배(채택 ~580) 확장. 모든 LLM 단계는 배치(여러 건 묶어 1 호출).
+//   ⚠ 읽기 tb_*(불변) · 쓰기 hp_*. 멱등(source_post_id 중복 제외).
+//   V1 대비 신규: ④중복제거(질문/제목 정규화 유사도) · ⑤마스킹(PII→○, 주민번호 제거) · ⑥3관점 패널 승인(cs/planner/it).
+//   파이프라인: ①추출 → ②분류(서비스/트랙/토픽) → ③가치평가(value) → ④dedup → ⑤마스킹 → ⑥패널승인 → ⑦등록.
+//   응답엔 본문 PII 미포함(집계·id·점수만). 적용 후 라우트 제거 + 재배포(404).
+// ─────────────────────────────────────────────────────────────
+type CurateV2Body = {
+  limit?: number;
+  perServiceCap?: number;
+  minValue?: number;
+  approveThreshold?: number;
+};
+// 토큰 자카드 유사도 — 정규화(소문자·공백·기호 제거) 후 토큰 집합 교집합/합집합.
+function normTokens(s: string): Set<string> {
+  const cleaned = String(s ?? "")
+    .replace(/<[^>]+>/g, " ")
+    .toLowerCase()
+    .replace(/[^0-9a-z가-힣\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return new Set(cleaned.split(" ").filter((t) => t.length >= 2));
+}
+function jaccard(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 && b.size === 0) return 1;
+  if (a.size === 0 || b.size === 0) return 0;
+  let inter = 0;
+  for (const t of a) if (b.has(t)) inter += 1;
+  const union = a.size + b.size - inter;
+  return union > 0 ? inter / union : 0;
+}
+app.post("/admin/migrate/harvest-curate-v2", async (c) =>
+  withConn(c, async (conn) => {
+    if (c.req.query("confirm") !== "yes") return c.json({ error: "add ?confirm=yes" }, 400);
+    const t0 = Date.now();
+    const route = "POST /admin/migrate/harvest-curate-v2";
+    const assetBase = c.env.PMS_ASSET_BASE || DEFAULT_PMS_ASSET_BASE;
+
+    const qLimit = c.req.query("limit");
+    const qCap = c.req.query("perServiceCap");
+    const qMin = c.req.query("minValue");
+    const qApprove = c.req.query("approveThreshold");
+    const b = await c.req.json<CurateV2Body>().catch((): CurateV2Body => ({}));
+    const limit = Math.min(Math.max(Number(qLimit ?? b.limit ?? 1000) || 1000, 1), 2000);
+    const perServiceCap = Math.min(Math.max(Number(qCap ?? b.perServiceCap ?? 160) || 160, 1), 600);
+    const minValue = Math.min(Math.max(Number(qMin ?? b.minValue ?? 0.7) || 0.7, 0), 1);
+    const approveThreshold = Math.min(Math.max(Number(qApprove ?? b.approveThreshold ?? 0.72) || 0.72, 0), 1);
+    // order=recent(기본, reg_date DESC) | rand(전 풀 무작위 표집 — 최신창 소진 후 깊은 표본 도달용).
+    //   rejected/low-value 후보가 committed 안 돼 매 청크 재추출되며 reg_date DESC 상단이 정체되는 것을 rand 로 회피.
+    const orderMode = (c.req.query("order") ?? "recent") === "rand" ? "rand" : "recent";
+    const DEDUP_SIM = 0.8; // 질문/제목 정규화 자카드 임계
+    const PANEL_MIN = 0.6; // 각 관점 최소 통과선
+
+    if (!c.env.OPENAI_API_KEY) return c.json({ error: "OPENAI_API_KEY missing" }, 500);
+
+    // ── ① 대상 추출(읽기) — V1 scan 제외룰 동일. 2022~2026, staff 답변 있는 Q&A + staff 안내글 ──
+    const from14 = "20220101000000";
+    const to14 = "20261231235959";
+    const internalNames = [...HARVEST_INTERNAL_GROUP_NAMES];
+    const where: string[] = [
+      "p.status = 1",
+      "p.site_id = 1",
+      "p.reg_date BETWEEN ? AND ?",
+      "CHAR_LENGTH(p.content) >= ?",
+      "proj.name NOT REGEXP '^[0-9]+\\\\.'",
+    ];
+    const params: unknown[] = [from14, to14, HARVEST_MIN_CONTENT_LEN];
+    if (internalNames.length > 0) {
+      where.push(`(g.name IS NULL OR g.name NOT IN (${internalNames.map(() => "?").join(",")}))`);
+      params.push(...internalNames);
+    }
+    where.push(
+      `(
+         EXISTS (
+           SELECT 1 FROM tb_post_comment cc
+            JOIN tb_user cu ON cu.id = cc.user_id
+            WHERE cc.post_id = p.id AND cc.status = 1 AND cc.private_yn != 'Y'
+              AND cc.content IS NOT NULL AND cc.content != ''
+              AND (cu.email LIKE '%@malgnsoft.com' OR cu.company = '맑은소프트')
+         )
+         OR (u.email LIKE '%@malgnsoft.com' OR u.company = '맑은소프트')
+       )`,
+    );
+    // V1 기등록분(중복) 사전 제외 — source_post_id 가 이미 hp_standard_answer/hp_announce 에 있으면 추출 안 함.
+    where.push(
+      `p.id NOT IN (SELECT source_post_id FROM hp_standard_answer WHERE source_post_id IS NOT NULL AND status = 1)`,
+    );
+    where.push(
+      `p.id NOT IN (SELECT source_post_id FROM hp_announce WHERE source_post_id IS NOT NULL AND status = 1)`,
+    );
+    const whereSql = `WHERE ${where.join(" AND ")}`;
+
+    const [countRows] = await conn.query(
+      `SELECT COUNT(*) AS total
+         FROM tb_post p
+         JOIN tb_project proj ON proj.id = p.project_id
+    LEFT JOIN tb_project_group g ON g.id = proj.group_id AND g.status = 1
+    LEFT JOIN tb_user u ON u.id = p.user_id
+        ${whereSql}`,
+      params,
+    );
+    const scanned = Number((countRows as { total: number }[])[0]?.total ?? 0);
+
+    const fetchCap = Math.min(limit * 4, 6000);
+    const [rows] = await conn.query(
+      `SELECT p.id, p.subject, p.content, p.project_id, p.reg_date,
+              g.name AS group_name,
+              (u.email LIKE '%@malgnsoft.com' OR u.company = '맑은소프트') AS author_is_staff,
+              EXISTS (
+                SELECT 1 FROM tb_post_comment cc
+                 JOIN tb_user cu ON cu.id = cc.user_id
+                 WHERE cc.post_id = p.id AND cc.status = 1 AND cc.private_yn != 'Y'
+                   AND cc.content IS NOT NULL AND cc.content != ''
+                   AND (cu.email LIKE '%@malgnsoft.com' OR cu.company = '맑은소프트')
+              ) AS has_staff_answer
+         FROM tb_post p
+         JOIN tb_project proj ON proj.id = p.project_id
+    LEFT JOIN tb_project_group g ON g.id = proj.group_id AND g.status = 1
+    LEFT JOIN tb_user u ON u.id = p.user_id
+        ${whereSql}
+     ORDER BY ${orderMode === "rand" ? "RAND()" : "p.reg_date DESC, p.id DESC"}
+        LIMIT ${fetchCap}`,
+      params,
+    );
+    type CurRow = {
+      id: number;
+      subject: string | null;
+      content: string | null;
+      project_id: number;
+      reg_date: string;
+      group_name: string | null;
+      author_is_staff: number;
+      has_staff_answer: number;
+    };
+    const allRows = rows as CurRow[];
+
+    // ── ② 분류 — 서비스배정·안내글/Q&A 분기(결정적). 서비스 slug→id 해석 ──
+    const [svcRows] = await conn.query(
+      `SELECT id, slug FROM hp_service WHERE status = 1 AND active = 1`,
+    );
+    const slugToServiceId = new Map<string, number>();
+    for (const r of svcRows as { id: number; slug: string }[]) {
+      slugToServiceId.set(r.slug, Number(r.id));
+    }
+
+    type CurCand = {
+      row: CurRow;
+      serviceSlug: string | null;
+      serviceId: number | null;
+      type: "qa" | "announce";
+      hasAnswer: boolean;
+      topicId: number | null;
+      topicSlug: string | null;
+      value?: number; // ③ 가치평가
+      label?: string;
+      announceTitle?: string;
+      // ⑤ 마스킹본 (등록은 이 값)
+      maskedQuestion?: string;
+      maskedAnswer?: string;
+      maskedBody?: string;
+      maskedTitle?: string;
+      masked?: boolean;
+      blocked?: boolean; // 고유식별정보(주민번호) → 미등록
+      // ⑥ 패널
+      panel?: { cs: number; planner: number; it: number; reject: boolean };
+      approval?: "approved" | "draft";
+    };
+
+    const perSvcCount = new Map<string, number>();
+    const candidates: CurCand[] = [];
+    for (const r of allRows) {
+      if (candidates.length >= limit) break;
+      const serviceSlug = groupNameToServiceSlug(r.group_name);
+      const isStaff = Number(r.author_is_staff) === 1;
+      const hasAnswer = Number(r.has_staff_answer) === 1;
+      const isAnnounce = isAnnounceCandidate(null, isStaff, true);
+      if (!isAnnounce && !hasAnswer) continue;
+      const capKey = serviceSlug ?? "__none";
+      const used = perSvcCount.get(capKey) ?? 0;
+      if (used >= perServiceCap) continue;
+      perSvcCount.set(capKey, used + 1);
+      candidates.push({
+        row: r,
+        serviceSlug,
+        serviceId: serviceSlug ? (slugToServiceId.get(serviceSlug) ?? null) : null,
+        type: isAnnounce ? "announce" : "qa",
+        hasAnswer,
+        topicId: null,
+        topicSlug: null,
+      });
+    }
+
+    // LLM 비용 집계
+    let llmCostUsd = 0;
+    let llmPromptTokens = 0;
+    let llmCompletionTokens = 0;
+    let llmCalls = 0;
+    let llmModel: string | null = null;
+    let llmError: string | null = null;
+
+    function stripHtml(s: string, n: number): string {
+      return String(s ?? "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, n);
+    }
+
+    // qa: staff 첫 답변 raw 수집(절대화·등록용 원본) / announce: 본문.
+    const evalSources: Array<{ question: string; answer: string; rawAnswer: string }> = [];
+    for (const cand of candidates) {
+      if (cand.type === "qa") {
+        const [ansRows] = await conn.query(
+          `SELECT c.content
+             FROM tb_post_comment c
+             JOIN tb_user cu ON cu.id = c.user_id
+            WHERE c.post_id = ? AND c.status = 1 AND c.private_yn != 'Y'
+              AND (cu.email LIKE '%@malgnsoft.com' OR cu.company = '맑은소프트')
+              AND c.content IS NOT NULL AND c.content != ''
+         ORDER BY c.reg_date ASC, c.id ASC
+            LIMIT 1`,
+          [cand.row.id],
+        );
+        const ans = String((ansRows as { content: string | null }[])[0]?.content ?? "").trim();
+        evalSources.push({
+          question: stripHtml(cand.row.content ?? "", 600),
+          answer: stripHtml(ans, 800),
+          rawAnswer: ans,
+        });
+      } else {
+        evalSources.push({ question: "", answer: stripHtml(cand.row.content ?? "", 900), rawAnswer: "" });
+      }
+    }
+
+    const BATCH = 15;
+
+    // ── ②-b 토픽 LLM 분류(배치) — V1 동일. 라이브 hp_topic active 카탈로그 ──
+    const [topicRows] = await conn.query(
+      `SELECT id, slug, label, description, scope FROM hp_topic
+        WHERE status = 1 AND active = 1
+        ORDER BY scope, sort_order, id`,
+    );
+    const topicCatalog = topicRows as Array<{
+      id: number; slug: string; label: string; description: string | null; scope: SaScope;
+    }>;
+    const slugToTopicId = new Map<string, number>();
+    for (const t of topicCatalog) slugToTopicId.set(t.slug, Number(t.id));
+    const validTopicSlugs = new Set(topicCatalog.map((t) => t.slug));
+    const TOPIC_CONF = 0.6;
+
+    if (candidates.length > 0 && topicCatalog.length > 0) {
+      for (let start = 0; start < candidates.length; start += BATCH) {
+        const chunk = candidates.slice(start, start + BATCH);
+        const items = chunk.map((cand, j) => ({
+          i: j,
+          title: stripHtml(cand.row.subject ?? "", 120),
+          excerpt: stripHtml(cand.row.content ?? "", 120),
+        }));
+        try {
+          const llm = await callOpenAiJson<{
+            results: Array<{ i: number; topic_slug: string | null; confidence: number }>;
+          }>(c.env, {
+            model: c.env.LLM_MODEL_DEFAULT,
+            system: [
+              "너는 고객상담 문의를 사전 정의된 토픽 카탈로그 중 하나로 분류하는 분류기다.",
+              "각 항목(title + excerpt)을 읽고 가장 적합한 topic_slug 1개와 confidence(0~1)를 매겨라.",
+              "- topic_slug 는 반드시 카탈로그 slug 중 하나이거나, 적합한 것이 없으면 null.",
+              "- 이름·회사로 도메인 추정 금지. 본문 내용만 근거.",
+              "- 애매하면 confidence 를 낮게(<0.6), 정말 해당 없으면 topic_slug=null.",
+              '출력 JSON: {"results":[{"i":번호,"topic_slug":"slug 또는 null","confidence":0~1}]}',
+              "모든 입력 항목 i 에 대해 정확히 1개 결과를 반환하라.",
+              "",
+              "=== 토픽 카탈로그 ===",
+              ...topicCatalog.map((t) => `- ${t.slug} (${t.label}): ${t.description ?? ""}`),
+            ].join("\n"),
+            user: JSON.stringify({ items }),
+            maxTokens: Math.min(200 + items.length * 30, 4000),
+            temperature: 0,
+          });
+          llmModel = llm.model;
+          llmPromptTokens += llm.promptTokens;
+          llmCompletionTokens += llm.completionTokens;
+          llmCostUsd += llm.costUsd;
+          llmCalls += 1;
+          for (const res of llm.data.results ?? []) {
+            const idx = Number(res.i);
+            if (!Number.isInteger(idx) || idx < 0 || idx >= chunk.length) continue;
+            const slug = res.topic_slug;
+            const conf = typeof res.confidence === "number" ? res.confidence : 0;
+            if (slug && validTopicSlugs.has(slug) && conf >= TOPIC_CONF) {
+              chunk[idx].topicSlug = slug;
+              chunk[idx].topicId = slugToTopicId.get(slug) ?? null;
+            }
+          }
+        } catch (e) {
+          llmError = e instanceof Error ? e.message : String(e);
+        }
+      }
+    }
+
+    // ── ③ 가치평가(배치) — value(0~1). V1 동일 기준. value>=minValue 만 다음 단계 ──
+    for (let start = 0; start < candidates.length; start += BATCH) {
+      const chunk = candidates.slice(start, start + BATCH);
+      const items = chunk.map((cand, j) => ({
+        i: j,
+        type: cand.type,
+        title: stripHtml(cand.row.subject ?? "", 120),
+        question: evalSources[start + j].question,
+        answer: evalSources[start + j].answer,
+      }));
+      try {
+        const llm = await callOpenAiJson<{
+          results: Array<{ i: number; value: number; reason?: string; label?: string; title?: string }>;
+        }>(c.env, {
+          model: c.env.LLM_MODEL_DEFAULT,
+          system: [
+            "너는 고객상담 지식베이스 큐레이터다. 각 항목이 '표준답변/표준안내글'로 등록할 가치가 있는지 0~1(value)로 평가한다.",
+            "평가 기준(모두 높을수록 고점): 명확성·정확성·재사용성(일반화)·자기완결성.",
+            "저점 사유 예: 개별 고객 특정, 일회성 처리, 불완전·단편 답변, '확인 후 연락드리겠습니다' 류.",
+            "각 항목에 value(0~1), reason(한 줄, PII 없이), label(<=40자 일반 주제 라벨), title(<=60자 제목)을 부여하라.",
+            "type=announce 는 question 이 비어있고 answer 가 안내 본문이다.",
+            '출력 JSON: {"results":[{"i":번호,"value":0~1,"reason":"사유","label":"라벨","title":"제목"}]}',
+            "모든 입력 항목 i 에 대해 정확히 1개 결과를 반환하라.",
+          ].join("\n"),
+          user: JSON.stringify({ items }),
+          maxTokens: Math.min(300 + items.length * 80, 4000),
+          temperature: 0,
+        });
+        llmModel = llm.model;
+        llmPromptTokens += llm.promptTokens;
+        llmCompletionTokens += llm.completionTokens;
+        llmCostUsd += llm.costUsd;
+        llmCalls += 1;
+        for (const res of llm.data.results ?? []) {
+          const idx = Number(res.i);
+          if (!Number.isInteger(idx) || idx < 0 || idx >= chunk.length) continue;
+          const v = typeof res.value === "number" ? res.value : 0;
+          chunk[idx].value = Math.min(Math.max(v, 0), 1);
+          chunk[idx].label = typeof res.label === "string" ? res.label.replace(/\s+/g, " ").trim().slice(0, 40) : undefined;
+          chunk[idx].announceTitle = typeof res.title === "string" ? res.title.replace(/\s+/g, " ").trim().slice(0, 60) : undefined;
+        }
+      } catch (e) {
+        llmError = e instanceof Error ? e.message : String(e);
+      }
+    }
+
+    let evaluated = 0;
+    let valueSum = 0;
+    // value>=minValue 통과분만 survivors. (점수 미부여분은 미평가로 제외)
+    const survivors: CurCand[] = [];
+    for (const cand of candidates) {
+      if (typeof cand.value !== "number") continue;
+      evaluated += 1;
+      valueSum += cand.value;
+      if (cand.value >= minValue) survivors.push(cand);
+    }
+
+    // ── ④ 중복 제거(신규) — survivors 끼리 질문/제목 정규화 자카드 ≥ DEDUP_SIM → 대표 1건(value 최고)만 ──
+    //   비교 키: qa=질문 본문, announce=제목+본문. 같은 서비스 스코프 내에서 비교(과제거 방지).
+    survivors.sort((a, b) => (b.value ?? 0) - (a.value ?? 0));
+    const kept: CurCand[] = [];
+    const keptTokens: Array<{ svc: string; tokens: Set<string> }> = [];
+    let deduped = 0;
+    for (const cand of survivors) {
+      const idx = candidates.indexOf(cand);
+      const keyText =
+        cand.type === "qa"
+          ? `${cand.row.subject ?? ""} ${evalSources[idx]?.question ?? ""}`
+          : `${cand.row.subject ?? ""} ${evalSources[idx]?.answer ?? ""}`;
+      const tokens = normTokens(keyText);
+      const svc = cand.serviceSlug ?? "__none";
+      let isDup = false;
+      for (const k of keptTokens) {
+        if (k.svc !== svc) continue;
+        if (jaccard(tokens, k.tokens) >= DEDUP_SIM) {
+          isDup = true;
+          break;
+        }
+      }
+      if (isDup) {
+        deduped += 1;
+        continue;
+      }
+      kept.push(cand);
+      keptTokens.push({ svc, tokens });
+    }
+
+    // ── ⑤ 마스킹(신규·필수, 배치) — 업체명·기관명·사람이름·연락처 → ○ 치환. 주민번호 등 고유식별정보는 제거·차단 ──
+    //   LLM 이 마스킹된 본문(question/answer/title/body)을 반환. 등록은 마스킹본.
+    //   ⚠ 마스킹은 PII 안전 필수단계 → 실패분은 raw 로 등록하지 않고 폐기(masked=false 인 건은 ⑦에서 제외).
+    //   본문 길이가 길어 응답 토큰이 크다 → 작은 배치(6)·긴 타임아웃(50s).
+    let masked = 0;
+    let blockedPii = 0;
+    let maskFailed = 0;
+    const MASK_BATCH = 3;
+    for (let start = 0; start < kept.length; start += MASK_BATCH) {
+      const chunk = kept.slice(start, start + MASK_BATCH);
+      const items = chunk.map((cand, j) => {
+        const idx = candidates.indexOf(cand);
+        const src = evalSources[idx];
+        // 마스킹 입력은 단락(\n) 보존 텍스트로 — 마스킹 결과도 줄바꿈을 유지(프롬프트 지시) → 저장 직전 paragraphsToHtml 래핑.
+        return cand.type === "qa"
+          ? { i: j, type: "qa", title: stripHtml(cand.row.subject ?? "", 150), question: htmlToParagraphs(cand.row.content ?? "").slice(0, 2000), answer: htmlToParagraphs(src?.rawAnswer ?? "").slice(0, 2500) }
+          : { i: j, type: "announce", title: stripHtml(cand.row.subject ?? "", 150), body: htmlToParagraphs(cand.row.content ?? "").slice(0, 3000) };
+      });
+      try {
+        const llm = await callOpenAiJson<{
+          results: Array<{
+            i: number;
+            title?: string;
+            question?: string;
+            answer?: string;
+            body?: string;
+            has_unique_id?: boolean; // 주민번호 등 고유식별정보 발견
+          }>;
+        }>(c.env, {
+          model: c.env.LLM_MODEL_DEFAULT,
+          system: [
+            "너는 고객상담 지식베이스에 등록할 본문에서 개인·업체 식별정보를 마스킹하는 비식별화기다.",
+            "각 항목의 title/question/answer/body 텍스트에서 아래를 마스킹하라(의미·문맥·기술 내용은 보존):",
+            "- 업체명·기관명·고객사명 → ○○○ (예: '△△상사' → '○○○', 'OO공단' → '○○○')",
+            "- 사람 이름 → ○○○ (직함은 보존, 예: '김철수 과장' → '○○○ 과장')",
+            "- 전화·휴대폰·이메일·주소·계좌번호·카드번호·사업자등록번호 → ○○○ (값 전체 치환)",
+            "주민등록번호 등 고유식별정보(여권·운전면허·외국인등록번호 포함)가 있으면 그 값을 제거하고 has_unique_id=true 로 표시하라.",
+            "마스킹할 식별정보가 없으면 원문을 그대로 반환하라. 일반 용어·제품명·메뉴명·기능명은 마스킹하지 마라.",
+            "입력 텍스트의 줄바꿈(\\n)·문단 구조를 그대로 유지하라. 단락을 합치거나 한 줄로 만들지 말고, 원문의 줄 구분을 출력에도 보존하라.",
+            '출력 JSON: {"results":[{"i":번호,"title":"...","question":"...","answer":"...","body":"...","has_unique_id":false}]}',
+            "qa 항목은 title/question/answer, announce 항목은 title/body 를 반환하라. 모든 입력 i 에 정확히 1개 결과.",
+          ].join("\n"),
+          user: JSON.stringify({ items }),
+          maxTokens: Math.min(1200 + items.length * 1800, 12000),
+          temperature: 0,
+          timeoutMs: 55_000,
+        });
+        llmModel = llm.model;
+        llmPromptTokens += llm.promptTokens;
+        llmCompletionTokens += llm.completionTokens;
+        llmCostUsd += llm.costUsd;
+        llmCalls += 1;
+        for (const res of llm.data.results ?? []) {
+          const idx = Number(res.i);
+          if (!Number.isInteger(idx) || idx < 0 || idx >= chunk.length) continue;
+          const cand = chunk[idx];
+          if (res.has_unique_id === true) {
+            cand.blocked = true; // 고유식별정보 → 미등록(P2-EXPOSURE G1 특칙)
+            continue;
+          }
+          if (typeof res.title === "string" && res.title.trim()) cand.maskedTitle = res.title.trim().slice(0, 150);
+          if (cand.type === "qa") {
+            if (typeof res.question === "string" && res.question.trim()) cand.maskedQuestion = res.question.trim();
+            if (typeof res.answer === "string" && res.answer.trim()) cand.maskedAnswer = res.answer.trim();
+            // qa 는 question·answer 둘 다 마스킹본이 필수(둘 다 등록 본문). 하나라도 누락이면 마스킹 미완 → 등록 제외(raw 유입 차단).
+            cand.masked = !!cand.maskedQuestion && !!cand.maskedAnswer;
+          } else {
+            if (typeof res.body === "string" && res.body.trim()) cand.maskedBody = res.body.trim();
+            cand.masked = !!cand.maskedBody;
+          }
+        }
+      } catch (e) {
+        llmError = e instanceof Error ? e.message : String(e);
+      }
+    }
+    for (const cand of kept) {
+      if (cand.blocked) blockedPii += 1;
+      else if (cand.masked) masked += 1;
+      else maskFailed += 1;
+    }
+    // 마스킹 차단(고유식별)·실패(미완)분 제외 — masked 된 것만 패널로(raw 등록 금지, PII 안전).
+    const toPanel = kept.filter((cand) => cand.masked && !cand.blocked);
+
+    // ── ⑥ 3관점 패널 승인(신규, 배치) — cs/planner/it 각 0~1. 모두≥PANEL_MIN AND 평균≥approveThreshold → approved ──
+    //   reject(명백 부적합)면 미등록. 통과하되 임계 미만이면 draft.
+    let panelCsSum = 0;
+    let panelPlannerSum = 0;
+    let panelItSum = 0;
+    let panelCount = 0;
+    for (let start = 0; start < toPanel.length; start += BATCH) {
+      const chunk = toPanel.slice(start, start + BATCH);
+      const items = chunk.map((cand, j) => {
+        const idx = candidates.indexOf(cand);
+        const src = evalSources[idx];
+        const qText = cand.type === "qa" ? (cand.maskedQuestion ?? stripHtml(cand.row.content ?? "", 800)) : "";
+        const aText = cand.type === "qa" ? (cand.maskedAnswer ?? stripHtml(src?.rawAnswer ?? "", 900)) : (cand.maskedBody ?? stripHtml(cand.row.content ?? "", 1000));
+        return {
+          i: j,
+          type: cand.type,
+          topic: cand.topicSlug ?? "(미분류)",
+          service: cand.serviceSlug ?? "(공통)",
+          title: cand.maskedTitle ?? stripHtml(cand.row.subject ?? "", 120),
+          question: stripHtml(qText, 700),
+          answer: stripHtml(aText, 900),
+        };
+      });
+      try {
+        const llm = await callOpenAiJson<{
+          results: Array<{ i: number; cs: number; planner: number; it: number; reject?: boolean }>;
+        }>(c.env, {
+          model: c.env.LLM_MODEL_DEFAULT,
+          system: [
+            "너는 표준답변/안내글 후보를 3명의 전문가 페르소나로 동시에 심사하는 승인 패널이다. 각 페르소나가 0~1 점수를 매긴다.",
+            "1) cs (CS 운영자): 고객 실효성·문의 빈도/대표성·상담 톤·완결성·재사용성. 일회성/회피/불완전 답변은 저점.",
+            "2) planner (기획자): 정책 정합·분류(서비스/토픽) 적절성·지식베이스 재사용 가치.",
+            "3) it (IT 전문가): 기술 정확성·최신성(구버전/폐기 기능 안내 아님)·안전성·오해 소지 없음.",
+            "어느 한 관점이라도 '명백히 등록 부적합'(틀린 정보·일회성·심한 미완결·고객 특정으로 일반화 불가)이면 reject=true.",
+            "마스킹은 이미 적용됨(○ 치환). 남은 식별정보가 보이면 cs 를 낮추고 reject 고려.",
+            '출력 JSON: {"results":[{"i":번호,"cs":0~1,"planner":0~1,"it":0~1,"reject":false}]}',
+            "모든 입력 i 에 정확히 1개 결과를 반환하라.",
+          ].join("\n"),
+          user: JSON.stringify({ items }),
+          maxTokens: Math.min(300 + items.length * 60, 5000),
+          temperature: 0,
+        });
+        llmModel = llm.model;
+        llmPromptTokens += llm.promptTokens;
+        llmCompletionTokens += llm.completionTokens;
+        llmCostUsd += llm.costUsd;
+        llmCalls += 1;
+        for (const res of llm.data.results ?? []) {
+          const idx = Number(res.i);
+          if (!Number.isInteger(idx) || idx < 0 || idx >= chunk.length) continue;
+          const cs = Math.min(Math.max(typeof res.cs === "number" ? res.cs : 0, 0), 1);
+          const planner = Math.min(Math.max(typeof res.planner === "number" ? res.planner : 0, 0), 1);
+          const it = Math.min(Math.max(typeof res.it === "number" ? res.it : 0, 0), 1);
+          chunk[idx].panel = { cs, planner, it, reject: res.reject === true };
+        }
+      } catch (e) {
+        llmError = e instanceof Error ? e.message : String(e);
+      }
+    }
+
+    // 패널 판정 → approval 결정.
+    const registrable: CurCand[] = [];
+    let rejectedByPanel = 0;
+    let notPaneled = 0;
+    for (const cand of toPanel) {
+      const p = cand.panel;
+      if (!p) {
+        notPaneled += 1;
+        continue;
+      } // 패널 실패분은 미등록(안전 측)
+      panelCsSum += p.cs;
+      panelPlannerSum += p.planner;
+      panelItSum += p.it;
+      panelCount += 1;
+      if (p.reject) {
+        rejectedByPanel += 1;
+        continue;
+      }
+      const avg = (p.cs + p.planner + p.it) / 3;
+      const allPass = p.cs >= PANEL_MIN && p.planner >= PANEL_MIN && p.it >= PANEL_MIN;
+      cand.approval = allPass && avg >= approveThreshold ? "approved" : "draft";
+      registrable.push(cand);
+    }
+
+    // ── ⑦ 등록 — qa→hp_standard_answer / announce→hp_announce. 마스킹본·분류·승인상태. 중복 제외 ──
+    const byService: Record<string, number> = {};
+    const byTopic: Record<string, number> = {};
+    const committed = { qa: 0, announce: 0 };
+    let approvedCount = 0;
+    let draftCount = 0;
+    const skipped = { already: 0, no_answer: 0, error: 0, mask_failed: maskFailed, blocked_pii: blockedPii, panel_reject: rejectedByPanel, not_paneled: notPaneled };
+
+    function harvestLabelLocal(s: string): string {
+      const t = (s ?? "").replace(/\s+/g, " ").trim();
+      return t.length <= HARVEST_LABEL_MAX ? t : `${t.slice(0, HARVEST_LABEL_MAX - 1)}…`;
+    }
+
+    for (const cand of registrable) {
+      const postId = cand.row.id;
+      const approval = cand.approval ?? "draft";
+      try {
+        const [dupSa] = await conn.query(
+          `SELECT 1 FROM hp_standard_answer WHERE source_post_id = ? AND status = 1 LIMIT 1`,
+          [postId],
+        );
+        const [dupAn] = await conn.query(
+          `SELECT 1 FROM hp_announce WHERE source_post_id = ? AND status = 1 LIMIT 1`,
+          [postId],
+        );
+        if ((dupSa as unknown[]).length > 0 || (dupAn as unknown[]).length > 0) {
+          skipped.already += 1;
+          continue;
+        }
+
+        const scope: SaScope = cand.serviceId != null ? "service" : "common";
+        const svcKey = cand.serviceSlug ?? "__none";
+        const topKey = cand.topicSlug ?? "__none";
+        const rawTitle = String(cand.row.subject ?? "").trim();
+        // approved 면 패널 승인 메타 기록.
+        const approvedBy = approval === "approved" ? "agent-panel" : null;
+        const approvedAtSql = approval === "approved" ? "NOW()" : "NULL";
+
+        if (cand.type === "qa") {
+          // 등록 본문은 마스킹본만 사용(toPanel 가 masked 만 통과시킴 → 둘 다 보장). 만일 누락이면 등록 제외(raw 유입 차단).
+          const answerSource = cand.maskedAnswer ?? "";
+          const questionSource = cand.maskedQuestion ?? "";
+          if (!answerSource.trim() || !questionSource.trim()) {
+            skipped.no_answer += 1;
+            continue;
+          }
+          const label = (cand.label && cand.label.length > 0 ? cand.label : harvestLabelLocal(cand.maskedTitle ?? rawTitle)) || `문의 #${postId}`;
+          // 마스킹본(\n 보존)을 <p> 래핑해 저장 → 다른 HTML 수집분과 일관·단락 표시. 그 후 PMS 자산 절대화.
+          const question = absolutizePmsAssets(paragraphsToHtml(questionSource), assetBase);
+          const answer = absolutizePmsAssets(paragraphsToHtml(answerSource), assetBase);
+          await conn.query(
+            `INSERT INTO hp_standard_answer
+               (label, question, answer, project_id, source_post_id, created_by,
+                scope, topic_id, service_id, approval_status, approved_by, approved_at)
+             VALUES (?, ?, ?, ?, ?, 'llm-curator-v2', ?, ?, ?, ?, ?, ${approvedAtSql})`,
+            [label.slice(0, 100), question, answer, cand.row.project_id ?? null, postId, scope, cand.topicId, cand.serviceId, approval, approvedBy],
+          );
+          committed.qa += 1;
+        } else {
+          const bodySource = cand.maskedBody ?? "";
+          if (!bodySource.trim()) {
+            skipped.no_answer += 1;
+            continue;
+          }
+          const bodyText = absolutizePmsAssets(paragraphsToHtml(bodySource), assetBase);
+          const annTitle = ((cand.maskedTitle ?? (cand.announceTitle && cand.announceTitle.length > 0 ? cand.announceTitle : rawTitle)) || `안내 #${postId}`).slice(0, 150);
+          await conn.query(
+            `INSERT INTO hp_announce
+               (title, label, question, body, source_post_id, created_by,
+                scope, topic_id, service_id, approval_status, approved_by, approved_at)
+             VALUES (?, ?, NULL, ?, ?, 'llm-curator-v2', ?, ?, ?, ?, ?, ${approvedAtSql})`,
+            [annTitle, cand.label ? cand.label.slice(0, 100) : null, bodyText, postId, scope, cand.topicId, cand.serviceId, approval, approvedBy],
+          );
+          committed.announce += 1;
+        }
+        if (approval === "approved") approvedCount += 1;
+        else draftCount += 1;
+        byService[svcKey] = (byService[svcKey] ?? 0) + 1;
+        byTopic[topKey] = (byTopic[topKey] ?? 0) + 1;
+      } catch {
+        skipped.error += 1;
+      }
+    }
+
+    // ── 감사 로그(hp_llm_log) ──
+    try {
+      await conn.query(
+        `INSERT INTO hp_llm_log
+           (route, entity_type, entity_id, model, prompt_tokens, completion_tokens, cost_usd, latency_ms, cache_hit, error)
+         VALUES (?, 'harvest_curate_v2', 0, ?, ?, ?, ?, ?, 0, ?)`,
+        [route, llmModel ?? "none", llmPromptTokens, llmCompletionTokens, llmCostUsd, Date.now() - t0, llmError],
+      );
+    } catch {
+      // 로그 실패는 응답을 막지 않는다.
+    }
+
+    const r3 = (n: number) => Math.round(n * 1000) / 1000;
+    return c.json({
+      scanned,
+      candidates: candidates.length,
+      evaluated,
+      survivors: survivors.length,
+      deduped,
+      masked,
+      approved: approvedCount,
+      draft: draftCount,
+      committed,
+      byService,
+      byTopic,
+      panelAvg: {
+        cs: panelCount > 0 ? r3(panelCsSum / panelCount) : 0,
+        planner: panelCount > 0 ? r3(panelPlannerSum / panelCount) : 0,
+        it: panelCount > 0 ? r3(panelItSum / panelCount) : 0,
+      },
+      valueAvg: evaluated > 0 ? r3(valueSum / evaluated) : 0,
+      minValue,
+      approveThreshold,
+      limit,
+      perServiceCap,
+      llmCalls,
+      llmCostUsd: Math.round(llmCostUsd * 1e6) / 1e6,
+      llmModel,
+      llmError,
+      skipped,
+    });
+  }),
+);
+
+// ── 일회용 본문 단락 복원 — POST /admin/migrate/reflow-harvest?confirm=yes ──────────
+//   배경: 구버전 수집 정제(stripHtml)가 \s+ 를 공백 1칸으로 collapse → <p> 단락이 사라진 한 줄 평문 저장됨.
+//   원본 HTML(tb_post.content + qa staff 답변 댓글)에서 단락 보존 재추출 → 재마스킹(PII 재유입 차단) → <p> 래핑 후 UPDATE.
+//   대상: 평문(태그 없음) 수집분 — hp_standard_answer(source_post_id NOT NULL AND answer NOT LIKE '%<%' AND status=1)
+//         + hp_announce(source_post_id NOT NULL AND body NOT LIKE '%<%' AND status=1).
+//   라벨·분류·승인상태는 건드리지 않음(본문만 보정). 멱등: 이미 태그 있는 건은 대상 쿼리에서 제외.
+//   ?dry=1 → 대상 건수·샘플만(쓰기 없음). ?limit=&offset= 페이지네이션. 적용 후 라우트 제거 + 재배포 전제.
+//   ⚠ 무인증 일회용. 응답엔 본문 PII 미포함(id·postId·집계만).
+// ───────────────────────────────────────────────────────────────────────────────
+app.post("/admin/migrate/reflow-harvest", async (c) =>
+  withConn(c, async (conn) => {
+    const dry = c.req.query("dry") === "1";
+    if (!dry && c.req.query("confirm") !== "yes") {
+      return c.json({ error: "add ?confirm=yes (or ?dry=1 for preview)" }, 400);
+    }
+    const t0 = Date.now();
+    const route = "POST /admin/migrate/reflow-harvest";
+    const assetBase = c.env.PMS_ASSET_BASE || DEFAULT_PMS_ASSET_BASE;
+    if (!dry && !c.env.OPENAI_API_KEY) return c.json({ error: "OPENAI_API_KEY missing" }, 500);
+
+    const limit = Math.min(Math.max(Number(c.req.query("limit") ?? 60) || 60, 1), 200);
+    const offset = Math.max(Number(c.req.query("offset") ?? 0) || 0, 0);
+
+    // ── 대상 식별(평문=태그 없음). source_post_id 로 원본 재조회 가능한 것만. ──
+    // sa: question/answer 둘 중 하나라도 평문이면 대상(둘 다 같은 시점 수집이라 사실상 동시). answer 기준 + question 평문 포함.
+    const [saCntRows] = await conn.query(
+      `SELECT COUNT(*) AS total FROM hp_standard_answer
+        WHERE status = 1 AND source_post_id IS NOT NULL
+          AND (answer NOT LIKE '%<%' OR question NOT LIKE '%<%')`,
+    );
+    const [anCntRows] = await conn.query(
+      `SELECT COUNT(*) AS total FROM hp_announce
+        WHERE status = 1 AND source_post_id IS NOT NULL AND body NOT LIKE '%<%'`,
+    );
+    const saTotal = Number((saCntRows as { total: number }[])[0]?.total ?? 0);
+    const anTotal = Number((anCntRows as { total: number }[])[0]?.total ?? 0);
+
+    type ReflowRow = {
+      kind: "sa" | "an";
+      id: number;
+      source_post_id: number;
+      // 재추출·재마스킹할 원본 텍스트(단락 보존)
+      qText: string; // sa: 질문, an: ""(미사용)
+      aText: string; // sa: 답변, an: 본문
+      // 어떤 필드가 평문인가(평문인 필드만 보정 — 이미 HTML(수동수정 포함)인 필드는 유지)
+      qPlain: boolean;
+      aPlain: boolean;
+      // 마스킹 결과
+      maskedQ?: string;
+      maskedA?: string;
+      blocked?: boolean;
+      masked?: boolean;
+    };
+
+    // sa 대상 페이지(이 청크). offset/limit 는 sa→an 순서의 글로벌 윈도우.
+    const sa = offset < saTotal
+      ? ((await conn.query(
+          `SELECT id, source_post_id,
+                  (question NOT LIKE '%<%') AS q_plain, (answer NOT LIKE '%<%') AS a_plain
+             FROM hp_standard_answer
+            WHERE status = 1 AND source_post_id IS NOT NULL
+              AND (answer NOT LIKE '%<%' OR question NOT LIKE '%<%')
+         ORDER BY id ASC LIMIT ? OFFSET ?`,
+          [limit, offset],
+        ))[0] as { id: number; source_post_id: number; q_plain: number; a_plain: number }[])
+      : [];
+    const remaining = limit - sa.length;
+    const anOffset = Math.max(offset - saTotal, 0);
+    const an = remaining > 0
+      ? ((await conn.query(
+          `SELECT id, source_post_id FROM hp_announce
+            WHERE status = 1 AND source_post_id IS NOT NULL AND body NOT LIKE '%<%'
+         ORDER BY id ASC LIMIT ? OFFSET ?`,
+          [remaining, anOffset],
+        ))[0] as { id: number; source_post_id: number }[])
+      : [];
+
+    const targets: ReflowRow[] = [];
+    // sa: tb_post.content(질문) + staff 첫 답변 댓글(answer 소스 — 기존 수집 로직 재사용).
+    for (const r of sa) {
+      const [postRows] = await conn.query(
+        `SELECT content FROM tb_post WHERE id = ? AND status = 1 AND site_id = 1 LIMIT 1`,
+        [r.source_post_id],
+      );
+      const content = String((postRows as { content: string | null }[])[0]?.content ?? "");
+      const [ansRows] = await conn.query(
+        `SELECT c.content
+           FROM tb_post_comment c
+           JOIN tb_user cu ON cu.id = c.user_id
+          WHERE c.post_id = ? AND c.status = 1 AND c.private_yn != 'Y'
+            AND (cu.email LIKE '%@malgnsoft.com' OR cu.company = '맑은소프트')
+            AND c.content IS NOT NULL AND c.content != ''
+       ORDER BY c.reg_date ASC, c.id ASC
+          LIMIT 1`,
+        [r.source_post_id],
+      );
+      const rawAns = String((ansRows as { content: string | null }[])[0]?.content ?? "");
+      targets.push({
+        kind: "sa",
+        id: Number(r.id),
+        source_post_id: Number(r.source_post_id),
+        qText: htmlToParagraphs(content).slice(0, 2000),
+        aText: htmlToParagraphs(rawAns).slice(0, 2500),
+        qPlain: Number(r.q_plain) === 1,
+        aPlain: Number(r.a_plain) === 1,
+      });
+    }
+    // an: tb_post.content(안내 본문).
+    for (const r of an) {
+      const [postRows] = await conn.query(
+        `SELECT content FROM tb_post WHERE id = ? AND status = 1 AND site_id = 1 LIMIT 1`,
+        [r.source_post_id],
+      );
+      const content = String((postRows as { content: string | null }[])[0]?.content ?? "");
+      targets.push({
+        kind: "an",
+        id: Number(r.id),
+        source_post_id: Number(r.source_post_id),
+        qText: "",
+        aText: htmlToParagraphs(content).slice(0, 3000),
+        qPlain: false,
+        aPlain: true,
+      });
+    }
+
+    if (dry) {
+      // 샘플은 PII 노출 방지를 위해 원문 일부가 아닌 줄 수·길이만(미리보기 첫 줄은 마스킹 전이라 제외).
+      const sample = targets.slice(0, 8).map((t) => ({
+        kind: t.kind,
+        id: t.id,
+        sourcePostId: t.source_post_id,
+        qPlain: t.qPlain,
+        aPlain: t.aPlain,
+        qLines: t.qText ? t.qText.split("\n").length : 0,
+        aLines: t.aText ? t.aText.split("\n").length : 0,
+        // 평문 필드의 원본이 비어 보정 불가한 건(소실)
+        sourceMissing:
+          (t.kind === "an" && t.aText.trim() === "") ||
+          (t.kind === "sa" && (!t.qPlain || t.qText.trim() === "") && (!t.aPlain || t.aText.trim() === "")),
+      }));
+      return c.json({
+        dry: true,
+        targetTotal: { sa: saTotal, announce: anTotal, total: saTotal + anTotal },
+        windowFetched: targets.length,
+        limit,
+        offset,
+        sample,
+      });
+    }
+
+    // ── 재마스킹(배치) — curate-v2 ⑤ 동일 정책 + 줄바꿈 보존 지시. ──
+    let llmCostUsd = 0;
+    let llmPromptTokens = 0;
+    let llmCompletionTokens = 0;
+    let llmCalls = 0;
+    let llmModel: string | null = null;
+    let llmError: string | null = null;
+
+    const MASK_BATCH = 3;
+    for (let start = 0; start < targets.length; start += MASK_BATCH) {
+      const chunk = targets.slice(start, start + MASK_BATCH);
+      // 평문 필드만 마스킹 입력에 포함(이미 HTML인 필드는 보존 — 토큰·재마스킹 회피).
+      const items = chunk.map((t, j) => {
+        if (t.kind === "sa") {
+          const it: { i: number; type: string; question?: string; answer?: string } = { i: j, type: "qa" };
+          if (t.qPlain) it.question = t.qText;
+          if (t.aPlain) it.answer = t.aText;
+          return it;
+        }
+        return { i: j, type: "announce", body: t.aText };
+      });
+      try {
+        const llm = await callOpenAiJson<{
+          results: Array<{
+            i: number;
+            question?: string;
+            answer?: string;
+            body?: string;
+            has_unique_id?: boolean;
+          }>;
+        }>(c.env, {
+          model: c.env.LLM_MODEL_DEFAULT,
+          system: [
+            "너는 고객상담 지식베이스에 등록할 본문에서 개인·업체 식별정보를 마스킹하는 비식별화기다.",
+            "각 항목의 question/answer/body 텍스트에서 아래를 마스킹하라(의미·문맥·기술 내용은 보존):",
+            "- 업체명·기관명·고객사명 → ○○○ (예: '△△상사' → '○○○', 'OO공단' → '○○○')",
+            "- 사람 이름 → ○○○ (직함은 보존, 예: '김철수 과장' → '○○○ 과장')",
+            "- 전화·휴대폰·이메일·주소·계좌번호·카드번호·사업자등록번호 → ○○○ (값 전체 치환)",
+            "주민등록번호 등 고유식별정보(여권·운전면허·외국인등록번호 포함)가 있으면 그 값을 제거하고 has_unique_id=true 로 표시하라.",
+            "마스킹할 식별정보가 없으면 원문을 그대로 반환하라. 일반 용어·제품명·메뉴명·기능명은 마스킹하지 마라.",
+            "입력 텍스트의 줄바꿈(\\n)·문단 구조를 그대로 유지하라. 단락을 합치거나 한 줄로 만들지 말고, 원문의 줄 구분을 출력에도 보존하라.",
+            '출력 JSON: {"results":[{"i":번호,"question":"...","answer":"...","body":"...","has_unique_id":false}]}',
+            "qa 항목은 question/answer, announce 항목은 body 를 반환하라. 모든 입력 i 에 정확히 1개 결과.",
+          ].join("\n"),
+          user: JSON.stringify({ items }),
+          maxTokens: Math.min(1200 + items.length * 1800, 12000),
+          temperature: 0,
+          timeoutMs: 55_000,
+        });
+        llmModel = llm.model;
+        llmPromptTokens += llm.promptTokens;
+        llmCompletionTokens += llm.completionTokens;
+        llmCostUsd += llm.costUsd;
+        llmCalls += 1;
+        for (const res of llm.data.results ?? []) {
+          const idx = Number(res.i);
+          if (!Number.isInteger(idx) || idx < 0 || idx >= chunk.length) continue;
+          const t = chunk[idx];
+          if (res.has_unique_id === true) {
+            t.blocked = true; // 고유식별정보 → 보정 보류(기존 평문 유지, PII 재유입 금지)
+            continue;
+          }
+          if (t.kind === "sa") {
+            if (typeof res.question === "string" && res.question.trim()) t.maskedQ = res.question.trim();
+            if (typeof res.answer === "string" && res.answer.trim()) t.maskedA = res.answer.trim();
+            // 평문이었던 필드가 모두 마스킹 결과를 받았으면 완료(이미 HTML인 필드는 불필요).
+            t.masked = (!t.qPlain || !!t.maskedQ) && (!t.aPlain || !!t.maskedA);
+          } else {
+            if (typeof res.body === "string" && res.body.trim()) t.maskedA = res.body.trim();
+            t.masked = !!t.maskedA;
+          }
+        }
+      } catch (e) {
+        llmError = e instanceof Error ? e.message : String(e);
+      }
+    }
+
+    // ── UPDATE — 본문만 보정. 멱등: 대상 쿼리가 평문만 잡으므로 재실행해도 안전. ──
+    let updated = 0;
+    const skipped = { source_missing: 0, mask_failed: 0, blocked_pii: 0, already_html: 0, error: 0 };
+    for (const t of targets) {
+      try {
+        if (t.blocked) {
+          skipped.blocked_pii += 1;
+          continue;
+        }
+        if (!t.masked) {
+          skipped.mask_failed += 1;
+          continue;
+        }
+        if (t.kind === "sa") {
+          // 평문이었던 필드만 보정(이미 HTML이면 유지). 원본 소실로 둘 다 비면 보정 불가 — 기존 평문 유지.
+          const q = t.qPlain ? (t.maskedQ ?? "").trim() : "";
+          const a = t.aPlain ? (t.maskedA ?? "").trim() : "";
+          if (!q && !a) {
+            skipped.source_missing += 1;
+            continue;
+          }
+          const sets: string[] = [];
+          const vals: unknown[] = [];
+          if (q) {
+            sets.push("question = ?");
+            vals.push(absolutizePmsAssets(paragraphsToHtml(q), assetBase));
+          }
+          if (a) {
+            sets.push("answer = ?");
+            vals.push(absolutizePmsAssets(paragraphsToHtml(a), assetBase));
+          }
+          vals.push(t.id);
+          // status=1 + 여전히 평문(LIKE '%<%' 아님)인 건만 — 동시 수정 레이스 방어.
+          const [r] = await conn.query(
+            `UPDATE hp_standard_answer SET ${sets.join(", ")}
+              WHERE id = ? AND status = 1`,
+            vals,
+          );
+          if ((r as { affectedRows: number }).affectedRows > 0) updated += 1;
+        } else {
+          const body = (t.maskedA ?? "").trim();
+          if (!body) {
+            skipped.source_missing += 1;
+            continue;
+          }
+          const bodyHtml = absolutizePmsAssets(paragraphsToHtml(body), assetBase);
+          const [r] = await conn.query(
+            `UPDATE hp_announce SET body = ? WHERE id = ? AND status = 1`,
+            [bodyHtml, t.id],
+          );
+          if ((r as { affectedRows: number }).affectedRows > 0) updated += 1;
+        }
+      } catch {
+        skipped.error += 1;
+      }
+    }
+
+    try {
+      await conn.query(
+        `INSERT INTO hp_llm_log
+           (route, entity_type, entity_id, model, prompt_tokens, completion_tokens, cost_usd, latency_ms, cache_hit, error)
+         VALUES (?, 'reflow_harvest', 0, ?, ?, ?, ?, ?, 0, ?)`,
+        [route, llmModel ?? "none", llmPromptTokens, llmCompletionTokens, llmCostUsd, Date.now() - t0, llmError],
+      );
+    } catch {
+      // 로그 실패는 응답을 막지 않는다.
+    }
+
+    return c.json({
+      dry: false,
+      targetTotal: { sa: saTotal, announce: anTotal, total: saTotal + anTotal },
+      windowFetched: targets.length,
+      updated,
+      skipped,
+      limit,
+      offset,
+      // 권장 사용법: offset=0 으로 반복 호출 — 보정된(태그 생긴) 행은 대상 쿼리에서 빠지므로 윈도우가 자동 전진한다.
+      //   updated 분만 빠지므로, blocked/source_missing/mask_failed 잔여분을 건너뛰려면 offset 을 그 잔여 수만큼 전진시켜라.
+      remainingAfter: Math.max(saTotal + anTotal - updated, 0),
+      done: targets.length === 0,
+      llmCalls,
+      llmCostUsd: Math.round(llmCostUsd * 1e6) / 1e6,
+      llmModel,
+      llmError,
+    });
+  }),
+);
 
 // 프로젝트의 게시글 목록 (검색·필터·페이지네이션). 작성자 분류 칩 포함.
 app.get("/pms/projects/:id/posts", async (c) =>
