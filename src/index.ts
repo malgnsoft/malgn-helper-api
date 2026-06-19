@@ -3697,6 +3697,7 @@ app.get("/standard-answers", requireAuth, requireRole(ROLE_LEVEL.developer), asy
     const approvalQ = c.req.query("approvalStatus");
     const limit = Math.min(parseInt(c.req.query("limit") ?? "20", 10) || 20, 100);
     const offset = Math.max(parseInt(c.req.query("offset") ?? "0", 10) || 0, 0);
+    const sortQ = c.req.query("sort"); // updated | created | usage(기본)
 
     const where: string[] = ["sa.status = 1"];
     const params: unknown[] = [];
@@ -3734,10 +3735,15 @@ app.get("/standard-answers", requireAuth, requireRole(ROLE_LEVEL.developer), asy
     );
     const total = Number((countRows as { total: number }[])[0]?.total ?? 0);
 
-    // 정렬: 해당 프로젝트 전용 우선 → 사용량 많은 순 → 최신
-    const order = projectId
-      ? "(sa.project_id IS NOT NULL) DESC, sa.usage_count DESC, sa.created_at DESC"
-      : "sa.usage_count DESC, sa.created_at DESC";
+    // 정렬: sort 파라미터(updated=수정일/created=등록일/usage=사용순, 기본 usage).
+    // updated_at NULL(미수정)은 created_at 으로 대체해 정렬. projectId 면 전용 우선.
+    const SORT_BY: Record<string, string> = {
+      updated: "COALESCE(sa.updated_at, sa.created_at) DESC, sa.id DESC",
+      created: "sa.created_at DESC, sa.id DESC",
+      usage: "sa.usage_count DESC, sa.created_at DESC",
+    };
+    const sortKey = sortQ && SORT_BY[sortQ] ? sortQ : "usage";
+    const order = (projectId ? "(sa.project_id IS NOT NULL) DESC, " : "") + SORT_BY[sortKey];
 
     const [rows] = await conn.query(
       `SELECT sa.id, sa.label, sa.question, sa.answer, sa.project_id, sa.source_post_id, sa.source_axis,
