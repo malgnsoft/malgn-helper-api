@@ -1975,19 +1975,28 @@ app.post("/pms/posts/:id/eval/generate", requireServiceToken, rateLimitLlm, asyn
         }
 
         // 2) 같은 프로젝트의 활성 표준답변 일부를 컨텍스트로 첨부
+        //    런타임 PII 게이트(D): pii_text_status='blocked' 답변은 비노출,
+        //    image_pii_status 미검수/의심 답변은 본문 <img> 제거 후 텍스트만 첨부.
         const [saRows] = await conn.query(
-          `SELECT label, question, answer
+          `SELECT label, question, answer, pii_text_status, image_pii_status
              FROM hp_standard_answer
             WHERE status = 1 AND project_id = ?
+              AND pii_text_status <> 'blocked'
             ORDER BY updated_at DESC, id DESC
             LIMIT 5`,
           [post.project_id],
         );
-        const standardAnswers = (saRows as any[]).map((r) => ({
-          label: r.label ?? "",
-          question: r.question ?? "",
-          answer: String(r.answer ?? "").slice(0, 2000),
-        }));
+        const standardAnswers = (saRows as any[])
+          .map((r) => {
+            const gated = gateAnswerForRuntime(String(r.answer ?? ""), r.pii_text_status, r.image_pii_status);
+            if (gated == null) return null; // 텍스트 차단 — 비노출
+            return {
+              label: r.label ?? "",
+              question: r.question ?? "",
+              answer: gated.slice(0, 2000),
+            };
+          })
+          .filter((x): x is { label: string; question: string; answer: string } => x !== null);
 
         const userMsgParts = resp
           ? [
@@ -2517,6 +2526,142 @@ const SA_TRANSITIONS: Record<SaApproval, SaApproval[]> = {
   archived: ["reviewing"],
 };
 
+// ── PII 게이트 공통 (006 마이그레이션) ─────────────────────
+// 정본: malgn-helper-mng/docs/HP-SCHEMA.md (PII 게이트) + migrations/006_pii_gate.sql
+//   텍스트 자동 스캔(B) · 비공개 출처 경고(B) · 런타임 롤업 게이트(D)에서 공유.
+//   ⛔ PII 값 자체는 절대 로그·응답에 출력하지 않는다 — 유형/영역/건수만.
+type PiiTextStatus = "pending" | "clear" | "masked" | "blocked";
+type ImagePiiStatus = "none" | "pending" | "suspect" | "clear" | "removed" | "masked" | "blocked";
+
+/** 런타임 노출 허용 이미지 상태(D). 이 집합 밖이면 답변 이미지 미노출. */
+const IMAGE_PII_VIEWABLE: readonly ImagePiiStatus[] = ["none", "clear", "removed", "masked"];
+
+/** hp_setting(safety).pii_patterns(JSON 문자열 배열) → 컴파일된 정규식 목록. 잘못된 패턴은 건너뜀. */
+async function loadPiiPatterns(conn: Queryable): Promise<RegExp[]> {
+  const [rows] = await conn.query(
+    `SELECT setting_value FROM hp_setting WHERE group_name = 'safety' AND setting_key = 'pii_patterns' AND status = 1 LIMIT 1`,
+  );
+  const raw = (rows as { setting_value: string | null }[])[0]?.setting_value;
+  if (!raw) return [];
+  let list: unknown;
+  try { list = JSON.parse(raw); } catch { return []; }
+  if (!Array.isArray(list)) return [];
+  const out: RegExp[] = [];
+  for (const p of list) {
+    if (typeof p !== "string" || !p) continue;
+    try { out.push(new RegExp(p, "g")); } catch { /* 잘못된 정규식 무시 */ }
+  }
+  return out;
+}
+
+/**
+ * 본문 텍스트 PII 스캔(B). pii_patterns 중 하나라도 매칭되면 hit.
+ * ⛔ 매칭된 PII 값(group)은 반환하지 않는다 — 매칭 패턴 인덱스·건수만 집계.
+ * 반환: { hit, matchedPatterns(패턴 인덱스 배열), totalMatches }.
+ */
+function scanTextPii(text: string, patterns: RegExp[]): { hit: boolean; matchedPatterns: number[]; totalMatches: number } {
+  const body = String(text ?? "");
+  const matchedPatterns: number[] = [];
+  let totalMatches = 0;
+  patterns.forEach((re, idx) => {
+    re.lastIndex = 0; // global 정규식 재사용 시 상태 초기화
+    const m = body.match(re);
+    if (m && m.length > 0) {
+      matchedPatterns.push(idx);
+      totalMatches += m.length;
+    }
+  });
+  return { hit: matchedPatterns.length > 0, matchedPatterns, totalMatches };
+}
+
+/**
+ * 비공개 출처 경고 산정(B). source_post_id 가 가리키는 원글에
+ * 공개(staff) 답변이 없고 비공개(private_yn='Y') staff 답변만 존재하면 1.
+ * (tb_post 자체엔 비공개 플래그가 없다 — 정본 LEGACY-DB-INVENTORY §4. 비공개 신호는 tb_post_comment.private_yn.)
+ * ⛔ tb_* SELECT 전용. 비공개 본문은 읽지 않는다(존재 여부 카운트만).
+ */
+async function computePrivateSourceFlag(conn: Queryable, sourcePostId: number | null): Promise<0 | 1> {
+  if (!sourcePostId || sourcePostId <= 0) return 0;
+  const [rows] = await conn.query(
+    `SELECT
+       SUM(CASE WHEN c.private_yn != 'Y' THEN 1 ELSE 0 END) AS public_staff,
+       SUM(CASE WHEN c.private_yn  = 'Y' THEN 1 ELSE 0 END) AS private_staff
+     FROM tb_post_comment c
+     JOIN tb_user cu ON cu.id = c.user_id
+     WHERE c.post_id = ? AND c.status = 1
+       AND (cu.email LIKE '%@malgnsoft.com' OR cu.company = '맑은소프트')
+       AND c.content IS NOT NULL AND c.content != ''`,
+    [sourcePostId],
+  );
+  const r = (rows as { public_staff: number | null; private_staff: number | null }[])[0];
+  const pub = Number(r?.public_staff ?? 0);
+  const priv = Number(r?.private_staff ?? 0);
+  return pub === 0 && priv > 0 ? 1 : 0;
+}
+
+/**
+ * 승인(reviewing→approved) 전이 직전 텍스트 PII 게이트(B).
+ * 대상 테이블('hp_standard_answer'|'hp_announce')의 본문(answer|body)을 스캔.
+ *  - 고유식별정보 등 발견 → pii_text_status='blocked' 기록 + 승인 거부(블록).
+ *  - 통과 → pii_text_status='clear'.
+ *  - 비공개 출처 → private_source_flag=1(경고, 비차단).
+ * 반환: { blocked, matchedCount } — blocked면 호출부가 422 로 승인 차단.
+ * ⛔ PII 값 미반환(매칭 건수만).
+ */
+async function applyTextPiiGate(
+  conn: Queryable,
+  table: "hp_standard_answer" | "hp_announce",
+  id: number,
+): Promise<{ blocked: boolean; matchedCount: number; privateSource: 0 | 1 }> {
+  const bodyCol = table === "hp_standard_answer" ? "answer" : "body";
+  const [rows] = await conn.query(
+    `SELECT ${bodyCol} AS body, source_post_id FROM ${table} WHERE id = ? AND status = 1`,
+    [id],
+  );
+  const row = (rows as { body: string | null; source_post_id: number | null }[])[0];
+  if (!row) return { blocked: false, matchedCount: 0, privateSource: 0 };
+
+  const patterns = await loadPiiPatterns(conn);
+  const scan = scanTextPii(row.body ?? "", patterns);
+  const privateSource = await computePrivateSourceFlag(conn, row.source_post_id ?? null);
+
+  if (scan.hit) {
+    // 차단: 본문에 PII 패턴 발견 → blocked 기록(승인 불가).
+    await conn.query(
+      `UPDATE ${table} SET pii_text_status = 'blocked', private_source_flag = ? WHERE id = ?`,
+      [privateSource, id],
+    );
+    return { blocked: true, matchedCount: scan.totalMatches, privateSource };
+  }
+  // 통과: clear 기록(+ 비공개 출처 경고는 그대로 기록).
+  await conn.query(
+    `UPDATE ${table} SET pii_text_status = 'clear', private_source_flag = ? WHERE id = ?`,
+    [privateSource, id],
+  );
+  return { blocked: false, matchedCount: 0, privateSource };
+}
+
+/** 본문 HTML 에서 <img ...> 태그를 제거(런타임 게이트 D — 미검수/의심 이미지 미노출). 캡션 placeholder 로 치환. */
+function stripImgTags(html: string): string {
+  return String(html ?? "").replace(/<img\b[^>]*>/gi, "[이미지 검수 대기 — 미노출]");
+}
+
+/**
+ * 런타임 노출 게이트(D) — 추천/검색/챗봇 등 답변 노출 직전 한 줄 게이트.
+ *  - pii_text_status='blocked' → 답변 자체 비노출(null 반환).
+ *  - image_pii_status ∉ {none,clear,removed,masked} → 답변 본문의 <img> 만 제거(텍스트는 유지).
+ * 답변 단위 롤업(인용 이미지 중 최악값은 image_pii_status 컬럼이 이미 보유 — 호출부가 컬럼값 전달).
+ */
+function gateAnswerForRuntime(
+  answer: string,
+  piiTextStatus: PiiTextStatus | string | null,
+  imagePiiStatus: ImagePiiStatus | string | null,
+): string | null {
+  if (piiTextStatus === "blocked") return null; // 텍스트 차단 → 답변 비노출
+  const imgOk = IMAGE_PII_VIEWABLE.includes((imagePiiStatus ?? "none") as ImagePiiStatus);
+  return imgOk ? answer : stripImgTags(answer);
+}
+
 /** tags(LONGTEXT) 역직렬화 — NULL/빈문자/비배열은 [] 로 정규화. */
 function parseTags(raw: unknown): string[] {
   if (typeof raw !== "string" || !raw.trim()) return [];
@@ -2598,6 +2743,8 @@ async function findSimilarStandardAnswers(
   if (!tokens.length) return [];
 
   const where: string[] = ["status = 1"];
+  // 런타임 PII 게이트(D): 텍스트 차단(blocked) 답변은 추천/매칭 후보에서 제외.
+  where.push("pii_text_status <> 'blocked'");
   const params: unknown[] = [];
   if (args.excludeId != null) {
     where.push("id <> ?");
@@ -3010,6 +3157,20 @@ app.patch("/standard-answers/:id/transition", requireAuth, requireRole(ROLE_LEVE
     const reason = (body.reason ?? "").trim();
     if (target === "rejected" && !reason) {
       return c.json({ error: "rejection_reason required for rejected (§3-4)" }, 400);
+    }
+
+    // ── 텍스트 PII 게이트(B): approved 전이 직전 본문 스캔 ──
+    //   고유식별정보 발견 → pii_text_status='blocked' 기록 + 승인 거부(422). PII 값은 응답·로그에 미노출.
+    if (target === "approved") {
+      const gate = await applyTextPiiGate(conn, "hp_standard_answer", id);
+      if (gate.blocked) {
+        return c.json({
+          error: "PII 게이트: 본문에서 고유식별정보 패턴이 발견되어 승인할 수 없습니다. 마스킹 후 재시도하세요.",
+          piiTextStatus: "blocked",
+          matchedCount: gate.matchedCount, // 건수만(값 미노출)
+          privateSource: gate.privateSource === 1,
+        }, 422);
+      }
     }
 
     const sets: string[] = ["approval_status = ?"];
@@ -3428,6 +3589,19 @@ app.patch("/announces/:id/transition", requireAuth, requireRole(ROLE_LEVEL.devel
       return c.json({ error: "rejection_reason required for rejected (§3-4)" }, 400);
     }
 
+    // ── 텍스트 PII 게이트(B): approved 전이 직전 본문 스캔 (SA 와 동일) ──
+    if (target === "approved") {
+      const gate = await applyTextPiiGate(conn, "hp_announce", id);
+      if (gate.blocked) {
+        return c.json({
+          error: "PII 게이트: 본문에서 고유식별정보 패턴이 발견되어 승인할 수 없습니다. 마스킹 후 재시도하세요.",
+          piiTextStatus: "blocked",
+          matchedCount: gate.matchedCount,
+          privateSource: gate.privateSource === 1,
+        }, 422);
+      }
+    }
+
     const sets: string[] = ["approval_status = ?"];
     const params: unknown[] = [target];
     if (target === "approved") {
@@ -3444,6 +3618,138 @@ app.patch("/announces/:id/transition", requireAuth, requireRole(ROLE_LEVEL.devel
       params,
     );
     return c.json({ ok: true, id, from, to: target });
+  }),
+);
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║ 이미지 Vision 1차 PII 플래그 (C) — 보조. 자동 'clear' 금지(사람검수 기본).   ║
+// ║   POST /standard-answers/:id/pii-image-scan  (announce 는 ?table=announce)  ║
+// ║   인용 이미지(<img src>) Vision 스캔: "PII 유형·영역 좌표만 반환, 값 미전사".║
+// ║   의심 신호 → image_pii_status='suspect', 아니면 'pending' 유지.            ║
+// ║   ⛔ AI Gateway 로그에 PII·이미지 잔존 유의 — 프롬프트가 값 전사 금지.        ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+type PiiImageScanResult = {
+  suspect: boolean;
+  signals: string[]; // 의심 유형 라벨만 (예: "인명","연락처","명단","계좌","고유식별정보화면"). 값 미포함.
+  regions: number; // 의심 영역 개수(좌표 상세는 미저장)
+};
+
+/** 본문 HTML 에서 <img src> 목록 추출(절대 URL 우선). */
+function extractImgSrcs(html: string): string[] {
+  const out: string[] = [];
+  const re = /<img\b[^>]*\bsrc\s*=\s*(["'])(.*?)\1/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(String(html ?? ""))) !== null) {
+    if (m[2]) out.push(m[2]);
+  }
+  return Array.from(new Set(out));
+}
+
+async function scanImagesForPii(
+  env: Bindings,
+  imageUrls: string[],
+): Promise<{ suspect: boolean; signals: string[]; regions: number; scanned: number }> {
+  const signalSet = new Set<string>();
+  let regions = 0;
+  let anySuspect = false;
+  let scanned = 0;
+  // 비용·레이트 보호: 1회 호출당 이미지 상한.
+  for (const url of imageUrls.slice(0, 8)) {
+    try {
+      const r = await callOpenAiJson<PiiImageScanResult>(env, {
+        model: env.LLM_MODEL_PREMIUM,
+        system: [
+          "너는 이미지 PII(개인식별정보) 1차 스크리너다. 화면 캡처에 개인정보가 보이는지 판별만 한다.",
+          "⛔ 절대 규칙: PII 값(이름·번호·계좌·주민번호 등)을 절대 전사·인용하지 마라. 값은 출력 금지.",
+          "오직 '유형 라벨'과 '의심 영역 개수'만 보고하라.",
+          "의심 신호 예: 인명, 연락처(전화/이메일), 명단/리스트, 계좌/카드번호, 주민번호 등 고유식별정보 화면.",
+          '출력 JSON: {"suspect": <true|false>, "signals": ["인명","연락처", ...], "regions": <정수>}',
+          "signals 에는 라벨만, 실제 값은 절대 넣지 마라. 확실치 않으면 suspect=true(보수적).",
+        ].join("\n"),
+        user: "이 이미지에 개인식별정보가 보이는지 유형 라벨과 의심 영역 개수만 판별하라. 값은 전사 금지.",
+        images: [url],
+        maxTokens: 300,
+        temperature: 0,
+        timeoutMs: 30_000,
+      });
+      scanned++;
+      const d = r.data;
+      if (d?.suspect) anySuspect = true;
+      for (const s of Array.isArray(d?.signals) ? d.signals : []) {
+        if (typeof s === "string" && s.trim()) signalSet.add(s.trim().slice(0, 30));
+      }
+      regions += Number.isFinite(d?.regions) ? Math.max(0, Math.trunc(Number(d.regions))) : 0;
+    } catch {
+      // 스캔 실패 → 보수적으로 의심 처리(자동 clear 금지 원칙).
+      anySuspect = true;
+      signalSet.add("scan_error");
+    }
+  }
+  return { suspect: anySuspect, signals: Array.from(signalSet), regions, scanned };
+}
+
+app.post("/standard-answers/:id/pii-image-scan", requireAuth, requireRole(ROLE_LEVEL.developer), rateLimitLlm, async (c) =>
+  withConn(c, async (conn) => {
+    const id = parseInt(c.req.param("id"), 10);
+    if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
+    const table = c.req.query("table") === "announce" ? "hp_announce" : "hp_standard_answer";
+    const bodyCol = table === "hp_announce" ? "body" : "answer";
+
+    const [rows] = await conn.query(
+      `SELECT id, ${bodyCol} AS body, image_pii_status FROM ${table} WHERE id = ? AND status = 1`,
+      [id],
+    );
+    const row = (rows as { id: number; body: string | null; image_pii_status: ImagePiiStatus }[])[0];
+    if (!row) return c.json({ error: "not found" }, 404);
+
+    // 사람검수로 확정된 상태(clear/removed/masked/blocked)는 재스캔이 덮지 않음(보호).
+    if (["clear", "removed", "masked", "blocked"].includes(row.image_pii_status)) {
+      return c.json({ ok: true, id, skipped: true, reason: `already ${row.image_pii_status} (사람검수 확정)`, imagePiiStatus: row.image_pii_status });
+    }
+
+    const imgs = extractImgSrcs(row.body ?? "");
+    if (imgs.length === 0) {
+      await conn.query(`UPDATE ${table} SET image_pii_status = 'none' WHERE id = ?`, [id]);
+      return c.json({ ok: true, id, imagePiiStatus: "none", images: 0 });
+    }
+
+    const result = await scanImagesForPii(c.env, imgs);
+    // 자동 'clear' 금지 — 의심이면 'suspect', 아니면 'pending' 유지(사람검수 대기).
+    const next: ImagePiiStatus = result.suspect ? "suspect" : "pending";
+    await conn.query(`UPDATE ${table} SET image_pii_status = ? WHERE id = ?`, [next, id]);
+
+    return c.json({
+      ok: true,
+      id,
+      imagePiiStatus: next, // 'suspect' | 'pending' (자동 clear 없음)
+      images: imgs.length,
+      scanned: result.scanned,
+      signals: result.signals, // 유형 라벨만(값 미포함)
+      regions: result.regions,
+    });
+  }),
+);
+
+// 사람 검수 결과로 이미지 PII 상태 확정(C 후속) — clear/removed/masked/blocked 만 허용.
+// 검수자·시각 기록. 가드 admin(최종 게이트 통과 권한).
+app.patch("/standard-answers/:id/pii-image-review", requireAuth, requireRole(ROLE_LEVEL.admin), async (c) =>
+  withConn(c, async (conn) => {
+    const id = parseInt(c.req.param("id"), 10);
+    if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
+    const table = c.req.query("table") === "announce" ? "hp_announce" : "hp_standard_answer";
+    type ReviewBody = { status?: string };
+    const body = await c.req.json<ReviewBody>().catch((): ReviewBody => ({}));
+    const ALLOWED: ImagePiiStatus[] = ["clear", "removed", "masked", "blocked"];
+    if (!body.status || !ALLOWED.includes(body.status as ImagePiiStatus)) {
+      return c.json({ error: "status must be one of clear|removed|masked|blocked" }, 400);
+    }
+    const [rows] = await conn.query(`SELECT id FROM ${table} WHERE id = ? AND status = 1`, [id]);
+    if ((rows as unknown[]).length === 0) return c.json({ error: "not found" }, 404);
+    await conn.query(
+      `UPDATE ${table} SET image_pii_status = ?, pii_checked_by = ?, pii_checked_at = NOW() WHERE id = ? AND status = 1`,
+      [body.status, c.get("session").email ?? null, id],
+    );
+    return c.json({ ok: true, id, imagePiiStatus: body.status });
   }),
 );
 
