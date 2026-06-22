@@ -2641,6 +2641,81 @@ async function applyTextPiiGate(
   return { blocked: false, matchedCount: 0, privateSource };
 }
 
+/**
+ * 본문(answer|body) 변경 시 PII 게이트 재평가(H-1). PATCH 에서 본문이 바뀐 직후 호출.
+ *  1. 텍스트 재스캔 — 변경 본문에 PII 패턴 발견 → pii_text_status='blocked', 아니면 'clear'.
+ *     private_source_flag 도 재산정(source_post_id 기준).
+ *  2. 이미지 상태 리셋 — 본문에 <img 있으면 image_pii_status='pending'(기존 확정 clear/removed/masked
+ *     여도 본문이 바뀌었으니 재검수), 없으면 'none'. pii_checked_by/at 은 NULL 초기화.
+ *  3. 승인 강등 — 현재 approval_status='approved' 면 'reviewing' 으로 강등(재승인 시 게이트 재통과 유도).
+ * ⛔ PII 값 미반환·미로그(상태/건수만). UPDATE 대상은 hp_* 만.
+ */
+async function reevaluateGateOnBodyChange(
+  conn: Queryable,
+  table: "hp_standard_answer" | "hp_announce",
+  id: number,
+  newBody: string,
+): Promise<void> {
+  const patterns = await loadPiiPatterns(conn);
+  const scan = scanTextPii(newBody ?? "", patterns);
+  const piiTextStatus: PiiTextStatus = scan.hit ? "blocked" : "clear";
+
+  // private_source_flag 재산정 — 현재 행의 source_post_id 로.
+  const [srcRows] = await conn.query(
+    `SELECT source_post_id, approval_status FROM ${table} WHERE id = ? AND status = 1`,
+    [id],
+  );
+  const srcRow = (srcRows as { source_post_id: number | null; approval_status: SaApproval }[])[0];
+  if (!srcRow) return;
+  const privateSource = await computePrivateSourceFlag(conn, srcRow.source_post_id ?? null);
+
+  // 이미지 상태 리셋 — 본문에 <img 존재 여부로 pending|none. checked_by/at NULL 초기화.
+  const hasImg = /<img\b/i.test(newBody ?? "");
+  const imagePiiStatus: ImagePiiStatus = hasImg ? "pending" : "none";
+
+  const sets = [
+    "pii_text_status = ?",
+    "private_source_flag = ?",
+    "image_pii_status = ?",
+    "pii_checked_by = NULL",
+    "pii_checked_at = NULL",
+  ];
+  const params: unknown[] = [piiTextStatus, privateSource, imagePiiStatus];
+
+  // 승인 강등 — approved 였으면 reviewing 으로(재승인 시 게이트 재통과).
+  if (srcRow.approval_status === "approved") {
+    sets.push("approval_status = ?");
+    params.push("reviewing" satisfies SaApproval);
+  }
+
+  params.push(id);
+  await conn.query(`UPDATE ${table} SET ${sets.join(", ")} WHERE id = ? AND status = 1`, params);
+}
+
+/**
+ * 이미지 PII 하드 게이트(M-1) — approved 전이 직전 호출. 본문에 <img 가 있고
+ * image_pii_status 가 노출 허용 집합(none|clear|removed|masked) 밖(=pending|suspect|blocked)이면
+ * 승인 차단 신호 반환. ⛔ PII 값·이미지 src 미노출(상태만).
+ */
+async function checkImageGate(
+  conn: Queryable,
+  table: "hp_standard_answer" | "hp_announce",
+  id: number,
+): Promise<{ blocked: boolean; imagePiiStatus: ImagePiiStatus }> {
+  const bodyCol = table === "hp_standard_answer" ? "answer" : "body";
+  const [rows] = await conn.query(
+    `SELECT ${bodyCol} AS body, image_pii_status FROM ${table} WHERE id = ? AND status = 1`,
+    [id],
+  );
+  const row = (rows as { body: string | null; image_pii_status: ImagePiiStatus }[])[0];
+  if (!row) return { blocked: false, imagePiiStatus: "none" };
+  const hasImg = /<img\b/i.test(row.body ?? "");
+  const status = (row.image_pii_status ?? "none") as ImagePiiStatus;
+  // 이미지 없으면 게이트 무관. 이미지 있고 노출 허용 집합 밖이면 차단.
+  const blocked = hasImg && !IMAGE_PII_VIEWABLE.includes(status);
+  return { blocked, imagePiiStatus: status };
+}
+
 /** 본문 HTML 에서 <img ...> 태그를 제거(런타임 게이트 D — 미검수/의심 이미지 미노출). 캡션 placeholder 로 치환. */
 function stripImgTags(html: string): string {
   return String(html ?? "").replace(/<img\b[^>]*>/gi, "[이미지 검수 대기 — 미노출]");
@@ -3044,6 +3119,8 @@ app.patch("/standard-answers/:id", requireAuth, requireRole(ROLE_LEVEL.admin), a
     const assetBase = c.env.PMS_ASSET_BASE || DEFAULT_PMS_ASSET_BASE;
     const sets: string[] = [];
     const params: any[] = [];
+    // answer(본문) 변경 시 게이트 재평가(H-1) — 저장될 최종 본문을 보관.
+    let newAnswer: string | null = null;
     // 본문 — question/answer 는 POST 와 동일하게 이미지 경로 절대화.
     for (const k of ["label", "question", "answer"] as const) {
       const v = body[k];
@@ -3051,6 +3128,7 @@ app.patch("/standard-answers/:id", requireAuth, requireRole(ROLE_LEVEL.admin), a
         let trimmed = String(v).trim();
         if (!trimmed) return c.json({ error: `${k} empty` }, 400);
         if (k === "question" || k === "answer") trimmed = absolutizePmsAssets(trimmed, assetBase);
+        if (k === "answer") newAnswer = trimmed;
         sets.push(`${k} = ?`);
         params.push(trimmed);
       }
@@ -3101,7 +3179,13 @@ app.patch("/standard-answers/:id", requireAuth, requireRole(ROLE_LEVEL.admin), a
       `UPDATE hp_standard_answer SET ${sets.join(", ")} WHERE id = ? AND status = 1`,
       params,
     );
-    return c.json({ ok: true, affected: (result as any).affectedRows, changed: (result as any).changedRows });
+    // H-1: answer(본문) 변경 시 PII 게이트 재평가 — 텍스트 재스캔·이미지 리셋·승인 강등.
+    let gateReevaluated = false;
+    if (newAnswer !== null) {
+      await reevaluateGateOnBodyChange(conn, "hp_standard_answer", id, newAnswer);
+      gateReevaluated = true;
+    }
+    return c.json({ ok: true, affected: (result as any).affectedRows, changed: (result as any).changedRows, gateReevaluated });
   }),
 );
 
@@ -3177,6 +3261,15 @@ app.patch("/standard-answers/:id/transition", requireAuth, requireRole(ROLE_LEVE
           piiTextStatus: "blocked",
           matchedCount: gate.matchedCount, // 건수만(값 미노출)
           privateSource: gate.privateSource === 1,
+        }, 422);
+      }
+      // ── 이미지 PII 하드 게이트(M-1): 이미지 보유 + 미검수/의심/차단이면 승인 거부 ──
+      //    admin imageGateOk 와 정합. PII 값·이미지 src 미노출(상태만).
+      const img = await checkImageGate(conn, "hp_standard_answer", id);
+      if (img.blocked) {
+        return c.json({
+          error: "PII 게이트: 인용 이미지 검수가 완료되지 않아 승인할 수 없습니다. 이미지 검수(clear/removed/masked) 후 재시도하세요.",
+          imagePiiStatus: img.imagePiiStatus,
         }, 422);
       }
     }
@@ -3485,6 +3578,8 @@ app.patch("/announces/:id", requireAuth, requireRole(ROLE_LEVEL.admin), async (c
     const assetBase = c.env.PMS_ASSET_BASE || DEFAULT_PMS_ASSET_BASE;
     const sets: string[] = [];
     const params: unknown[] = [];
+    // body(본문) 변경 시 게이트 재평가(H-1) — 저장될 최종 본문을 보관.
+    let newBody: string | null = null;
 
     if (body.title !== undefined) {
       const t = String(body.title).trim();
@@ -3503,8 +3598,10 @@ app.patch("/announces/:id", requireAuth, requireRole(ROLE_LEVEL.admin), async (c
     if (body.body !== undefined || body.answer !== undefined) {
       const raw = (body.body ?? body.answer ?? "").trim();
       if (!raw) return c.json({ error: "body empty" }, 400);
+      const absolutized = absolutizePmsAssets(raw, assetBase);
+      newBody = absolutized;
       sets.push("body = ?");
-      params.push(absolutizePmsAssets(raw, assetBase));
+      params.push(absolutized);
     }
     // question 은 NULL 허용 — null/빈문자 이면 해제, 있으면 절대화.
     if (body.question !== undefined) {
@@ -3557,10 +3654,17 @@ app.patch("/announces/:id", requireAuth, requireRole(ROLE_LEVEL.admin), async (c
       `UPDATE hp_announce SET ${sets.join(", ")} WHERE id = ? AND status = 1`,
       params,
     );
+    // H-1: body(본문) 변경 시 PII 게이트 재평가 — 텍스트 재스캔·이미지 리셋·승인 강등.
+    let gateReevaluated = false;
+    if (newBody !== null) {
+      await reevaluateGateOnBodyChange(conn, "hp_announce", id, newBody);
+      gateReevaluated = true;
+    }
     return c.json({
       ok: true,
       affected: (result as { affectedRows?: number }).affectedRows,
       changed: (result as { changedRows?: number }).changedRows,
+      gateReevaluated,
     });
   }),
 );
@@ -3614,6 +3718,14 @@ app.patch("/announces/:id/transition", requireAuth, requireRole(ROLE_LEVEL.devel
           piiTextStatus: "blocked",
           matchedCount: gate.matchedCount,
           privateSource: gate.privateSource === 1,
+        }, 422);
+      }
+      // ── 이미지 PII 하드 게이트(M-1): 이미지 보유 + 미검수/의심/차단이면 승인 거부 ──
+      const img = await checkImageGate(conn, "hp_announce", id);
+      if (img.blocked) {
+        return c.json({
+          error: "PII 게이트: 인용 이미지 검수가 완료되지 않아 승인할 수 없습니다. 이미지 검수(clear/removed/masked) 후 재시도하세요.",
+          imagePiiStatus: img.imagePiiStatus,
         }, 422);
       }
     }
