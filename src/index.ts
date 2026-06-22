@@ -3911,6 +3911,60 @@ app.patch("/standard-answers/:id/pii-image-review", requireAuth, requireRole(ROL
   }),
 );
 
+// 이미지 PII Vision 1차 스캔 배치(검수 큐 트리아지) — admin 인증 운영 도구.
+// id 커서(afterId)로 멱등 전진. 무탐도 'pending' 유지(자동 clear 금지) → id>afterId 로 재스캔 방지.
+// 가드: requireServiceToken(관찰) + requireAuth + requireRole(developer). 무인증 노출 없음.
+app.post("/standard-answers/pii-image-scan-batch", requireServiceToken, requireAuth, requireRole(ROLE_LEVEL.developer), async (c) =>
+  withConn(c, async (conn) => {
+    const table = c.req.query("table") === "announce" ? "hp_announce" : "hp_standard_answer";
+    const bodyCol = table === "hp_announce" ? "body" : "answer";
+    const limit = Math.min(40, Math.max(1, parseInt(c.req.query("limit") ?? "30", 10)));
+    const afterId = Math.max(0, parseInt(c.req.query("afterId") ?? "0", 10));
+    const [rows] = await conn.query(
+      `SELECT id, ${bodyCol} AS body FROM ${table}
+        WHERE status = 1 AND image_pii_status = 'pending' AND ${bodyCol} LIKE '%<img%' AND id > ?
+        ORDER BY id ASC LIMIT ?`,
+      [afterId, limit],
+    );
+    const list = rows as { id: number; body: string | null }[];
+    let suspect = 0, pendingKept = 0, none = 0, scanned = 0, errors = 0;
+    let costUsd = 0, promptTokens = 0, completionTokens = 0, lastId = afterId;
+    for (const row of list) {
+      lastId = row.id;
+      const imgs = extractImgSrcs(row.body ?? "");
+      if (imgs.length === 0) {
+        await conn.query(`UPDATE ${table} SET image_pii_status = 'none' WHERE id = ? AND status = 1`, [row.id]);
+        none++;
+        continue;
+      }
+      const r = await scanImagesForPii(c.env, imgs);
+      const next: ImagePiiStatus = r.suspect ? "suspect" : "pending";
+      await conn.query(`UPDATE ${table} SET image_pii_status = ? WHERE id = ? AND status = 1`, [next, row.id]);
+      if (next === "suspect") suspect++; else pendingKept++;
+      scanned += r.scanned;
+      errors += r.errors;
+      costUsd += r.costUsd;
+      promptTokens += r.promptTokens;
+      completionTokens += r.completionTokens;
+    }
+    return c.json({
+      ok: true,
+      table,
+      processed: list.length,
+      lastId,
+      done: list.length < limit,
+      suspect,
+      pendingKept,
+      none,
+      scanned,
+      errors,
+      costUsd: Math.round(costUsd * 1e6) / 1e6,
+      promptTokens,
+      completionTokens,
+    });
+  }),
+);
+
 
 // 게시글(문의) 1건 + 작성자 + (공개) 댓글 흐름.
 // 직원/고객 구분은 email 도메인(@malgnsoft.com) 기준. private_yn='Y' 댓글 본문은 마스킹.
