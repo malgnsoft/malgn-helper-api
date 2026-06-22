@@ -3776,11 +3776,26 @@ function extractImgSrcs(html: string): string[] {
 async function scanImagesForPii(
   env: Bindings,
   imageUrls: string[],
-): Promise<{ suspect: boolean; signals: string[]; regions: number; scanned: number }> {
+): Promise<{
+  suspect: boolean;
+  signals: string[];
+  regions: number;
+  scanned: number;
+  promptTokens: number;
+  completionTokens: number;
+  costUsd: number;
+  errors: number;
+  model: string | null;
+}> {
   const signalSet = new Set<string>();
   let regions = 0;
   let anySuspect = false;
   let scanned = 0;
+  let promptTokens = 0;
+  let completionTokens = 0;
+  let costUsd = 0;
+  let errors = 0;
+  let model: string | null = null;
   // 비용·레이트 보호: 1회 호출당 이미지 상한.
   for (const url of imageUrls.slice(0, 8)) {
     try {
@@ -3801,6 +3816,10 @@ async function scanImagesForPii(
         timeoutMs: 30_000,
       });
       scanned++;
+      promptTokens += r.promptTokens ?? 0;
+      completionTokens += r.completionTokens ?? 0;
+      costUsd += r.costUsd ?? 0;
+      model = r.model ?? model;
       const d = r.data;
       if (d?.suspect) anySuspect = true;
       for (const s of Array.isArray(d?.signals) ? d.signals : []) {
@@ -3810,10 +3829,21 @@ async function scanImagesForPii(
     } catch {
       // 스캔 실패 → 보수적으로 의심 처리(자동 clear 금지 원칙).
       anySuspect = true;
+      errors++;
       signalSet.add("scan_error");
     }
   }
-  return { suspect: anySuspect, signals: Array.from(signalSet), regions, scanned };
+  return {
+    suspect: anySuspect,
+    signals: Array.from(signalSet),
+    regions,
+    scanned,
+    promptTokens,
+    completionTokens,
+    costUsd,
+    errors,
+    model,
+  };
 }
 
 app.post("/standard-answers/:id/pii-image-scan", requireAuth, requireRole(ROLE_LEVEL.developer), rateLimitLlm, async (c) =>
@@ -3880,6 +3910,7 @@ app.patch("/standard-answers/:id/pii-image-review", requireAuth, requireRole(ROL
     return c.json({ ok: true, id, imagePiiStatus: body.status });
   }),
 );
+
 
 // 게시글(문의) 1건 + 작성자 + (공개) 댓글 흐름.
 // 직원/고객 구분은 email 도메인(@malgnsoft.com) 기준. private_yn='Y' 댓글 본문은 마스킹.
