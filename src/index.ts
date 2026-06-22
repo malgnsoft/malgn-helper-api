@@ -2949,8 +2949,10 @@ app.get("/standard-answers", requireAuth, requireRole(ROLE_LEVEL.developer), asy
 
     // 정렬: sort 파라미터(updated=수정일/created=등록일/usage=사용순, 기본 usage).
     // updated_at NULL(미수정)은 created_at 으로 대체해 정렬. projectId 면 전용 우선.
-    // sort = <field>[_<dir>] — field: updated(수정일)|created(등록일)|usage(사용순, 기본), dir: desc(기본)|asc.
-    const sm = (sortQ ?? "usage").match(/^(updated|created|usage)(?:_(asc|desc))?$/);
+    // sort = <field>[_<dir>] — field: updated(수정일)|created(등록일)|usage(사용순, 기본)|pii(PII 검수 우선), dir: desc(기본)|asc.
+    // pii: image_pii_status 가 'suspect'(의심)·'pending'(미검수) 인 행을 최상단으로 끌어올려 검수 큐로 사용.
+    //      dir 무관(우선순위 고정), 동순위는 usage_count 내림차순으로 안정 정렬.
+    const sm = (sortQ ?? "usage").match(/^(updated|created|usage|pii)(?:_(asc|desc))?$/);
     const sField = sm ? sm[1] : "usage";
     const sDir = sm && sm[2] === "asc" ? "ASC" : "DESC";
     const SORT_COL: Record<string, string> = {
@@ -2958,14 +2960,20 @@ app.get("/standard-answers", requireAuth, requireRole(ROLE_LEVEL.developer), asy
       created: "sa.created_at",
       usage: "sa.usage_count",
     };
+    // PII 검수 우선순위: suspect(2) > pending(1) > 그 외(0) 내림차순.
+    const PII_PRIORITY = "(CASE sa.image_pii_status WHEN 'suspect' THEN 2 WHEN 'pending' THEN 1 ELSE 0 END)";
     const order =
-      (projectId ? "(sa.project_id IS NOT NULL) DESC, " : "") + `${SORT_COL[sField]} ${sDir}, sa.id ${sDir}`;
+      (projectId ? "(sa.project_id IS NOT NULL) DESC, " : "") +
+      (sField === "pii"
+        ? `${PII_PRIORITY} DESC, sa.usage_count DESC, sa.id DESC`
+        : `${SORT_COL[sField]} ${sDir}, sa.id ${sDir}`);
 
     const [rows] = await conn.query(
       `SELECT sa.id, sa.label, sa.question, sa.answer, sa.project_id, sa.source_post_id, sa.source_axis,
               sa.created_by, sa.usage_count, sa.last_used_at, sa.created_at, sa.updated_at,
               sa.scope, sa.topic_id, sa.service_id, sa.tags, sa.approval_status,
               sa.approved_by, sa.approved_at, sa.rejection_reason, sa.merged_into_id, sa.source_uncovered_id,
+              sa.image_pii_status, sa.pii_text_status, sa.private_source_flag,
               t.slug AS topic_slug, t.label AS topic_label,
               s.slug AS service_slug, s.name AS service_name
          FROM hp_standard_answer sa
@@ -3283,6 +3291,7 @@ app.get("/announces", requireAuth, requireRole(ROLE_LEVEL.developer), async (c) 
     const approvalQ = c.req.query("approvalStatus");
     const limit = Math.min(parseInt(c.req.query("limit") ?? "20", 10) || 20, 100);
     const offset = Math.max(parseInt(c.req.query("offset") ?? "0", 10) || 0, 0);
+    const sortQ = c.req.query("sort"); // usage(기본) | pii(PII 검수 우선)
 
     const where: string[] = ["an.status = 1"];
     const params: unknown[] = [];
@@ -3316,18 +3325,25 @@ app.get("/announces", requireAuth, requireRole(ROLE_LEVEL.developer), async (c) 
     );
     const total = Number((countRows as { total: number }[])[0]?.total ?? 0);
 
+    // 정렬: 기본은 사용순(usage). sort=pii 면 PII 검수 우선(suspect>pending>그 외) 후 사용순.
+    const annOrder =
+      sortQ === "pii"
+        ? "(CASE an.image_pii_status WHEN 'suspect' THEN 2 WHEN 'pending' THEN 1 ELSE 0 END) DESC, an.usage_count DESC, an.created_at DESC"
+        : "an.usage_count DESC, an.created_at DESC";
+
     const [rows] = await conn.query(
       `SELECT an.id, an.title, an.label, an.question, an.body, an.scope, an.topic_id, an.service_id,
               an.tags, an.approval_status, an.approved_by, an.approved_at, an.rejection_reason,
               an.merged_into_id, an.source_uncovered_id, an.source_post_id, an.created_by,
               an.usage_count, an.last_used_at, an.created_at, an.updated_at,
+              an.image_pii_status, an.pii_text_status, an.private_source_flag,
               t.slug AS topic_slug, t.label AS topic_label,
               s.slug AS service_slug, s.name AS service_name
          FROM hp_announce an
          LEFT JOIN hp_topic   t ON t.id = an.topic_id   AND t.status = 1
          LEFT JOIN hp_service s ON s.id = an.service_id AND s.status = 1
          ${whereSql}
-     ORDER BY an.usage_count DESC, an.created_at DESC
+     ORDER BY ${annOrder}
         LIMIT ${limit} OFFSET ${offset}`,
       params,
     );
