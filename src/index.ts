@@ -2513,6 +2513,60 @@ app.get("/admin/cost", requireAuth, requireRole(ROLE_LEVEL.developer), async (c)
 //   scope(common|service)·topic_id·service_id·tags(LONGTEXT JSON)·approval_status
 //   ·approved_by·approved_at·rejection_reason·merged_into_id·source_uncovered_id
 
+// ── graceful degrade: 신규/006 컬럼 존재 여부 캐시 ─────────────────
+// 운영 MySQL에 마이그레이션이 아직 미적용일 수 있다.
+// isolate 단위 lazy init — 첫 요청 시 INFORMATION_SCHEMA 조회 후 모듈 레벨 Map에 캐싱.
+// 키: `${table}.${column}`, 값: boolean.
+// ⚠ Worker isolate 수명 동안 캐시 유지 — 마이그레이션 적용 후 worker 재배포로 갱신.
+
+const _colCache = new Map<string, boolean>();
+let _colCacheInitialized = false;
+
+/** 컬럼 존재 여부를 반환. 첫 호출에서 일괄 조회·캐싱. */
+async function hasCol(conn: Queryable, table: string, column: string): Promise<boolean> {
+  const key = `${table}.${column}`;
+  if (_colCacheInitialized) return _colCache.get(key) ?? false;
+  // 첫 호출 — 007(last_verified_at·archived_reason·supersedes_id·superseded_by_id) +
+  //           006(pii_text_status·image_pii_status·private_source_flag) 대상 컬럼 일괄 조회.
+  const targets: Array<[string, string]> = [
+    ["hp_standard_answer", "last_verified_at"],
+    ["hp_standard_answer", "archived_reason"],
+    ["hp_standard_answer", "supersedes_id"],
+    ["hp_standard_answer", "superseded_by_id"],
+    ["hp_standard_answer", "pii_text_status"],
+    ["hp_standard_answer", "image_pii_status"],
+    ["hp_standard_answer", "private_source_flag"],
+    ["hp_announce", "last_verified_at"],
+    ["hp_announce", "archived_reason"],
+    ["hp_announce", "supersedes_id"],
+    ["hp_announce", "superseded_by_id"],
+    ["hp_announce", "pii_text_status"],
+    ["hp_announce", "image_pii_status"],
+    ["hp_announce", "private_source_flag"],
+  ];
+  // 초기값 false 세팅(쿼리 실패 시에도 graceful).
+  for (const [t, c] of targets) _colCache.set(`${t}.${c}`, false);
+  try {
+    const [rows] = await conn.query(
+      `SELECT TABLE_NAME, COLUMN_NAME
+         FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME IN ('hp_standard_answer','hp_announce')
+          AND COLUMN_NAME IN (
+            'last_verified_at','archived_reason','supersedes_id','superseded_by_id',
+            'pii_text_status','image_pii_status','private_source_flag'
+          )`,
+    );
+    for (const r of rows as { TABLE_NAME: string; COLUMN_NAME: string }[]) {
+      _colCache.set(`${r.TABLE_NAME}.${r.COLUMN_NAME}`, true);
+    }
+  } catch {
+    // INFORMATION_SCHEMA 조회 실패 시 모두 false — 워커는 SQL 에러 없이 동작.
+  }
+  _colCacheInitialized = true;
+  return _colCache.get(key) ?? false;
+}
+
 type SaScope = "common" | "service";
 type SaApproval = "draft" | "reviewing" | "approved" | "rejected" | "archived";
 const SA_APPROVALS: readonly SaApproval[] = ["draft", "reviewing", "approved", "rejected", "archived"];
@@ -2898,6 +2952,8 @@ app.post("/standard-answers", requireServiceToken, async (c) =>
       topicId?: number | null;
       serviceId?: number | null;
       tags?: unknown;
+      // 007 버전 링크 — 의미 변경 new row 에 기록. 컬럼 없으면 무시(graceful degrade).
+      supersedesId?: number | null;
     }>();
     const assetBase = c.env.PMS_ASSET_BASE || DEFAULT_PMS_ASSET_BASE;
     const label = (body.label ?? "").trim();
@@ -2944,12 +3000,19 @@ app.post("/standard-answers", requireServiceToken, async (c) =>
     // 저장 직전 유사 표준답변 top N (중복 경고용, §4-1). OpenSearch k-NN 전환 대상(§4-1, T2).
     const similar = await findSimilarStandardAnswers(conn, { question, topicId, serviceId });
 
+    // supersedes_id — 007 컬럼 있을 때만 INSERT에 포함(graceful degrade).
+    const supersedesId: number | null = (body.supersedesId != null && Number.isInteger(Number(body.supersedesId)))
+      ? Number(body.supersedesId) : null;
+    const hasSupersedesCol = await hasCol(conn, "hp_standard_answer", "supersedes_id");
+    const supersedesColPart = (hasSupersedesCol && supersedesId != null) ? "supersedes_id, " : "";
+    const supersedesValPart = (hasSupersedesCol && supersedesId != null) ? "?, " : "";
+
     // 모든 수집 진입점은 항상 draft 로 진입 — 무검증 답변 챗봇 직행 방지 (§3-4).
     const [ins] = await conn.query(
       `INSERT INTO hp_standard_answer
          (label, question, answer, project_id, source_post_id, source_axis, created_by,
-          ${scope != null ? "scope, " : ""}topic_id, service_id, tags, approval_status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ${scope != null ? "?, " : ""}?, ?, ?, 'draft')`,
+          ${scope != null ? "scope, " : ""}topic_id, service_id, tags, ${supersedesColPart}approval_status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ${scope != null ? "?, " : ""}?, ?, ?, ${supersedesValPart}'draft')`,
       [
         label,
         question,
@@ -2962,10 +3025,17 @@ app.post("/standard-answers", requireServiceToken, async (c) =>
         topicId,
         serviceId,
         tagsJson,
+        ...(hasSupersedesCol && supersedesId != null ? [supersedesId] : []),
       ],
     );
     return c.json(
-      { ok: true, id: (ins as { insertId: number }).insertId, approvalStatus: "draft", similar },
+      {
+        ok: true,
+        id: (ins as { insertId: number }).insertId,
+        approvalStatus: "draft",
+        similar,
+        ...(hasSupersedesCol && supersedesId != null ? { supersedesId } : {}),
+      },
       201,
     );
   }),
@@ -2982,6 +3052,8 @@ app.get("/standard-answers", requireAuth, requireRole(ROLE_LEVEL.developer), asy
     const topicIdQ = c.req.query("topicId");
     const serviceIdQ = c.req.query("serviceId");
     const approvalQ = c.req.query("approvalStatus");
+    // needsVerification=true: 007 컬럼 있을 때 재검증 필요 행 필터(§8-1, §10-3).
+    const needsVerification = c.req.query("needsVerification") === "true";
     const limit = Math.min(parseInt(c.req.query("limit") ?? "20", 10) || 20, 100);
     const offset = Math.max(parseInt(c.req.query("offset") ?? "0", 10) || 0, 0);
     const sortQ = c.req.query("sort"); // updated | created | usage(기본)
@@ -3014,6 +3086,19 @@ app.get("/standard-answers", requireAuth, requireRole(ROLE_LEVEL.developer), asy
       const like = `%${q}%`;
       params.push(like, like, like);
     }
+    // 재검증 필터(007 컬럼 있을 때만) — approved 이고 last_verified_at이 NULL 또는 180일 경과.
+    const hasLastVerifiedCol = await hasCol(conn, "hp_standard_answer", "last_verified_at");
+    if (needsVerification) {
+      if (hasLastVerifiedCol) {
+        where.push(
+          "sa.approval_status = 'approved'" +
+          " AND (sa.last_verified_at IS NULL OR sa.last_verified_at < NOW() - INTERVAL 180 DAY)",
+        );
+      } else {
+        // 컬럼 없으면 빈 결과 반환(graceful degrade).
+        return c.json({ total: 0, limit, offset, rows: [], needsVerificationSkipped: true });
+      }
+    }
     const whereSql = `WHERE ${where.join(" AND ")}`;
 
     const [countRows] = await conn.query(
@@ -3043,12 +3128,35 @@ app.get("/standard-answers", requireAuth, requireRole(ROLE_LEVEL.developer), asy
         ? `${PII_PRIORITY} DESC, sa.usage_count DESC, sa.id DESC`
         : `${SORT_COL[sField]} ${sDir}, sa.id ${sDir}`);
 
+    // 007 신규 컬럼을 SELECT에 조건부 포함(graceful degrade).
+    const hasSupersedesCol = await hasCol(conn, "hp_standard_answer", "supersedes_id");
+    const hasSupersededByCol = await hasCol(conn, "hp_standard_answer", "superseded_by_id");
+    const hasArchivedReasonCol = await hasCol(conn, "hp_standard_answer", "archived_reason");
+    const extraCols007 = [
+      ...(hasLastVerifiedCol ? ["sa.last_verified_at"] : []),
+      ...(hasSupersedesCol ? ["sa.supersedes_id"] : []),
+      ...(hasSupersededByCol ? ["sa.superseded_by_id"] : []),
+      ...(hasArchivedReasonCol ? ["sa.archived_reason"] : []),
+    ].join(", ");
+
+    // 006 PII 컬럼 존재 여부(SELECT 조건부 포함).
+    const hasPiiTextCol = await hasCol(conn, "hp_standard_answer", "pii_text_status");
+    const hasImagePiiCol = await hasCol(conn, "hp_standard_answer", "image_pii_status");
+    const hasPrivateSrcCol = await hasCol(conn, "hp_standard_answer", "private_source_flag");
+    const extraCols006 = [
+      ...(hasImagePiiCol ? ["sa.image_pii_status"] : []),
+      ...(hasPiiTextCol ? ["sa.pii_text_status"] : []),
+      ...(hasPrivateSrcCol ? ["sa.private_source_flag"] : []),
+    ].join(", ");
+
+    const extraColsSql = [extraCols006, extraCols007].filter(Boolean).join(", ");
+
     const [rows] = await conn.query(
       `SELECT sa.id, sa.label, sa.question, sa.answer, sa.project_id, sa.source_post_id, sa.source_axis,
               sa.created_by, sa.usage_count, sa.last_used_at, sa.created_at, sa.updated_at,
               sa.scope, sa.topic_id, sa.service_id, sa.tags, sa.approval_status,
-              sa.approved_by, sa.approved_at, sa.rejection_reason, sa.merged_into_id, sa.source_uncovered_id,
-              sa.image_pii_status, sa.pii_text_status, sa.private_source_flag,
+              sa.approved_by, sa.approved_at, sa.rejection_reason, sa.merged_into_id, sa.source_uncovered_id
+              ${extraColsSql ? ", " + extraColsSql : ""},
               t.slug AS topic_slug, t.label AS topic_label,
               s.slug AS service_slug, s.name AS service_name
          FROM hp_standard_answer sa
@@ -3087,6 +3195,14 @@ app.get("/standard-answers/:id", requireAuth, requireRole(ROLE_LEVEL.developer),
   withConn(c, async (conn) => {
     const id = parseInt(c.req.param("id"), 10);
     if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
+    // 007 컬럼 존재 여부 확인 후 SELECT에 조건부 포함(graceful degrade).
+    // sa.* 는 이미 존재 컬럼만 반환하므로 SQL 에러는 없으나, 미적용 환경에서 응답 형상 일관성을 위해 null로 채움.
+    const [hasLVA, hasSID, hasSBID, hasAR] = await Promise.all([
+      hasCol(conn, "hp_standard_answer", "last_verified_at"),
+      hasCol(conn, "hp_standard_answer", "supersedes_id"),
+      hasCol(conn, "hp_standard_answer", "superseded_by_id"),
+      hasCol(conn, "hp_standard_answer", "archived_reason"),
+    ]);
     const [rows] = await conn.query(
       `SELECT sa.*, t.slug AS topic_slug, t.label AS topic_label,
               s.slug AS service_slug, s.name AS service_name
@@ -3096,9 +3212,17 @@ app.get("/standard-answers/:id", requireAuth, requireRole(ROLE_LEVEL.developer),
         WHERE sa.id = ? AND sa.status = 1`,
       [id],
     );
-    const r = (rows as { tags?: unknown }[])[0];
+    const r = (rows as Record<string, unknown>[])[0];
     if (!r) return c.json({ error: "not found" }, 404);
-    return c.json({ ...r, tags: parseTags(r.tags) });
+    // 007 컬럼이 DB에 없으면 응답에 null로 명시(admin 형상 일관성).
+    return c.json({
+      ...r,
+      tags: parseTags(r.tags),
+      last_verified_at: hasLVA ? (r.last_verified_at ?? null) : null,
+      supersedes_id: hasSID ? (r.supersedes_id ?? null) : null,
+      superseded_by_id: hasSBID ? (r.superseded_by_id ?? null) : null,
+      archived_reason: hasAR ? (r.archived_reason ?? null) : null,
+    });
   }),
 );
 
@@ -3216,16 +3340,23 @@ app.post("/standard-answers/:id/use", requireServiceToken, async (c) =>
   }),
 );
 
-// 승인 워크플로 상태 전이 (§3-2/§3-3). body { to, reason? }.
+// 승인 워크플로 상태 전이 (§3-2/§3-3). body { to, reason?, archivedReason? }.
 // 전이표(SA_TRANSITIONS) 위반 시 422. approved 시 approved_by(세션)·approved_at=NOW().
 // rejected 시 rejection_reason 필수. 가드 developer↑ (승인/반려/보관/검토착수/재작업/복원 모두).
 //   - 정본 §3-3 은 draft→reviewing(검토착수)을 agent(자기 제안)도 허용하나,
 //     현 가드 체계엔 "본인 제안" 판별이 없어 우선 developer↑ 로 통일(보고: 확인 필요).
+// reviewing→approved 자동 게이트(§10-3):
+//   (A) 분류 게이트: scope='service' 인데 service_id IS NULL → 422 ERR_CLASSIFY
+//   (B) PII 게이트(006 컬럼 있을 때): pii_text_status='blocked' 또는 이미지 차단 → 422 ERR_PII
+//   통과 시 응답에 gate:{classification,pii} 포함.
+// reviewing→approved + supersedes_id 있을 때 원자적 버전 교체(007 컬럼 있을 때):
+//   신규 row approved + 구본 archived (동일 트랜잭션).
+// approved→archived: archivedReason 입력 수용(007 컬럼 있을 때).
 app.patch("/standard-answers/:id/transition", requireAuth, requireRole(ROLE_LEVEL.developer), async (c) =>
   withConn(c, async (conn) => {
     const id = parseInt(c.req.param("id"), 10);
     if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
-    type TransBody = { to?: string; reason?: string };
+    type TransBody = { to?: string; reason?: string; archivedReason?: string };
     const body = await c.req.json<TransBody>().catch((): TransBody => ({}));
     const to = body.to;
     if (!to || !(SA_APPROVALS as readonly string[]).includes(to)) {
@@ -3233,11 +3364,34 @@ app.patch("/standard-answers/:id/transition", requireAuth, requireRole(ROLE_LEVE
     }
     const target = to as SaApproval;
 
+    // 007 컬럼 존재 여부 사전 확인(graceful degrade).
+    const [hasSupersedesCol, hasSupersededByCol, hasArchivedReasonCol, hasLastVerifiedCol] = await Promise.all([
+      hasCol(conn, "hp_standard_answer", "supersedes_id"),
+      hasCol(conn, "hp_standard_answer", "superseded_by_id"),
+      hasCol(conn, "hp_standard_answer", "archived_reason"),
+      hasCol(conn, "hp_standard_answer", "last_verified_at"),
+    ]);
+    // 006 PII 컬럼 존재 여부.
+    const [hasPiiTextCol, hasImagePiiCol] = await Promise.all([
+      hasCol(conn, "hp_standard_answer", "pii_text_status"),
+      hasCol(conn, "hp_standard_answer", "image_pii_status"),
+    ]);
+
+    // 현재 행 조회 — 분류 게이트에 필요한 scope·service_id·supersedes_id 포함.
+    const selectCols = [
+      "id", "approval_status", "scope", "service_id",
+      ...(hasSupersedesCol ? ["supersedes_id"] : []),
+    ].join(", ");
     const [rows] = await conn.query(
-      `SELECT id, approval_status FROM hp_standard_answer WHERE id = ? AND status = 1`,
+      `SELECT ${selectCols} FROM hp_standard_answer WHERE id = ? AND status = 1`,
       [id],
     );
-    const cur = (rows as { approval_status: SaApproval }[])[0];
+    const cur = (rows as {
+      approval_status: SaApproval;
+      scope: SaScope;
+      service_id: number | null;
+      supersedes_id?: number | null;
+    }[])[0];
     if (!cur) return c.json({ error: "not found" }, 404);
     const from = cur.approval_status;
 
@@ -3251,46 +3405,142 @@ app.patch("/standard-answers/:id/transition", requireAuth, requireRole(ROLE_LEVE
       return c.json({ error: "rejection_reason required for rejected (§3-4)" }, 400);
     }
 
-    // ── 텍스트 PII 게이트(B): approved 전이 직전 본문 스캔 ──
-    //   고유식별정보 발견 → pii_text_status='blocked' 기록 + 승인 거부(422). PII 값은 응답·로그에 미노출.
-    if (target === "approved") {
-      const gate = await applyTextPiiGate(conn, "hp_standard_answer", id);
-      if (gate.blocked) {
+    // ── reviewing→approved 자동 게이트 ──
+    // gate 결과 요약(admin UI 표시용). 컬럼 미적용 환경에서도 형상 일관성 유지.
+    type GateResult = "pass" | "fail" | "skip";
+    const gate: { classification: GateResult; pii: GateResult } = {
+      classification: "pass",
+      pii: "skip",
+    };
+
+    if (target === "approved" && from === "reviewing") {
+      // (A) 분류 게이트: scope='service' 인데 service_id IS NULL → ERR_CLASSIFY 422.
+      //     기존 컬럼(scope·service_id) — 항상 적용.
+      if (cur.scope === "service" && cur.service_id == null) {
+        gate.classification = "fail";
         return c.json({
-          error: "PII 게이트: 본문에서 고유식별정보 패턴이 발견되어 승인할 수 없습니다. 마스킹 후 재시도하세요.",
-          piiTextStatus: "blocked",
-          matchedCount: gate.matchedCount, // 건수만(값 미노출)
-          privateSource: gate.privateSource === 1,
+          error: "분류 게이트: scope=service 인데 service_id 가 지정되지 않았습니다.",
+          code: "ERR_CLASSIFY",
+          failed: ["classification"],
+          gate,
         }, 422);
       }
-      // ── 이미지 PII 하드 게이트(M-1): 이미지 보유 + 미검수/의심/차단이면 승인 거부 ──
-      //    admin imageGateOk 와 정합. PII 값·이미지 src 미노출(상태만).
-      const img = await checkImageGate(conn, "hp_standard_answer", id);
-      if (img.blocked) {
+
+      // (B) PII 게이트(006 컬럼 있을 때만).
+      if (hasPiiTextCol || hasImagePiiCol) {
+        // 텍스트 PII 게이트(B): 본문 스캔. 컬럼 없으면 skip.
+        if (hasPiiTextCol) {
+          const textGate = await applyTextPiiGate(conn, "hp_standard_answer", id);
+          if (textGate.blocked) {
+            gate.pii = "fail";
+            return c.json({
+              error: "PII 게이트: 본문에서 고유식별정보 패턴이 발견되어 승인할 수 없습니다. 마스킹 후 재시도하세요.",
+              code: "ERR_PII",
+              failed: ["pii"],
+              piiTextStatus: "blocked",
+              matchedCount: textGate.matchedCount,
+              privateSource: textGate.privateSource === 1,
+              gate: { ...gate, pii: "fail" },
+            }, 422);
+          }
+        }
+        // 이미지 PII 하드 게이트(M-1): 이미지 보유 + 미검수/의심/차단 → 승인 거부.
+        if (hasImagePiiCol) {
+          const imgGate = await checkImageGate(conn, "hp_standard_answer", id);
+          if (imgGate.blocked) {
+            gate.pii = "fail";
+            return c.json({
+              error: "PII 게이트: 인용 이미지 검수가 완료되지 않아 승인할 수 없습니다. 이미지 검수(clear/removed/masked) 후 재시도하세요.",
+              code: "ERR_PII",
+              failed: ["pii"],
+              imagePiiStatus: imgGate.imagePiiStatus,
+              gate: { ...gate, pii: "fail" },
+            }, 422);
+          }
+        }
+        gate.pii = "pass";
+      }
+      // (else) 006 컬럼 없으면 pii: 'skip' 유지.
+    } else if (target === "approved") {
+      // reviewing 외 다른 상태에서 approved 로 가는 전이는 전이표에서 막히므로 여기 도달 안 함.
+      // 방어 코드: 분류 게이트만 실행.
+      if (cur.scope === "service" && cur.service_id == null) {
+        gate.classification = "fail";
         return c.json({
-          error: "PII 게이트: 인용 이미지 검수가 완료되지 않아 승인할 수 없습니다. 이미지 검수(clear/removed/masked) 후 재시도하세요.",
-          imagePiiStatus: img.imagePiiStatus,
+          error: "분류 게이트: scope=service 인데 service_id 가 지정되지 않았습니다.",
+          code: "ERR_CLASSIFY",
+          failed: ["classification"],
+          gate,
         }, 422);
       }
     }
 
+    // ── 원자적 버전 교체(reviewing→approved + supersedes_id 있을 때, 007 컬럼 있을 때) ──
+    const supersedesId: number | null = hasSupersedesCol ? (cur.supersedes_id ?? null) : null;
+    const doVersionSwap = target === "approved" && from === "reviewing" && supersedesId != null
+      && hasSupersedesCol && hasSupersededByCol && hasArchivedReasonCol;
+
+    const approver = c.get("session").email ?? null;
+
+    if (doVersionSwap) {
+      // 단일 트랜잭션 — 신규본 approved + 구본 archived 원자적.
+      await (conn as { beginTransaction(): Promise<void> }).beginTransaction();
+      try {
+        // 신규본: approved + approved_by/at + last_verified_at(컬럼 있을 때).
+        const newSets: string[] = ["approval_status = 'approved'", "approved_by = ?", "approved_at = NOW()"];
+        const newParams: unknown[] = [approver];
+        if (hasLastVerifiedCol) newSets.push("last_verified_at = NOW()");
+        newParams.push(id);
+        await conn.query(
+          `UPDATE hp_standard_answer SET ${newSets.join(", ")} WHERE id = ? AND status = 1`,
+          newParams,
+        );
+        // 구본: archived + archived_reason='superseded' + superseded_by_id=신규 id.
+        const oldSets: string[] = [
+          "approval_status = 'archived'",
+          "archived_reason = 'superseded'",
+          "superseded_by_id = ?",
+        ];
+        const oldParams: unknown[] = [id, supersedesId];
+        await conn.query(
+          `UPDATE hp_standard_answer SET ${oldSets.join(", ")} WHERE id = ? AND status = 1`,
+          oldParams,
+        );
+        await (conn as { commit(): Promise<void> }).commit();
+      } catch (txErr) {
+        await (conn as { rollback(): Promise<void> }).rollback();
+        throw txErr;
+      }
+      return c.json({ ok: true, id, from, to: target, gate, supersededId: supersedesId });
+    }
+
+    // ── 일반 전이(버전 교체 없음) ──
     const sets: string[] = ["approval_status = ?"];
     const params: unknown[] = [target];
     if (target === "approved") {
-      // 승인자·승인시각 기록 (§3-4).
       sets.push("approved_by = ?", "approved_at = NOW()");
-      params.push(c.get("session").email ?? null);
+      params.push(approver);
+      if (hasLastVerifiedCol) sets.push("last_verified_at = NOW()");
     }
     if (target === "rejected") {
       sets.push("rejection_reason = ?", "approved_by = ?");
-      params.push(reason, c.get("session").email ?? null);
+      params.push(reason, approver);
+    }
+    if (target === "archived") {
+      // archivedReason 입력 수용(007 컬럼 있을 때). 값 허용: superseded|outdated|domain_closed.
+      const archivedReasonInput = (body.archivedReason ?? "").trim();
+      const VALID_AR = ["superseded", "outdated", "domain_closed"] as const;
+      if (hasArchivedReasonCol && archivedReasonInput && (VALID_AR as readonly string[]).includes(archivedReasonInput)) {
+        sets.push("archived_reason = ?");
+        params.push(archivedReasonInput);
+      }
     }
     params.push(id);
     await conn.query(
       `UPDATE hp_standard_answer SET ${sets.join(", ")} WHERE id = ? AND status = 1`,
       params,
     );
-    return c.json({ ok: true, id, from, to: target });
+    return c.json({ ok: true, id, from, to: target, ...(target === "approved" ? { gate } : {}) });
   }),
 );
 
@@ -3382,6 +3632,7 @@ app.get("/announces", requireAuth, requireRole(ROLE_LEVEL.developer), async (c) 
     const topicIdQ = c.req.query("topicId");
     const serviceIdQ = c.req.query("serviceId");
     const approvalQ = c.req.query("approvalStatus");
+    const needsVerificationAn = c.req.query("needsVerification") === "true";
     const limit = Math.min(parseInt(c.req.query("limit") ?? "20", 10) || 20, 100);
     const offset = Math.max(parseInt(c.req.query("offset") ?? "0", 10) || 0, 0);
     const sortQ = c.req.query("sort"); // usage(기본) | pii(PII 검수 우선)
@@ -3410,6 +3661,18 @@ app.get("/announces", requireAuth, requireRole(ROLE_LEVEL.developer), async (c) 
       const like = `%${q}%`;
       params.push(like, like, like, like);
     }
+    // 재검증 필터(007 컬럼 있을 때만).
+    const hasLastVerifiedColAnList = await hasCol(conn, "hp_announce", "last_verified_at");
+    if (needsVerificationAn) {
+      if (hasLastVerifiedColAnList) {
+        where.push(
+          "an.approval_status = 'approved'" +
+          " AND (an.last_verified_at IS NULL OR an.last_verified_at < NOW() - INTERVAL 180 DAY)",
+        );
+      } else {
+        return c.json({ total: 0, limit, offset, rows: [], needsVerificationSkipped: true });
+      }
+    }
     const whereSql = `WHERE ${where.join(" AND ")}`;
 
     const [countRows] = await conn.query(
@@ -3418,18 +3681,42 @@ app.get("/announces", requireAuth, requireRole(ROLE_LEVEL.developer), async (c) 
     );
     const total = Number((countRows as { total: number }[])[0]?.total ?? 0);
 
+    // 007 신규 컬럼 조건부 SELECT.
+    const hasAnSupersedesCol = await hasCol(conn, "hp_announce", "supersedes_id");
+    const hasAnSupersededByCol = await hasCol(conn, "hp_announce", "superseded_by_id");
+    const hasAnArchivedReasonCol = await hasCol(conn, "hp_announce", "archived_reason");
+    const anExtra007 = [
+      ...(hasLastVerifiedColAnList ? ["an.last_verified_at"] : []),
+      ...(hasAnSupersedesCol ? ["an.supersedes_id"] : []),
+      ...(hasAnSupersededByCol ? ["an.superseded_by_id"] : []),
+      ...(hasAnArchivedReasonCol ? ["an.archived_reason"] : []),
+    ].join(", ");
+
+    // 006 PII 컬럼 조건부 SELECT.
+    const hasAnPiiTextCol = await hasCol(conn, "hp_announce", "pii_text_status");
+    const hasAnImagePiiCol = await hasCol(conn, "hp_announce", "image_pii_status");
+    const hasAnPrivateSrcCol = await hasCol(conn, "hp_announce", "private_source_flag");
+    const anExtra006 = [
+      ...(hasAnImagePiiCol ? ["an.image_pii_status"] : []),
+      ...(hasAnPiiTextCol ? ["an.pii_text_status"] : []),
+      ...(hasAnPrivateSrcCol ? ["an.private_source_flag"] : []),
+    ].join(", ");
+
+    const anExtraColsSql = [anExtra006, anExtra007].filter(Boolean).join(", ");
+
     // 정렬: 기본은 사용순(usage). sort=pii 면 PII 검수 우선(suspect>pending>그 외) 후 사용순.
-    const annOrder =
-      sortQ === "pii"
-        ? "(CASE an.image_pii_status WHEN 'suspect' THEN 2 WHEN 'pending' THEN 1 ELSE 0 END) DESC, an.usage_count DESC, an.created_at DESC"
-        : "an.usage_count DESC, an.created_at DESC";
+    // 006 컬럼 없으면 pii 정렬에서 image_pii_status 미참조(CASE 문 대신 단순 안정정렬).
+    const annPiiOrder = hasAnImagePiiCol
+      ? "(CASE an.image_pii_status WHEN 'suspect' THEN 2 WHEN 'pending' THEN 1 ELSE 0 END) DESC, an.usage_count DESC, an.created_at DESC"
+      : "an.usage_count DESC, an.created_at DESC";
+    const annOrder = sortQ === "pii" ? annPiiOrder : "an.usage_count DESC, an.created_at DESC";
 
     const [rows] = await conn.query(
       `SELECT an.id, an.title, an.label, an.question, an.body, an.scope, an.topic_id, an.service_id,
               an.tags, an.approval_status, an.approved_by, an.approved_at, an.rejection_reason,
               an.merged_into_id, an.source_uncovered_id, an.source_post_id, an.created_by,
-              an.usage_count, an.last_used_at, an.created_at, an.updated_at,
-              an.image_pii_status, an.pii_text_status, an.private_source_flag,
+              an.usage_count, an.last_used_at, an.created_at, an.updated_at
+              ${anExtraColsSql ? ", " + anExtraColsSql : ""},
               t.slug AS topic_slug, t.label AS topic_label,
               s.slug AS service_slug, s.name AS service_name
          FROM hp_announce an
@@ -3455,6 +3742,13 @@ app.get("/announces/:id", requireAuth, requireRole(ROLE_LEVEL.developer), async 
   withConn(c, async (conn) => {
     const id = parseInt(c.req.param("id"), 10);
     if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
+    // 007 컬럼 존재 여부 확인 후 미적용 환경에서 null로 채워 응답 형상 일관성 유지.
+    const [hasAnLVA, hasAnSID, hasAnSBID, hasAnAR] = await Promise.all([
+      hasCol(conn, "hp_announce", "last_verified_at"),
+      hasCol(conn, "hp_announce", "supersedes_id"),
+      hasCol(conn, "hp_announce", "superseded_by_id"),
+      hasCol(conn, "hp_announce", "archived_reason"),
+    ]);
     const [rows] = await conn.query(
       `SELECT an.*, t.slug AS topic_slug, t.label AS topic_label,
               s.slug AS service_slug, s.name AS service_name
@@ -3464,10 +3758,18 @@ app.get("/announces/:id", requireAuth, requireRole(ROLE_LEVEL.developer), async 
         WHERE an.id = ? AND an.status = 1`,
       [id],
     );
-    const r = (rows as { tags?: unknown; body?: string }[])[0];
+    const r = (rows as Record<string, unknown>[])[0];
     if (!r) return c.json({ error: "not found" }, 404);
-    // body→answer 매핑(SA UI 재사용).
-    return c.json({ ...r, tags: parseTags(r.tags), answer: r.body });
+    // body→answer 매핑(SA UI 재사용) + 007 컬럼 null 채움.
+    return c.json({
+      ...r,
+      tags: parseTags(r.tags),
+      answer: r.body,
+      last_verified_at: hasAnLVA ? (r.last_verified_at ?? null) : null,
+      supersedes_id: hasAnSID ? (r.supersedes_id ?? null) : null,
+      superseded_by_id: hasAnSBID ? (r.superseded_by_id ?? null) : null,
+      archived_reason: hasAnAR ? (r.archived_reason ?? null) : null,
+    });
   }),
 );
 
@@ -3680,11 +3982,12 @@ app.delete("/announces/:id", requireAuth, requireRole(ROLE_LEVEL.admin), async (
 );
 
 // 승인 워크플로 상태 전이 (§3-2/§3-3) — SA 전이표(SA_TRANSITIONS)·권한 재사용. 가드 developer↑.
+// reviewing→approved 자동 게이트 + 원자적 버전 교체 + archivedReason 수용 — SA 와 동일 정책.
 app.patch("/announces/:id/transition", requireAuth, requireRole(ROLE_LEVEL.developer), async (c) =>
   withConn(c, async (conn) => {
     const id = parseInt(c.req.param("id"), 10);
     if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
-    type TransBody = { to?: string; reason?: string };
+    type TransBody = { to?: string; reason?: string; archivedReason?: string };
     const reqBody = await c.req.json<TransBody>().catch((): TransBody => ({}));
     const to = reqBody.to;
     if (!to || !(SA_APPROVALS as readonly string[]).includes(to)) {
@@ -3692,11 +3995,32 @@ app.patch("/announces/:id/transition", requireAuth, requireRole(ROLE_LEVEL.devel
     }
     const target = to as SaApproval;
 
+    // 007·006 컬럼 존재 여부(graceful degrade).
+    const [hasSupersedesColAn, hasSupersededByColAn, hasArchivedReasonColAn, hasLastVerifiedColAn] = await Promise.all([
+      hasCol(conn, "hp_announce", "supersedes_id"),
+      hasCol(conn, "hp_announce", "superseded_by_id"),
+      hasCol(conn, "hp_announce", "archived_reason"),
+      hasCol(conn, "hp_announce", "last_verified_at"),
+    ]);
+    const [hasPiiTextColAn, hasImagePiiColAn] = await Promise.all([
+      hasCol(conn, "hp_announce", "pii_text_status"),
+      hasCol(conn, "hp_announce", "image_pii_status"),
+    ]);
+
+    const selectCols = [
+      "id", "approval_status", "scope", "service_id",
+      ...(hasSupersedesColAn ? ["supersedes_id"] : []),
+    ].join(", ");
     const [rows] = await conn.query(
-      `SELECT id, approval_status FROM hp_announce WHERE id = ? AND status = 1`,
+      `SELECT ${selectCols} FROM hp_announce WHERE id = ? AND status = 1`,
       [id],
     );
-    const cur = (rows as { approval_status: SaApproval }[])[0];
+    const cur = (rows as {
+      approval_status: SaApproval;
+      scope: SaScope;
+      service_id: number | null;
+      supersedes_id?: number | null;
+    }[])[0];
     if (!cur) return c.json({ error: "not found" }, 404);
     const from = cur.approval_status;
 
@@ -3709,43 +4033,115 @@ app.patch("/announces/:id/transition", requireAuth, requireRole(ROLE_LEVEL.devel
       return c.json({ error: "rejection_reason required for rejected (§3-4)" }, 400);
     }
 
-    // ── 텍스트 PII 게이트(B): approved 전이 직전 본문 스캔 (SA 와 동일) ──
-    if (target === "approved") {
-      const gate = await applyTextPiiGate(conn, "hp_announce", id);
-      if (gate.blocked) {
+    type GateResult = "pass" | "fail" | "skip";
+    const gate: { classification: GateResult; pii: GateResult } = { classification: "pass", pii: "skip" };
+
+    if (target === "approved" && from === "reviewing") {
+      // (A) 분류 게이트 — 항상 적용.
+      if (cur.scope === "service" && cur.service_id == null) {
+        gate.classification = "fail";
         return c.json({
-          error: "PII 게이트: 본문에서 고유식별정보 패턴이 발견되어 승인할 수 없습니다. 마스킹 후 재시도하세요.",
-          piiTextStatus: "blocked",
-          matchedCount: gate.matchedCount,
-          privateSource: gate.privateSource === 1,
+          error: "분류 게이트: scope=service 인데 service_id 가 지정되지 않았습니다.",
+          code: "ERR_CLASSIFY",
+          failed: ["classification"],
+          gate,
         }, 422);
       }
-      // ── 이미지 PII 하드 게이트(M-1): 이미지 보유 + 미검수/의심/차단이면 승인 거부 ──
-      const img = await checkImageGate(conn, "hp_announce", id);
-      if (img.blocked) {
-        return c.json({
-          error: "PII 게이트: 인용 이미지 검수가 완료되지 않아 승인할 수 없습니다. 이미지 검수(clear/removed/masked) 후 재시도하세요.",
-          imagePiiStatus: img.imagePiiStatus,
-        }, 422);
+      // (B) PII 게이트(006 컬럼 있을 때만).
+      if (hasPiiTextColAn || hasImagePiiColAn) {
+        if (hasPiiTextColAn) {
+          const textGate = await applyTextPiiGate(conn, "hp_announce", id);
+          if (textGate.blocked) {
+            gate.pii = "fail";
+            return c.json({
+              error: "PII 게이트: 본문에서 고유식별정보 패턴이 발견되어 승인할 수 없습니다. 마스킹 후 재시도하세요.",
+              code: "ERR_PII",
+              failed: ["pii"],
+              piiTextStatus: "blocked",
+              matchedCount: textGate.matchedCount,
+              privateSource: textGate.privateSource === 1,
+              gate: { ...gate, pii: "fail" },
+            }, 422);
+          }
+        }
+        if (hasImagePiiColAn) {
+          const imgGate = await checkImageGate(conn, "hp_announce", id);
+          if (imgGate.blocked) {
+            gate.pii = "fail";
+            return c.json({
+              error: "PII 게이트: 인용 이미지 검수가 완료되지 않아 승인할 수 없습니다. 이미지 검수(clear/removed/masked) 후 재시도하세요.",
+              code: "ERR_PII",
+              failed: ["pii"],
+              imagePiiStatus: imgGate.imagePiiStatus,
+              gate: { ...gate, pii: "fail" },
+            }, 422);
+          }
+        }
+        gate.pii = "pass";
       }
+    }
+
+    // 원자적 버전 교체(reviewing→approved + supersedes_id 있을 때, 007 컬럼 있을 때).
+    const supersedesIdAn: number | null = hasSupersedesColAn ? (cur.supersedes_id ?? null) : null;
+    const doVersionSwapAn = target === "approved" && from === "reviewing" && supersedesIdAn != null
+      && hasSupersedesColAn && hasSupersededByColAn && hasArchivedReasonColAn;
+
+    const approverAn = c.get("session").email ?? null;
+
+    if (doVersionSwapAn) {
+      await (conn as { beginTransaction(): Promise<void> }).beginTransaction();
+      try {
+        const newSets: string[] = ["approval_status = 'approved'", "approved_by = ?", "approved_at = NOW()"];
+        const newParams: unknown[] = [approverAn];
+        if (hasLastVerifiedColAn) newSets.push("last_verified_at = NOW()");
+        newParams.push(id);
+        await conn.query(
+          `UPDATE hp_announce SET ${newSets.join(", ")} WHERE id = ? AND status = 1`,
+          newParams,
+        );
+        const oldSets: string[] = [
+          "approval_status = 'archived'",
+          "archived_reason = 'superseded'",
+          "superseded_by_id = ?",
+        ];
+        const oldParams: unknown[] = [id, supersedesIdAn];
+        await conn.query(
+          `UPDATE hp_announce SET ${oldSets.join(", ")} WHERE id = ? AND status = 1`,
+          oldParams,
+        );
+        await (conn as { commit(): Promise<void> }).commit();
+      } catch (txErr) {
+        await (conn as { rollback(): Promise<void> }).rollback();
+        throw txErr;
+      }
+      return c.json({ ok: true, id, from, to: target, gate, supersededId: supersedesIdAn });
     }
 
     const sets: string[] = ["approval_status = ?"];
     const params: unknown[] = [target];
     if (target === "approved") {
       sets.push("approved_by = ?", "approved_at = NOW()");
-      params.push(c.get("session").email ?? null);
+      params.push(approverAn);
+      if (hasLastVerifiedColAn) sets.push("last_verified_at = NOW()");
     }
     if (target === "rejected") {
       sets.push("rejection_reason = ?", "approved_by = ?");
-      params.push(reason, c.get("session").email ?? null);
+      params.push(reason, approverAn);
+    }
+    if (target === "archived") {
+      const archivedReasonInput = (reqBody.archivedReason ?? "").trim();
+      const VALID_AR = ["superseded", "outdated", "domain_closed"] as const;
+      if (hasArchivedReasonColAn && archivedReasonInput && (VALID_AR as readonly string[]).includes(archivedReasonInput)) {
+        sets.push("archived_reason = ?");
+        params.push(archivedReasonInput);
+      }
     }
     params.push(id);
     await conn.query(
       `UPDATE hp_announce SET ${sets.join(", ")} WHERE id = ? AND status = 1`,
       params,
     );
-    return c.json({ ok: true, id, from, to: target });
+    return c.json({ ok: true, id, from, to: target, ...(target === "approved" ? { gate } : {}) });
   }),
 );
 
