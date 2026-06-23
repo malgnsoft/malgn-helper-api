@@ -5254,6 +5254,53 @@ app.get("/auth/sso", async (c) =>
   }),
 );
 
+/**
+ * 일회용 — 재점검 일괄 처분 적용(토큰 해시 가드). block→rejected(PII), archive→archived. 적용 후 라우트 제거.
+ * 모두 soft(복원 가능): rejected→draft, archived→reviewing.
+ */
+app.post("/admin/inspect/sa-apply", async (c) =>
+  withConn(c, async (conn) => {
+    const token = c.req.query("token") ?? "";
+    const EXPECTED = "82d1249b8ced9d7d3d2ddf035ebf64c4a5bb127a22cdd35e62bf9ce390a0f699";
+    if (!token || (await sha256Hex(token)) !== EXPECTED) {
+      return c.json({ error: "forbidden" }, 403);
+    }
+    const body = await c.req.json<{ block?: number[]; archive?: number[] }>().catch(() => ({}));
+    const block = (body.block ?? []).filter((n) => Number.isInteger(n));
+    const archive = (body.archive ?? []).filter((n) => Number.isInteger(n));
+    const hasArchReason = await hasCol(conn, "hp_standard_answer", "archived_reason");
+    const result: { block: number; archive: number } = { block: 0, archive: 0 };
+    await conn.query("START TRANSACTION");
+    try {
+      if (block.length) {
+        const ph = block.map(() => "?").join(",");
+        const [r] = await conn.query(
+          `UPDATE hp_standard_answer SET approval_status='rejected',
+             rejection_reason='[재점검] ERR_PII: 개인정보/식별정보 노출 — 마스킹 후 재작업', updated_at=NOW()
+           WHERE status=1 AND approval_status='approved' AND id IN (${ph})`,
+          block,
+        );
+        result.block = (r as { affectedRows?: number }).affectedRows ?? 0;
+      }
+      if (archive.length) {
+        const ph = archive.map(() => "?").join(",");
+        const setReason = hasArchReason ? ", archived_reason='outdated'" : "";
+        const [r] = await conn.query(
+          `UPDATE hp_standard_answer SET approval_status='archived'${setReason}, updated_at=NOW()
+           WHERE status=1 AND approval_status='approved' AND id IN (${ph})`,
+          archive,
+        );
+        result.archive = (r as { affectedRows?: number }).affectedRows ?? 0;
+      }
+      await conn.query("COMMIT");
+    } catch (e) {
+      await conn.query("ROLLBACK");
+      throw e;
+    }
+    return c.json({ ok: true, applied: result, requested: { block: block.length, archive: archive.length } });
+  }),
+);
+
 /** POST /auth/logout — cookie 삭제 */
 app.post("/auth/logout", (c) => {
   deleteCookie(c, SESSION_COOKIE, { path: "/" });
