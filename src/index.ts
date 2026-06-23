@@ -5254,47 +5254,6 @@ app.get("/auth/sso", async (c) =>
   }),
 );
 
-/**
- * 일회용 — AI 재생성 초안 적재(토큰 해시 가드). 원본 분류 복사 + 질문/답변 교체 → draft + supersedes_id.
- * createdBy 로 등급 구분(ai-regen / ai-regen-rewrite). approved 변경 없음. 적용 후 라우트 제거.
- */
-app.post("/admin/inspect/sa-regen-insert", async (c) =>
-  withConn(c, async (conn) => {
-    const token = c.req.query("token") ?? "";
-    const EXPECTED = "81ebe898ffc185190eb7e2d898f783c7834b6d9c8137b34af6cae363800cab5f";
-    if (!token || (await sha256Hex(token)) !== EXPECTED) {
-      return c.json({ error: "forbidden" }, 403);
-    }
-    const body = await c.req.json<{ drafts?: { sourceId: number; question: string; answer: string }[]; createdBy?: string }>().catch(() => ({}));
-    const createdBy = ["ai-regen", "ai-regen-rewrite"].includes(body.createdBy ?? "") ? body.createdBy! : "ai-regen";
-    const drafts = (body.drafts ?? []).filter(
-      (d) => Number.isInteger(d?.sourceId) && typeof d?.answer === "string" && typeof d?.question === "string",
-    );
-    const hasSup = await hasCol(conn, "hp_standard_answer", "supersedes_id");
-    const created: { sourceId: number; newId: number }[] = [];
-    await conn.query("START TRANSACTION");
-    try {
-      for (const d of drafts) {
-        const supCol = hasSup ? "supersedes_id, " : "";
-        const supSel = hasSup ? "id, " : "";
-        const [ins] = await conn.query(
-          `INSERT INTO hp_standard_answer
-             (label, question, answer, project_id, source_post_id, source_axis, created_by, scope, topic_id, service_id, tags, ${supCol}approval_status)
-           SELECT label, ?, ?, project_id, source_post_id, source_axis, ?, scope, topic_id, service_id, tags, ${supSel}'draft'
-             FROM hp_standard_answer WHERE id = ? AND status = 1`,
-          [d.question, d.answer, createdBy, d.sourceId],
-        );
-        created.push({ sourceId: d.sourceId, newId: (ins as { insertId: number }).insertId });
-      }
-      await conn.query("COMMIT");
-    } catch (e) {
-      await conn.query("ROLLBACK");
-      throw e;
-    }
-    return c.json({ ok: true, created: created.length, requested: drafts.length, createdBy, items: created });
-  }),
-);
-
 /** POST /auth/logout — cookie 삭제 */
 app.post("/auth/logout", (c) => {
   deleteCookie(c, SESSION_COOKIE, { path: "/" });
