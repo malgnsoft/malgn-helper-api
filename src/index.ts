@@ -5254,56 +5254,6 @@ app.get("/auth/sso", async (c) =>
   }),
 );
 
-/**
- * 일회용 — 007 마이그레이션(버전·최신성 컬럼/인덱스) 멱등 적용. 적용 후 라우트 제거.
- * 토큰 해시 가드(원문 토큰은 운영자만 보유). information_schema 부재 점검 후 컬럼별 ALTER.
- */
-app.post("/admin/migrate/sa-quality-007", async (c) =>
-  withConn(c, async (conn) => {
-    const token = c.req.query("token") ?? "";
-    const EXPECTED = "eb7f6d94da39f01f698a5a3aa6522f593212554fc0aeadf8975c8dd07f1dddbf";
-    if (!token || (await sha256Hex(token)) !== EXPECTED) {
-      return c.json({ error: "forbidden" }, 403);
-    }
-    const tables = ["hp_standard_answer", "hp_announce"];
-    const columns = [
-      { name: "last_verified_at", ddl: "ADD COLUMN last_verified_at DATETIME NULL" },
-      { name: "archived_reason", ddl: "ADD COLUMN archived_reason ENUM('superseded','outdated','domain_closed') NULL" },
-      { name: "supersedes_id", ddl: "ADD COLUMN supersedes_id INT NULL" },
-      { name: "superseded_by_id", ddl: "ADD COLUMN superseded_by_id INT NULL" },
-    ];
-    const indexes = [
-      { name: "idx_needs_verification", ddl: "ADD KEY idx_needs_verification (approval_status, last_verified_at)" },
-      { name: "idx_superseded_by", ddl: "ADD KEY idx_superseded_by (superseded_by_id)" },
-    ];
-    const report: Record<string, { columns: Record<string, string>; indexes: Record<string, string> }> = {};
-    for (const table of tables) {
-      report[table] = { columns: {}, indexes: {} };
-      for (const col of columns) {
-        const [rows] = await conn.query(
-          "SELECT 1 FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND COLUMN_NAME=? LIMIT 1",
-          [table, col.name],
-        );
-        if ((rows as unknown[]).length) { report[table].columns[col.name] = "exists"; continue; }
-        await conn.query(`ALTER TABLE ${table} ${col.ddl}`);
-        report[table].columns[col.name] = "added";
-      }
-      for (const idx of indexes) {
-        const [rows] = await conn.query(
-          "SELECT 1 FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND INDEX_NAME=? LIMIT 1",
-          [table, idx.name],
-        );
-        if ((rows as unknown[]).length) { report[table].indexes[idx.name] = "exists"; continue; }
-        await conn.query(`ALTER TABLE ${table} ${idx.ddl}`);
-        report[table].indexes[idx.name] = "added";
-      }
-    }
-    _colCacheInitialized = false;
-    _colCache.clear();
-    return c.json({ ok: true, migration: "007_sa_quality_version", report });
-  }),
-);
-
 /** POST /auth/logout — cookie 삭제 */
 app.post("/auth/logout", (c) => {
   deleteCookie(c, SESSION_COOKIE, { path: "/" });
