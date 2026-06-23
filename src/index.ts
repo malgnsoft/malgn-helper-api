@@ -5254,6 +5254,60 @@ app.get("/auth/sso", async (c) =>
   }),
 );
 
+/**
+ * 일회용 — 모든 표준답변(삭제분 포함) 이미지 추출 → hp_image_asset 등록(Vision 캡션·중복제거).
+ * ?dry=1 카운트만. ?limit=&offset= 배치 처리(Vision 호출 시간 분산). 적용 후 라우트 제거.
+ */
+app.post("/admin/inspect/sa-images", async (c) =>
+  withConn(c, async (conn) => {
+    const token = c.req.query("token") ?? "";
+    const EXPECTED = "56a23f5fa5b6e575910289b4c07f38d83d0b0a8c2d42cd466e7cfc9db5865d77";
+    if (!token || (await sha256Hex(token)) !== EXPECTED) {
+      return c.json({ error: "forbidden" }, 403);
+    }
+    const base = c.env.PMS_ASSET_BASE || DEFAULT_PMS_ASSET_BASE;
+    const [rows] = await conn.query(
+      `SELECT id, source_post_id, question, answer FROM hp_standard_answer`,
+    );
+    const set = new Map<string, { srcPath: string; postId: number }>();
+    for (const r of rows as { source_post_id: number | null; question: string | null; answer: string | null }[]) {
+      for (const field of [r.question, r.answer]) {
+        if (!field) continue;
+        for (const m of field.matchAll(/<img[^>]+src=["']([^"']+)["']/gi)) {
+          const src = (m[1] || "").trim();
+          if (!src || src.startsWith("data:")) continue;
+          if (!set.has(src)) set.set(src, { srcPath: src, postId: r.source_post_id || 0 });
+        }
+      }
+    }
+    const all = [...set.values()].sort((a, b) => a.srcPath.localeCompare(b.srcPath));
+    const totalDistinct = all.length;
+    if (c.req.query("dry") === "1") {
+      const hosts: Record<string, number> = {};
+      for (const it of all) {
+        const h = /^https?:\/\//.test(it.srcPath) ? new URL(it.srcPath).host : (it.srcPath.startsWith("/data/") ? "(/data→ppm)" : "(rel)");
+        hosts[h] = (hosts[h] || 0) + 1;
+      }
+      return c.json({ dry: true, totalDistinct, hosts, sample: all.slice(0, 5).map((x) => x.srcPath) });
+    }
+    const limit = Math.min(parseInt(c.req.query("limit") ?? "20", 10) || 20, 50);
+    const offset = Math.max(parseInt(c.req.query("offset") ?? "0", 10) || 0, 0);
+    const slice = all.slice(offset, offset + limit);
+    let registered = 0, reused = 0, failed = 0;
+    for (const it of slice) {
+      const absoluteUrl = absolutizePmsAssets(it.srcPath, base);
+      const res = await analyzeAndStoreImage(conn, c.env, {
+        srcPath: it.srcPath, absoluteUrl, postId: it.postId, projectId: 0, source: "reply",
+      });
+      if (!res) failed++;
+      else if (res.reused) reused++;
+      else registered++;
+    }
+    const nextOffset = offset + slice.length;
+    return c.json({ ok: true, totalDistinct, offset, processed: slice.length, registered, reused, failed, nextOffset, done: nextOffset >= totalDistinct });
+  }),
+);
+
 /** POST /auth/logout — cookie 삭제 */
 app.post("/auth/logout", (c) => {
   deleteCookie(c, SESSION_COOKIE, { path: "/" });
