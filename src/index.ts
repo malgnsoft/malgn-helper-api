@@ -5254,6 +5254,31 @@ app.get("/auth/sso", async (c) =>
   }),
 );
 
+/**
+ * 일회용 — 표준답변 전면 교체 soft-delete(토큰 해시 가드). AI 신규 초안(created_by ai-regen*)만 남기고 나머지 status=-1.
+ * ?dry=1 이면 카운트만. soft(status=-1) — 복원 가능. 적용 후 라우트 제거.
+ */
+app.post("/admin/inspect/sa-purge", async (c) =>
+  withConn(c, async (conn) => {
+    const token = c.req.query("token") ?? "";
+    const EXPECTED = "7aae0758faafd524473f7860599d246b596a696d98109e3d0616889b8fdfa15d";
+    if (!token || (await sha256Hex(token)) !== EXPECTED) {
+      return c.json({ error: "forbidden" }, 403);
+    }
+    const KEEP = "created_by IN ('ai-regen','ai-regen-rewrite')";
+    const DEL = "(created_by IS NULL OR created_by NOT IN ('ai-regen','ai-regen-rewrite'))";
+    const [keepRows] = await conn.query(`SELECT COUNT(*) AS n FROM hp_standard_answer WHERE status=1 AND ${KEEP}`);
+    const [delRows] = await conn.query(`SELECT COUNT(*) AS n FROM hp_standard_answer WHERE status=1 AND ${DEL}`);
+    const keep = Number((keepRows as { n: number }[])[0]?.n ?? 0);
+    const willDelete = Number((delRows as { n: number }[])[0]?.n ?? 0);
+    if (c.req.query("dry") === "1") return c.json({ dry: true, keep, willDelete });
+    const [r] = await conn.query(
+      `UPDATE hp_standard_answer SET status=-1, updated_at=NOW() WHERE status=1 AND ${DEL}`,
+    );
+    return c.json({ ok: true, keep, deleted: (r as { affectedRows?: number }).affectedRows ?? 0 });
+  }),
+);
+
 /** POST /auth/logout — cookie 삭제 */
 app.post("/auth/logout", (c) => {
   deleteCookie(c, SESSION_COOKIE, { path: "/" });
