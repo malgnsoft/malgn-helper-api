@@ -5254,6 +5254,38 @@ app.get("/auth/sso", async (c) =>
   }),
 );
 
+/**
+ * 일회용 — 표준답변 전수 재점검용 읽기 전용 export(토큰 해시 가드). 점검 후 라우트 제거.
+ * approved hp_standard_answer 를 사용량순으로 반환(인증 게이트 우회 아님 — 토큰 보유자만).
+ */
+app.get("/admin/inspect/sa-export", async (c) =>
+  withConn(c, async (conn) => {
+    const token = c.req.query("token") ?? "";
+    const EXPECTED = "641828dbabeb6e777b16b0d255687e0b367beb087ea48640debebc18a50f6d6d";
+    if (!token || (await sha256Hex(token)) !== EXPECTED) {
+      return c.json({ error: "forbidden" }, 403);
+    }
+    const limit = Math.min(parseInt(c.req.query("limit") ?? "200", 10) || 200, 500);
+    const offset = Math.max(parseInt(c.req.query("offset") ?? "0", 10) || 0, 0);
+    const [cntRows] = await conn.query(
+      "SELECT COUNT(*) AS total FROM hp_standard_answer WHERE status=1 AND approval_status='approved'",
+    );
+    const total = Number((cntRows as { total: number }[])[0]?.total ?? 0);
+    const [rows] = await conn.query(
+      `SELECT sa.id, sa.label, sa.question, sa.answer, sa.scope,
+              t.slug AS topic_slug, s.slug AS service_slug, sa.tags,
+              sa.usage_count, sa.source_post_id, sa.created_at, sa.last_verified_at
+         FROM hp_standard_answer sa
+         LEFT JOIN hp_topic t   ON t.id = sa.topic_id
+         LEFT JOIN hp_service s ON s.id = sa.service_id
+        WHERE sa.status=1 AND sa.approval_status='approved'
+        ORDER BY sa.usage_count DESC, sa.id
+        LIMIT ${limit} OFFSET ${offset}`,
+    );
+    return c.json({ total, limit, offset, rows });
+  }),
+);
+
 /** POST /auth/logout — cookie 삭제 */
 app.post("/auth/logout", (c) => {
   deleteCookie(c, SESSION_COOKIE, { path: "/" });
