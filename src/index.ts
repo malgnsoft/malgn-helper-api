@@ -216,12 +216,19 @@ type SessionPayload = {
 // 역할 레벨: agent < developer(5) <= admin(9). roleOf와 정합.
 const ROLE_LEVEL = { agent: 1, developer: 5, admin: 9 } as const;
 
-/** helper_session 쿠키의 JWT를 검증하고 c.set("session")에 payload 주입. 실패 시 401. */
+/** 세션 토큰 추출 — Authorization: Bearer 우선, 없으면 helper_session 쿠키(크로스사이트 쿠키 차단 대비). */
+function getSessionToken(c: any): string | undefined {
+  const auth = c.req.header("Authorization") || c.req.header("authorization");
+  if (typeof auth === "string" && /^Bearer\s+/i.test(auth)) return auth.replace(/^Bearer\s+/i, "").trim();
+  return getCookie(c, SESSION_COOKIE);
+}
+
+/** helper_session 쿠키/Bearer 토큰의 JWT를 검증하고 c.set("session")에 payload 주입. 실패 시 401. */
 const requireAuth: MiddlewareHandler<{
   Bindings: Bindings;
   Variables: { session: SessionPayload };
 }> = async (c, next) => {
-  const token = getCookie(c, SESSION_COOKIE);
+  const token = getSessionToken(c);
   if (!token) return c.json({ error: "로그인이 필요합니다." }, 401);
   try {
     // sign은 default(HS256) → verify에도 alg 명시 (hono v4 verify는 3번째 인자 필수)
@@ -5166,6 +5173,7 @@ app.post("/auth/login", async (c) =>
 
     return c.json({
       ok: true,
+      token,
       user: {
         id: user.id,
         loginId: user.login_id,
@@ -5242,6 +5250,7 @@ app.get("/auth/sso", async (c) =>
 
     return c.json({
       ok: true,
+      token,
       user: {
         id: user.id,
         loginId: user.login_id,
@@ -5316,7 +5325,7 @@ app.post("/auth/logout", (c) => {
 
 /** GET /auth/me — 현재 세션 사용자 (미인증 시 401) */
 app.get("/auth/me", async (c) => {
-  const token = getCookie(c, SESSION_COOKIE);
+  const token = getSessionToken(c);
   if (!token) return c.json({ error: "로그인이 필요합니다." }, 401);
   try {
     const payload = (await jwtVerify(token, c.env.JWT_SECRET)) as unknown as SessionPayload;
