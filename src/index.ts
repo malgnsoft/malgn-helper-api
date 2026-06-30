@@ -371,7 +371,7 @@ app.get("/doc/openapi.json", (c) => c.json(openapiSpec));
 
 const WBS_KEY = "wbs/wbs.json";
 
-app.get("/wbs", async (c) => {
+app.get("/wbs", requireAuth, async (c) => {
   const obj = await c.env.R2.get(WBS_KEY);
   if (!obj) return c.json({ exists: false }, 404);
   const body = await obj.text();
@@ -471,7 +471,7 @@ async function analyzeAndStoreImage(
   }
 }
 // 프로젝트의 게시글 목록 (검색·필터·페이지네이션). 작성자 분류 칩 포함.
-app.get("/pms/projects/:id/posts", async (c) =>
+app.get("/pms/projects/:id/posts", requireAuth, async (c) =>
   withConn(c, async (conn) => {
     const id = parseInt(c.req.param("id"), 10);
     if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
@@ -561,7 +561,7 @@ app.get("/pms/projects/:id/posts", async (c) =>
 );
 
 // 프로젝트 단건 메타 (이름·그룹·발주처·상태·기간)
-app.get("/pms/projects/:id", async (c) =>
+app.get("/pms/projects/:id", requireAuth, async (c) =>
   withConn(c, async (conn) => {
     const id = parseInt(c.req.param("id"), 10);
     if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
@@ -598,7 +598,7 @@ app.get("/pms/projects/:id", async (c) =>
 );
 
 // 그룹 목록 (셀렉트박스용). site_id 기본 1, 활성만.
-app.get("/pms/groups", async (c) =>
+app.get("/pms/groups", requireAuth, async (c) =>
   withConn(c, async (conn) => {
     const siteParam = c.req.query("siteId");
     const where: string[] = ["g.status = 1"];
@@ -634,7 +634,7 @@ app.get("/pms/groups", async (c) =>
 );
 
 // 프로젝트 목록 + 간이 통계 (검색·페이지네이션).
-app.get("/pms/projects", async (c) =>
+app.get("/pms/projects", requireAuth, async (c) =>
   withConn(c, async (conn) => {
     const limit = Math.min(parseInt(c.req.query("limit") ?? "50", 10) || 50, 200);
     const offset = Math.max(parseInt(c.req.query("offset") ?? "0", 10) || 0, 0);
@@ -1048,7 +1048,7 @@ async function buildBriefingDbOnly(conn: any, id: number, timings?: Record<strin
 }
 
 // GET: 즉시 집계 (DB only) — 캐시 사용 안 함, 저장 안 함
-app.get("/pms/projects/:id/briefing", async (c) =>
+app.get("/pms/projects/:id/briefing", requireAuth, async (c) =>
   withConn(c, async (conn) => {
     const id = parseInt(c.req.param("id"), 10);
     if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
@@ -1061,7 +1061,7 @@ app.get("/pms/projects/:id/briefing", async (c) =>
 // POST: 새 브리핑 카드 생성 — hp_briefing 저장 + LLM(hotTopics)
 //   캐시: 동일 input_hash + 24h 이내면 LLM 미호출. ?force=1로 우회.
 //   LLM 실패 시 graceful degrade — DB-only 브리핑은 그대로 저장.
-app.post("/pms/projects/:id/briefing/generate", requireServiceToken, rateLimitLlm, async (c) =>
+app.post("/pms/projects/:id/briefing/generate", requireAuth, requireServiceToken, rateLimitLlm, async (c) =>
   withConn(c, async (conn) => {
     const id = parseInt(c.req.param("id"), 10);
     if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
@@ -1462,7 +1462,7 @@ app.post("/pms/projects/:id/briefing/generate", requireServiceToken, rateLimitLl
 );
 
 // GET: 프로젝트의 저장된 브리핑 목록 (히스토리 selectbox용, 메타만)
-app.get("/pms/projects/:id/briefings", async (c) =>
+app.get("/pms/projects/:id/briefings", requireAuth, async (c) =>
   withConn(c, async (conn) => {
     const id = parseInt(c.req.param("id"), 10);
     if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
@@ -1480,7 +1480,7 @@ app.get("/pms/projects/:id/briefings", async (c) =>
 );
 
 // GET: 저장된 브리핑 단건 (briefing_json 파싱)
-app.get("/pms/briefings/:id", async (c) =>
+app.get("/pms/briefings/:id", requireAuth, async (c) =>
   withConn(c, async (conn) => {
     const id = parseInt(c.req.param("id"), 10);
     if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
@@ -1503,7 +1503,7 @@ app.get("/pms/briefings/:id", async (c) =>
 );
 
 // DELETE: 저장된 브리핑 soft-delete
-app.delete("/pms/briefings/:id", async (c) =>
+app.delete("/pms/briefings/:id", requireAuth, async (c) =>
   withConn(c, async (conn) => {
     const id = parseInt(c.req.param("id"), 10);
     if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
@@ -1629,7 +1629,7 @@ const ANNOUNCE_SYSTEM_PROMPT = [
   "score가 정해지지 않으면 'warn' + scoreLabel='주의'.",
 ].join("\n");
 
-app.post("/pms/posts/:id/announce-eval/generate", requireServiceToken, rateLimitLlm, async (c) =>
+app.post("/pms/posts/:id/announce-eval/generate", requireAuth, requireServiceToken, rateLimitLlm, async (c) =>
   withConn(c, async (conn) => {
     const id = parseInt(c.req.param("id"), 10);
     if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
@@ -1859,7 +1859,7 @@ const QA_INQUIRY_ONLY_SYSTEM_PROMPT = [
   "  ◈ 문의가 모호하면 commentary에 '추가 확인이 필요한 정보(예: 환경/버전/일자)'를 1~2줄 명시.",
 ].join("\n");
 
-app.post("/pms/posts/:id/eval/generate", requireServiceToken, rateLimitLlm, async (c) =>
+app.post("/pms/posts/:id/eval/generate", requireAuth, requireServiceToken, rateLimitLlm, async (c) =>
   withConn(c, async (conn) => {
     const id = parseInt(c.req.param("id"), 10);
     if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
@@ -2170,7 +2170,7 @@ app.post("/pms/posts/:id/eval/generate", requireServiceToken, rateLimitLlm, asyn
   }),
 );
 
-app.get("/pms/posts/:id/evals", async (c) =>
+app.get("/pms/posts/:id/evals", requireAuth, async (c) =>
   withConn(c, async (conn) => {
     const id = parseInt(c.req.param("id"), 10);
     if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
@@ -2186,7 +2186,7 @@ app.get("/pms/posts/:id/evals", async (c) =>
   }),
 );
 
-app.get("/pms/evals/:id", async (c) =>
+app.get("/pms/evals/:id", requireAuth, async (c) =>
   withConn(c, async (conn) => {
     const id = parseInt(c.req.param("id"), 10);
     if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
@@ -2209,7 +2209,7 @@ app.get("/pms/evals/:id", async (c) =>
   }),
 );
 
-app.delete("/pms/evals/:id", async (c) =>
+app.delete("/pms/evals/:id", requireAuth, async (c) =>
   withConn(c, async (conn) => {
     const id = parseInt(c.req.param("id"), 10);
     if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
@@ -2222,7 +2222,7 @@ app.delete("/pms/evals/:id", async (c) =>
 // 프로젝트의 직원 응답 본문을 모아 LLM이 반복 패턴을 표준답변 후보로 정리.
 // 저장은 별도 — UI에서 후보 검토 후 POST /standard-answers 호출.
 
-app.post("/pms/projects/:id/standard-answer-suggestions", requireServiceToken, rateLimitLlm, async (c) =>
+app.post("/pms/projects/:id/standard-answer-suggestions", requireAuth, requireServiceToken, rateLimitLlm, async (c) =>
   withConn(c, async (conn) => {
     const id = parseInt(c.req.param("id"), 10);
     if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
@@ -4410,7 +4410,7 @@ app.post("/standard-answers/pii-image-scan-batch", requireServiceToken, requireA
 
 // 게시글(문의) 1건 + 작성자 + (공개) 댓글 흐름.
 // 직원/고객 구분은 email 도메인(@malgnsoft.com) 기준. private_yn='Y' 댓글 본문은 마스킹.
-app.get("/pms/posts/:id", async (c) =>
+app.get("/pms/posts/:id", requireAuth, async (c) =>
   withConn(c, async (conn) => {
     const id = parseInt(c.req.param("id"), 10);
     if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
