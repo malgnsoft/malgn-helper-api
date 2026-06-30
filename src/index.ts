@@ -190,7 +190,9 @@ app.use(
   cors({
     origin: (origin) => {
       if (!origin) return "*";
-      if (/\.pages\.dev$/.test(origin)) return origin;
+      // 가족 pages.dev 프로젝트(프로덕션 + <deploy>.* 프리뷰)만 허용 — 임의 *.pages.dev 반사 차단.
+      // 허용 대상: malgn-helper(-admin|-pms|-mng).pages.dev. credentials:true 와 결합되는 반사 범위를 좁힌다.
+      if (/^https:\/\/([a-z0-9-]+\.)?malgn-helper(-admin|-pms|-mng)?\.pages\.dev$/.test(origin)) return origin;
       if (/\.malgnsoft\.com$/.test(origin)) return origin;
       if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) return origin;
       return null;
