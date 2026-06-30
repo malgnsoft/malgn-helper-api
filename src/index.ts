@@ -5164,6 +5164,12 @@ app.get("/admin/kpi", requireAuth, requireRole(ROLE_LEVEL.developer), async (c) 
 // 세션 상수·가드(SESSION_COOKIE / requireAuth / requireRole / ROLE_LEVEL)는
 // 파일 상단(CORS 직후)으로 이전 — TDZ 회피 위해 라우트 등록보다 앞서야 함.
 
+// 핸드오프 토큰을 postMessage로 돌려줄 수 있는 허용 origin (애드온).
+const HANDOFF_ALLOWED_ORIGINS = new Set<string>([
+  "https://malgn-helper-pms.pages.dev",
+  "http://localhost:3000", // 로컬 dev
+]);
+
 /** POST /auth/login — login_id + password로 JWT 발급 + httpOnly cookie */
 app.post("/auth/login", async (c) =>
   withConn(c, async (conn) => {
@@ -5222,6 +5228,60 @@ app.post("/auth/login", async (c) =>
         level: user.level,
       },
     });
+  }),
+);
+
+/**
+ * GET /auth/access-exchange?o=<addon-origin>
+ * Cloudflare Access(requireAccess)로 검증된 이메일 → tb_user 매핑 → 앱 JWT 발급.
+ * 결과를 opener(iframe)에 postMessage로 전달하는 작은 HTML을 반환한다.
+ * 이 라우트만 Access Application으로 보호된다(다른 라우트는 requireAuth가 가드).
+ */
+app.get("/auth/access-exchange", requireAccess, async (c) =>
+  withConn(c, async (conn) => {
+    const origin = c.req.query("o") ?? "";
+    if (!HANDOFF_ALLOWED_ORIGINS.has(origin)) {
+      return c.json({ error: "disallowed origin" }, 400);
+    }
+    const email = c.get("accessEmail") as string;
+
+    const [rows] = await conn.query(
+      `SELECT id, login_id, name, email, company, level, status
+         FROM tb_user
+        WHERE email = ? AND status = 1
+        LIMIT 1`,
+      [email],
+    );
+    const user = (rows as any[])[0];
+    if (!user) {
+      return c.json({ error: "등록되지 않은 직원입니다.", email }, 403);
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    const payload: SessionPayload = {
+      sub: user.id,
+      loginId: user.login_id,
+      name: user.name ?? "",
+      email: user.email ?? "",
+      company: user.company ?? "",
+      level: user.level ?? 0,
+      iat: now,
+      exp: now + SESSION_TTL_SECONDS,
+    };
+    const token = await jwtSign(payload, c.env.JWT_SECRET);
+
+    // 브리지: opener(iframe)에 토큰 전달 후 자기 자신 닫기. origin은 검증된 값만 사용.
+    const safeOrigin = origin; // 위에서 allowlist 검증됨
+    const html = `<!doctype html><meta charset="utf-8"><title>인증 완료</title>
+<body style="font:14px system-ui;padding:24px">인증 완료. 창이 자동으로 닫힙니다…
+<script>
+(function(){
+  var msg = { type: "malgn-helper:session", token: ${JSON.stringify(token)} };
+  try { if (window.opener) window.opener.postMessage(msg, ${JSON.stringify(safeOrigin)}); } catch(e){}
+  setTimeout(function(){ try { window.close(); } catch(e){} }, 150);
+})();
+</script></body>`;
+    return c.html(html);
   }),
 );
 
