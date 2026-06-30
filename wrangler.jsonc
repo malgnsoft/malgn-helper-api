@@ -48,7 +48,12 @@
 
     // 서비스 토큰 하드 차단 플래그. PMS 프록시 전환 검증 후 "1"로 올린다.
     // "0"(또는 미설정): secret 설정+토큰 불일치도 통과(관찰 모드).
-    "SERVICE_TOKEN_ENFORCE": "0"
+    "SERVICE_TOKEN_ENFORCE": "0",
+
+    // Cloudflare Access JWT 검증용 — /auth/access-exchange 가드.
+    // CF_ACCESS_AUD 는 Cloudflare Zero Trust → Access Applications → Overview → AUD Tag 값.
+    "CF_ACCESS_TEAM_DOMAIN": "https://malgnsoft.cloudflareaccess.com",
+    "CF_ACCESS_AUD": "REPLACE_WITH_ACCESS_APPLICATION_AUD_TAG"
   }
 
   // PMS_SERVICE_TOKEN / OPENAI_API_KEY / JWT_SECRET / AI_GATEWAY_TOKEN 은
