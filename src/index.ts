@@ -5353,6 +5353,46 @@ app.post("/admin/inspect/announce-export", async (c) =>
   }),
 );
 
+/**
+ * 일회용 — AI 보안 재생성 안내글 초안 적재(토큰 해시 가드). 원본 분류·라벨 복사 + 제목/질문/본문 교체 → draft + supersedes_id.
+ * approved 변경 없음. 적용 후 라우트 제거.
+ */
+app.post("/admin/inspect/announce-regen-insert", async (c) =>
+  withConn(c, async (conn) => {
+    const token = c.req.query("token") ?? "";
+    const EXPECTED = "dc8b3cc01959e0a1b13ccc28b0fa48e467f1584f682ed6f467d7f417a3f7a10a";
+    if (!token || (await sha256Hex(token)) !== EXPECTED) {
+      return c.json({ error: "forbidden" }, 403);
+    }
+    const body = await c.req.json<{ drafts?: { sourceId: number; title: string; question: string; answer: string }[] }>().catch(() => ({}));
+    const drafts = (body.drafts ?? []).filter(
+      (d) => Number.isInteger(d?.sourceId) && typeof d?.title === "string" && typeof d?.answer === "string",
+    );
+    const hasSup = await hasCol(conn, "hp_announce", "supersedes_id");
+    const created: { sourceId: number; newId: number }[] = [];
+    await conn.query("START TRANSACTION");
+    try {
+      for (const d of drafts) {
+        const supCol = hasSup ? "supersedes_id, " : "";
+        const supSel = hasSup ? "id, " : "";
+        const [ins] = await conn.query(
+          `INSERT INTO hp_announce
+             (title, label, question, body, source_post_id, created_by, scope, topic_id, service_id, tags, ${supCol}approval_status)
+           SELECT ?, label, ?, ?, source_post_id, 'ai-regen-announce', scope, topic_id, service_id, tags, ${supSel}'draft'
+             FROM hp_announce WHERE id = ? AND status = 1`,
+          [d.title, d.question || null, d.answer, d.sourceId],
+        );
+        created.push({ sourceId: d.sourceId, newId: (ins as { insertId: number }).insertId });
+      }
+      await conn.query("COMMIT");
+    } catch (e) {
+      await conn.query("ROLLBACK");
+      throw e;
+    }
+    return c.json({ ok: true, created: created.length, requested: drafts.length, items: created });
+  }),
+);
+
 /** POST /auth/logout — cookie 삭제 */
 app.post("/auth/logout", (c) => {
   deleteCookie(c, SESSION_COOKIE, { path: "/" });
