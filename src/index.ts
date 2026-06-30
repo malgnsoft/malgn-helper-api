@@ -5237,6 +5237,10 @@ app.post("/auth/login", async (c) =>
  * 결과를 opener(iframe)에 postMessage로 전달하는 작은 HTML을 반환한다.
  * 이 라우트만 Access Application으로 보호된다(다른 라우트는 requireAuth가 가드).
  */
+// <script> 컨텍스트 안전 임베드 — JSON.stringify는 '</script>' 등의 '<'를 이스케이프하지 않으므로 보강.
+const jsonForScript = (v: unknown): string =>
+  JSON.stringify(v).replace(/</g, "\\u003c");
+
 app.get("/auth/access-exchange", requireAccess, async (c) =>
   withConn(c, async (conn) => {
     const origin = c.req.query("o") ?? "";
@@ -5254,7 +5258,8 @@ app.get("/auth/access-exchange", requireAccess, async (c) =>
     );
     const user = (rows as any[])[0];
     if (!user) {
-      return c.json({ error: "등록되지 않은 직원입니다.", email }, 403);
+      // email은 응답 바디에 넣지 않는다(로그·모니터링에 미등록 직원 목록 잔류 방지).
+      return c.json({ error: "등록되지 않은 직원입니다." }, 403);
     }
 
     const now = Math.floor(Date.now() / 1000);
@@ -5276,8 +5281,8 @@ app.get("/auth/access-exchange", requireAccess, async (c) =>
 <body style="font:14px system-ui;padding:24px">인증 완료. 창이 자동으로 닫힙니다…
 <script>
 (function(){
-  var msg = { type: "malgn-helper:session", token: ${JSON.stringify(token)} };
-  try { if (window.opener) window.opener.postMessage(msg, ${JSON.stringify(safeOrigin)}); } catch(e){}
+  var msg = { type: "malgn-helper:session", token: ${jsonForScript(token)} };
+  try { if (window.opener) window.opener.postMessage(msg, ${jsonForScript(safeOrigin)}); } catch(e){}
   setTimeout(function(){ try { window.close(); } catch(e){} }, 150);
 })();
 </script></body>`;
