@@ -4999,7 +4999,7 @@ app.post(
     }),
 );
 
-app.put("/wbs", async (c) => {
+app.put("/wbs", requireAuth, async (c) => {
   const text = await c.req.text();
   try {
     JSON.parse(text);
