@@ -5,6 +5,7 @@ import { createConnection } from "mysql2/promise";
 import { openapiSpec, docHtml } from "./openapi";
 import { callOpenAiJson, callWorkersAi } from "./llm";
 import { sign as jwtSign, verify as jwtVerify } from "hono/jwt";
+import { jwtVerify as joseVerify, createRemoteJWKSet } from "jose";
 import { getCookie, setCookie, deleteCookie } from "hono/cookie";
 import {
   parseKst14ToMs,
@@ -29,6 +30,8 @@ type Bindings = {
   PMS_SERVICE_TOKEN?: string; // wrangler secret — PMS 프록시 공유 시크릿(미설정 시 가드 통과)
   SERVICE_TOKEN_ENFORCE?: string; // vars "1"이면 secret 설정+토큰 불일치 시 401
   RL_LLM?: RateLimit; // Cloudflare Rate Limiting binding (LLM generate)
+  CF_ACCESS_TEAM_DOMAIN: string; // Zero Trust 팀 도메인 (issuer)
+  CF_ACCESS_AUD: string;         // Access Application AUD 태그
 };
 
 /** Cloudflare Rate Limiting binding 형상 (workers-types 미포함 시 대비 인라인). */
@@ -36,7 +39,10 @@ interface RateLimit {
   limit(opts: { key: string }): Promise<{ success: boolean }>;
 }
 
-const app = new Hono<{ Bindings: Bindings; Variables: { session: SessionPayload } }>();
+const app = new Hono<{
+  Bindings: Bindings;
+  Variables: { session: SessionPayload; accessEmail?: string };
+}>();
 
 const DEFAULT_PMS_ASSET_BASE = "https://ppm.malgn.co.kr";
 
@@ -298,6 +304,39 @@ const requireServiceToken: MiddlewareHandler<{
   // 관찰 모드: 차단하지 않되 헤더로 표시(로그/대시보드에서 미전환 호출 추적).
   c.header("X-Service-Token-Status", provided ? "mismatch" : "missing");
   return next();
+};
+
+// ── Cloudflare Access 가드 (/auth/access-exchange 전용) ──────────────────
+// Cf-Access-Jwt-Assertion(엣지 주입)을 원격 JWKS로 검증해 이메일을 확정한다.
+// team 도메인/AUD는 env로 주입(테스트·회전 용이). JWKS는 host별 1회 캐시.
+const _jwksCache = new Map<string, ReturnType<typeof createRemoteJWKSet>>();
+function accessJwks(teamDomain: string) {
+  let jwks = _jwksCache.get(teamDomain);
+  if (!jwks) {
+    jwks = createRemoteJWKSet(new URL(`${teamDomain}/cdn-cgi/access/certs`));
+    _jwksCache.set(teamDomain, jwks);
+  }
+  return jwks;
+}
+
+const requireAccess: MiddlewareHandler<{
+  Bindings: Bindings;
+  Variables: { session: SessionPayload; accessEmail?: string };
+}> = async (c, next) => {
+  const token = c.req.header("cf-access-jwt-assertion");
+  if (!token) return c.json({ error: "no-access-jwt" }, 401);
+  try {
+    const { payload } = await joseVerify(token, accessJwks(c.env.CF_ACCESS_TEAM_DOMAIN), {
+      issuer: c.env.CF_ACCESS_TEAM_DOMAIN,
+      audience: c.env.CF_ACCESS_AUD,
+    });
+    const email = typeof payload.email === "string" ? payload.email : "";
+    if (!email) return c.json({ error: "no-email-in-access-jwt" }, 401);
+    c.set("accessEmail", email);
+    await next();
+  } catch {
+    return c.json({ error: "invalid-access-jwt" }, 401);
+  }
 };
 
 // ── rate limit (LLM generate 4종 — IP+프로젝트/포스트 키 기준 분당 한도) ──
