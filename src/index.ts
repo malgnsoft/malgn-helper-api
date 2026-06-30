@@ -5317,6 +5317,42 @@ app.post("/admin/inspect/sa-images", async (c) =>
   }),
 );
 
+/**
+ * 일회용 — 안내글(hp_announce) 전수 검토용 읽기 export(토큰 해시 가드). 점검 후 라우트 제거.
+ */
+app.post("/admin/inspect/announce-export", async (c) =>
+  withConn(c, async (conn) => {
+    const token = c.req.query("token") ?? "";
+    const EXPECTED = "17fd909f7af521792a1a8a9b34c753eae8debb93d5524123971925f6179bef11";
+    if (!token || (await sha256Hex(token)) !== EXPECTED) {
+      return c.json({ error: "forbidden" }, 403);
+    }
+    if (c.req.query("dry") === "1") {
+      const [byStatus] = await conn.query(
+        "SELECT approval_status, COUNT(*) AS n FROM hp_announce WHERE status=1 GROUP BY approval_status",
+      );
+      const [imgRows] = await conn.query(
+        "SELECT COUNT(*) AS n FROM hp_announce WHERE status=1 AND body LIKE '%<img%'",
+      );
+      return c.json({ dry: true, byStatus, withImage: Number((imgRows as { n: number }[])[0]?.n ?? 0) });
+    }
+    const limit = Math.min(parseInt(c.req.query("limit") ?? "200", 10) || 200, 500);
+    const offset = Math.max(parseInt(c.req.query("offset") ?? "0", 10) || 0, 0);
+    const [rows] = await conn.query(
+      `SELECT a.id, a.title, a.question, a.body AS answer, a.scope,
+              t.slug AS topic_slug, s.slug AS service_slug, a.tags,
+              a.approval_status, a.source_post_id, a.created_at
+         FROM hp_announce a
+         LEFT JOIN hp_topic t   ON t.id = a.topic_id
+         LEFT JOIN hp_service s ON s.id = a.service_id
+        WHERE a.status = 1
+        ORDER BY a.id
+        LIMIT ${limit} OFFSET ${offset}`,
+    );
+    return c.json({ limit, offset, rows });
+  }),
+);
+
 /** POST /auth/logout — cookie 삭제 */
 app.post("/auth/logout", (c) => {
   deleteCookie(c, SESSION_COOKIE, { path: "/" });
