@@ -5263,6 +5263,54 @@ app.get("/auth/sso", async (c) =>
   }),
 );
 
+/**
+ * 일회용 — 안내글 마무리(토큰 해시 가드): ① ai-regen-announce 정제 초안 전부 soft-delete,
+ * ② 민감정보 원본에 '민감정보-주의' 태그 + 본문 상단 주의 배너(사유) 부착. 멱등. 적용 후 라우트 제거.
+ */
+app.post("/admin/inspect/announce-finalize", async (c) =>
+  withConn(c, async (conn) => {
+    const token = c.req.query("token") ?? "";
+    const EXPECTED = "225270ac9ae4d00f7c44b97d0ccac8ad8947ad50fa2308a9ac6b5f1266454970";
+    if (!token || (await sha256Hex(token)) !== EXPECTED) {
+      return c.json({ error: "forbidden" }, 403);
+    }
+    const body = await c.req.json<{ sensitive?: { id: number; types: string }[] }>().catch(() => ({}));
+    const sensitive = (body.sensitive ?? []).filter((s) => Number.isInteger(s?.id));
+    const TAG = "민감정보-주의";
+    let deletedDrafts = 0, labeled = 0, skipped = 0;
+    await conn.query("START TRANSACTION");
+    try {
+      const [del] = await conn.query(
+        "UPDATE hp_announce SET status=-1, updated_at=NOW() WHERE status=1 AND approval_status='draft' AND created_by='ai-regen-announce'",
+      );
+      deletedDrafts = (del as { affectedRows?: number }).affectedRows ?? 0;
+      for (const s of sensitive) {
+        const [rows] = await conn.query("SELECT body, tags FROM hp_announce WHERE id=? AND status=1", [s.id]);
+        const row = (rows as { body: string; tags: string | null }[])[0];
+        if (!row) { skipped++; continue; }
+        if (typeof row.body === "string" && row.body.includes('data-caution="민감정보"')) { skipped++; continue; }
+        const types = String(s.types || "민감정보").replace(/[<>"]/g, "");
+        const banner =
+          `<div data-caution="민감정보" style="border:1px solid #f5a3b6;background:#fff5f7;color:#a01040;padding:8px 12px;margin:0 0 10px;border-radius:6px;font-size:13px;line-height:1.5;">` +
+          `⚠️ <strong>민감정보 포함 — 취급 주의</strong><br>감지 유형: ${types}. 사유: 해당 고객 안내(접속·결제·도메인 설정 등)에 필요해 원문을 유지합니다. 챗봇 노출·외부 공유 범위에 유의하세요.</div>`;
+        let tags: string[] = [];
+        try { const p = JSON.parse(row.tags || "[]"); if (Array.isArray(p)) tags = p.map(String); } catch { tags = []; }
+        if (!tags.includes(TAG)) tags.push(TAG);
+        await conn.query(
+          "UPDATE hp_announce SET body=CONCAT(?, body), tags=?, updated_at=NOW() WHERE id=? AND status=1",
+          [banner, JSON.stringify(tags), s.id],
+        );
+        labeled++;
+      }
+      await conn.query("COMMIT");
+    } catch (e) {
+      await conn.query("ROLLBACK");
+      throw e;
+    }
+    return c.json({ ok: true, deletedDrafts, labeled, skipped });
+  }),
+);
+
 /** POST /auth/logout — cookie 삭제 */
 app.post("/auth/logout", (c) => {
   deleteCookie(c, SESSION_COOKIE, { path: "/" });
