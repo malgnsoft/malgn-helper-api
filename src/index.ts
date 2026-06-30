@@ -5263,48 +5263,6 @@ app.get("/auth/sso", async (c) =>
   }),
 );
 
-/** 일회용 — 안내글 본문 재취득(포맷팅용). 토큰 해시 가드. 적용 후 제거. */
-app.post("/admin/inspect/announce-export2", async (c) =>
-  withConn(c, async (conn) => {
-    const token = c.req.query("token") ?? "";
-    const EXPECTED = "69e88e5c8e6e0ec936d2fbc70edbbc47e18062174279a42985d77156a3f47f46";
-    if (!token || (await sha256Hex(token)) !== EXPECTED) return c.json({ error: "forbidden" }, 403);
-    const [rows] = await conn.query(
-      "SELECT id, title, body, approval_status FROM hp_announce WHERE status=1 ORDER BY id",
-    );
-    return c.json({ rows });
-  }),
-);
-
-/** 일회용 — 안내글 본문/제목 포맷팅 직접 적용(UPDATE). 토큰 해시 가드. 적용 후 제거. */
-app.post("/admin/inspect/announce-apply-format", async (c) =>
-  withConn(c, async (conn) => {
-    const token = c.req.query("token") ?? "";
-    const EXPECTED = "69e88e5c8e6e0ec936d2fbc70edbbc47e18062174279a42985d77156a3f47f46";
-    if (!token || (await sha256Hex(token)) !== EXPECTED) return c.json({ error: "forbidden" }, 403);
-    const body = await c.req.json<{ items?: { id: number; title: string; body: string }[] }>().catch(() => ({}));
-    const items = (body.items ?? []).filter(
-      (x) => Number.isInteger(x?.id) && typeof x?.title === "string" && typeof x?.body === "string",
-    );
-    let updated = 0;
-    await conn.query("START TRANSACTION");
-    try {
-      for (const it of items) {
-        const [r] = await conn.query(
-          "UPDATE hp_announce SET title=?, body=?, updated_at=NOW() WHERE id=? AND status=1",
-          [it.title.slice(0, 150), it.body, it.id],
-        );
-        if ((r as { affectedRows?: number }).affectedRows) updated++;
-      }
-      await conn.query("COMMIT");
-    } catch (e) {
-      await conn.query("ROLLBACK");
-      throw e;
-    }
-    return c.json({ ok: true, updated, requested: items.length });
-  }),
-);
-
 /** POST /auth/logout — cookie 삭제 */
 app.post("/auth/logout", (c) => {
   deleteCookie(c, SESSION_COOKIE, { path: "/" });
