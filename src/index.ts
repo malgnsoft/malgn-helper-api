@@ -5271,6 +5271,75 @@ app.get("/auth/sso", async (c) =>
   }),
 );
 
+/**
+ * GET /auth/pms-sso — 맑은도우미 PMS 임베드 SSO 핸드오프.
+ * PMS 게시판이 iframe URL에 ?ek=<해시>&email=<email>&pid=<projectId> 를 부착한다.
+ * ek = SHA-256( `${email}_${pid}_${yyyyMMdd(KST)}_MALGNHELPER_PMS` ) — PMS m.encrypt(...,"SHA-256")와 동일.
+ * 검증 성공 시 tb_user(email) 직원 계정으로 앱 JWT 발급(응답 바디 token). 쿠키는 쓰지 않음(iframe은 Bearer 사용).
+ */
+app.get("/auth/pms-sso", async (c) =>
+  withConn(c, async (conn) => {
+    const ek = (c.req.query("ek") ?? "").trim().toLowerCase();
+    const email = (c.req.query("email") ?? "").trim();
+    const pid = (c.req.query("pid") ?? "").trim();
+    if (!ek || !email || !pid) return c.json({ error: "ek, email, pid 파라미터가 필요합니다." }, 400);
+
+    // PMS(KST)의 yyyyMMdd 기준. 자정 경계·시차 허용 위해 오늘/어제 모두 대조.
+    const kstYmd = (offsetDays: number) => {
+      const d = new Date(Date.now() + 9 * 3600_000 + offsetDays * 86400_000);
+      return d.toISOString().slice(0, 10).replace(/-/g, "");
+    };
+    const expected = await Promise.all(
+      [0, -1].map((o) => sha256Hex(`${email}_${pid}_${kstYmd(o)}_MALGNHELPER_PMS`)),
+    );
+    if (!expected.some((h) => h.toLowerCase() === ek)) {
+      return c.json({ error: "유효하지 않은 PMS SSO 토큰입니다." }, 401);
+    }
+
+    const [rows] = await conn.query(
+      `SELECT id, login_id, name, email, company, level, status
+         FROM tb_user
+        WHERE email = ? AND status = 1
+        ORDER BY id
+        LIMIT 1`,
+      [email],
+    );
+    const user = (rows as any[])[0];
+    if (!user) return c.json({ error: "등록된 사용자가 아닙니다." }, 403);
+
+    const isStaff =
+      (typeof user.email === "string" && user.email.endsWith("@malgnsoft.com")) ||
+      user.company === "맑은소프트";
+    if (!isStaff) return c.json({ error: "맑은소프트 직원 계정만 접근할 수 있습니다." }, 403);
+
+    const now = Math.floor(Date.now() / 1000);
+    const payload: SessionPayload = {
+      sub: user.id,
+      loginId: user.login_id,
+      name: user.name ?? "",
+      email: user.email ?? "",
+      company: user.company ?? "",
+      level: user.level ?? 0,
+      iat: now,
+      exp: now + SESSION_TTL_SECONDS,
+    };
+    const token = await jwtSign(payload, c.env.JWT_SECRET);
+
+    return c.json({
+      ok: true,
+      token,
+      user: {
+        id: user.id,
+        loginId: user.login_id,
+        name: user.name,
+        email: user.email,
+        company: user.company,
+        level: user.level,
+      },
+    });
+  }),
+);
+
 /** POST /auth/logout — cookie 삭제 */
 app.post("/auth/logout", (c) => {
   deleteCookie(c, SESSION_COOKIE, { path: "/" });
