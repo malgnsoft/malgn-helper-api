@@ -11,9 +11,6 @@ importers:
       hono:
         specifier: ^4.6.0
         version: 4.12.23
-      jose:
-        specifier: ^5.9.6
-        version: 5.10.0
       mysql2:
         specifier: 3.22.4
         version: 3.22.4(@types/node@25.9.1)
@@ -451,9 +448,6 @@ packages:
   is-property@1.0.2:
     resolution: {integrity: sha512-Ks/IoX00TtClbGQr4TWXemAnktAQvYB7HzcCxDGqEZU6oCmb2INHuOoKxbtR+HFkmYWBKv/dOZtGRiAjDhj92g==}
 
-  jose@5.10.0:
-    resolution: {integrity: sha512-s+3Al/p9g32Iq+oqXxkW//7jk2Vig6FF1CFqzVXoTUXt2qz89YWbL+OwS17NFYEvxC35n0FKeGO2LGYSxeM2Gg==}
-
   kleur@4.1.5:
     resolution: {integrity: sha512-o+NO+8WrRiQEE4/7nwRJhN1HWpVmJm511pBHUxPLtp0BUISzlBplORYSmTclCnJvQq2tKu/sgl3xVpkc7ZWuQQ==}
     engines: {node: '>=6'}
@@ -871,8 +865,6 @@ snapshots:
       safer-buffer: 2.1.2
 
   is-property@1.0.2: {}
-
-  jose@5.10.0: {}
 
   kleur@4.1.5: {}
 
