@@ -9,7 +9,6 @@
   },
   "dependencies": {
     "hono": "^4.6.0",
-    "jose": "^5.9.6",
     "mysql2": "3.22.4"
   },
   "devDependencies": {

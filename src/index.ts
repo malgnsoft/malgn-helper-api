@@ -5,7 +5,6 @@ import { createConnection } from "mysql2/promise";
 import { openapiSpec, docHtml } from "./openapi";
 import { callOpenAiJson, callWorkersAi } from "./llm";
 import { sign as jwtSign, verify as jwtVerify } from "hono/jwt";
-import { jwtVerify as joseVerify, createRemoteJWKSet } from "jose";
 import { getCookie, setCookie, deleteCookie } from "hono/cookie";
 import {
   parseKst14ToMs,
@@ -30,8 +29,6 @@ type Bindings = {
   PMS_SERVICE_TOKEN?: string; // wrangler secret — PMS 프록시 공유 시크릿(미설정 시 가드 통과)
   SERVICE_TOKEN_ENFORCE?: string; // vars "1"이면 secret 설정+토큰 불일치 시 401
   RL_LLM?: RateLimit; // Cloudflare Rate Limiting binding (LLM generate)
-  CF_ACCESS_TEAM_DOMAIN: string; // Zero Trust 팀 도메인 (issuer)
-  CF_ACCESS_AUD: string;         // Access Application AUD 태그
 };
 
 /** Cloudflare Rate Limiting binding 형상 (workers-types 미포함 시 대비 인라인). */
@@ -41,7 +38,7 @@ interface RateLimit {
 
 const app = new Hono<{
   Bindings: Bindings;
-  Variables: { session: SessionPayload; accessEmail?: string };
+  Variables: { session: SessionPayload };
 }>();
 
 const DEFAULT_PMS_ASSET_BASE = "https://ppm.malgn.co.kr";
@@ -308,38 +305,6 @@ const requireServiceToken: MiddlewareHandler<{
   return next();
 };
 
-// ── Cloudflare Access 가드 (/auth/access-exchange 전용) ──────────────────
-// Cf-Access-Jwt-Assertion(엣지 주입)을 원격 JWKS로 검증해 이메일을 확정한다.
-// team 도메인/AUD는 env로 주입(테스트·회전 용이). JWKS는 host별 1회 캐시.
-const _jwksCache = new Map<string, ReturnType<typeof createRemoteJWKSet>>();
-function accessJwks(teamDomain: string) {
-  let jwks = _jwksCache.get(teamDomain);
-  if (!jwks) {
-    jwks = createRemoteJWKSet(new URL(`${teamDomain}/cdn-cgi/access/certs`));
-    _jwksCache.set(teamDomain, jwks);
-  }
-  return jwks;
-}
-
-const requireAccess: MiddlewareHandler<{
-  Bindings: Bindings;
-  Variables: { session: SessionPayload; accessEmail?: string };
-}> = async (c, next) => {
-  const token = c.req.header("cf-access-jwt-assertion");
-  if (!token) return c.json({ error: "no-access-jwt" }, 401);
-  try {
-    const { payload } = await joseVerify(token, accessJwks(c.env.CF_ACCESS_TEAM_DOMAIN), {
-      issuer: c.env.CF_ACCESS_TEAM_DOMAIN,
-      audience: c.env.CF_ACCESS_AUD,
-    });
-    const email = typeof payload.email === "string" ? payload.email : "";
-    if (!email) return c.json({ error: "no-email-in-access-jwt" }, 401);
-    c.set("accessEmail", email);
-    await next();
-  } catch {
-    return c.json({ error: "invalid-access-jwt" }, 401);
-  }
-};
 
 // ── rate limit (LLM generate 4종 — IP+프로젝트/포스트 키 기준 분당 한도) ──
 // Cloudflare Rate Limiting binding 사용(무상태·무료, KV/D1 불필요).
@@ -5166,11 +5131,6 @@ app.get("/admin/kpi", requireAuth, requireRole(ROLE_LEVEL.developer), async (c) 
 // 세션 상수·가드(SESSION_COOKIE / requireAuth / requireRole / ROLE_LEVEL)는
 // 파일 상단(CORS 직후)으로 이전 — TDZ 회피 위해 라우트 등록보다 앞서야 함.
 
-// 핸드오프 토큰을 postMessage로 돌려줄 수 있는 허용 origin (애드온).
-const HANDOFF_ALLOWED_ORIGINS = new Set<string>([
-  "https://malgn-helper-pms.pages.dev",
-  "http://localhost:3000", // 로컬 dev
-]);
 
 /** POST /auth/login — login_id + password로 JWT 발급 + httpOnly cookie */
 app.post("/auth/login", async (c) =>
@@ -5233,64 +5193,6 @@ app.post("/auth/login", async (c) =>
   }),
 );
 
-/**
- * GET /auth/access-exchange?o=<addon-origin>
- * Cloudflare Access(requireAccess)로 검증된 이메일 → tb_user 매핑 → 앱 JWT 발급.
- * 결과를 opener(iframe)에 postMessage로 전달하는 작은 HTML을 반환한다.
- * 이 라우트만 Access Application으로 보호된다(다른 라우트는 requireAuth가 가드).
- */
-// <script> 컨텍스트 안전 임베드 — JSON.stringify는 '</script>' 등의 '<'를 이스케이프하지 않으므로 보강.
-const jsonForScript = (v: unknown): string =>
-  JSON.stringify(v).replace(/</g, "\\u003c");
-
-app.get("/auth/access-exchange", requireAccess, async (c) =>
-  withConn(c, async (conn) => {
-    const origin = c.req.query("o") ?? "";
-    if (!HANDOFF_ALLOWED_ORIGINS.has(origin)) {
-      return c.json({ error: "disallowed origin" }, 400);
-    }
-    const email = c.get("accessEmail") as string;
-
-    const [rows] = await conn.query(
-      `SELECT id, login_id, name, email, company, level, status
-         FROM tb_user
-        WHERE email = ? AND status = 1
-        LIMIT 1`,
-      [email],
-    );
-    const user = (rows as any[])[0];
-    if (!user) {
-      // email은 응답 바디에 넣지 않는다(로그·모니터링에 미등록 직원 목록 잔류 방지).
-      return c.json({ error: "등록되지 않은 직원입니다." }, 403);
-    }
-
-    const now = Math.floor(Date.now() / 1000);
-    const payload: SessionPayload = {
-      sub: user.id,
-      loginId: user.login_id,
-      name: user.name ?? "",
-      email: user.email ?? "",
-      company: user.company ?? "",
-      level: user.level ?? 0,
-      iat: now,
-      exp: now + SESSION_TTL_SECONDS,
-    };
-    const token = await jwtSign(payload, c.env.JWT_SECRET);
-
-    // 브리지: opener(iframe)에 토큰 전달 후 자기 자신 닫기. origin은 검증된 값만 사용.
-    const safeOrigin = origin; // 위에서 allowlist 검증됨
-    const html = `<!doctype html><meta charset="utf-8"><title>인증 완료</title>
-<body style="font:14px system-ui;padding:24px">인증 완료. 창이 자동으로 닫힙니다…
-<script>
-(function(){
-  var msg = { type: "malgn-helper:session", token: ${jsonForScript(token)} };
-  try { if (window.opener) window.opener.postMessage(msg, ${jsonForScript(safeOrigin)}); } catch(e){}
-  setTimeout(function(){ try { window.close(); } catch(e){} }, 150);
-})();
-</script></body>`;
-    return c.html(html);
-  }),
-);
 
 /**
  * GET /auth/sso — 맑은오피스 SSO 핸드오프.
