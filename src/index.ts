@@ -7085,4 +7085,324 @@ app.get("/materials/:id", requireAuth, requireRole(ROLE_LEVEL.developer), async 
   }),
 );
 
+// ── 고객 챗봇 답변 파이프라인 (POST /chat/answer) — public + rateLimitLlm ──
+// 원칙(CLAUDE.md): 정확성·일관성 · 표준답변 우선 · 근거+출처 인용 · "모르면 모른다"(추측 금지→상담사 에스컬레이션).
+// 흐름: ① approved 표준답변 강매칭 → standard(본문 그대로)  ② RAG(Vectorize 자료 청크 임계 이상) → rag(LLM, 근거만 사용)  ③ 그 외 → escalate.
+// 모든 외부 의존(Vectorize/AI/LLM)은 graceful — 실패 시 db_only(표준답변)·escalate 폴백, 절대 500 안 냄.
+const CHAT_STD_THRESHOLD = 0.5; // 표준답변 어휘 자카드 임계(top1 ≥ → 그대로 반환)
+const CHAT_RAG_THRESHOLD = 0.5; // 자료 청크 cosine 임계(top ≥ → RAG 답변). 봇 escalation_threshold 있으면 대체.
+const CHAT_STD_FALLBACK = 0.35; // RAG 불가(Vectorize/AI 다운) 시 db_only 폴백 허용 표준답변 최소 점수.
+const CHAT_QUESTION_MAX = 2000; // 질문 길이 상한.
+const CHAT_RAG_TOPK = 6; // Vectorize top-K(자료 청크).
+const CHAT_ESCALATE_DEFAULT =
+  "문의하신 내용은 정확한 확인이 필요해 상담사에게 연결해 드리겠습니다. 잠시만 기다려 주세요.";
+
+type ChatSourceKind = "standard_answer" | "material";
+type ChatSource = {
+  kind: ChatSourceKind;
+  id: number;
+  title: string;
+  snippet?: string;
+  score?: number;
+};
+type ChatMode = "standard" | "rag" | "escalate";
+type ChatAnswerResponse = {
+  answer: string;
+  mode: ChatMode;
+  confidence: number; // 0~1
+  sources: ChatSource[];
+  usedChunks?: number;
+};
+type ChatAnswerBody = {
+  question?: unknown;
+  serviceId?: unknown;
+  botId?: unknown;
+  topicId?: unknown;
+};
+// botId 주면 hp_bot에서 로드하는 정책(서비스범위·페르소나·모름정책·에스컬레이션 임계).
+type ChatBotPolicy = {
+  serviceId: number | null;
+  name: string | null;
+  systemPrompt: string | null; // 페르소나
+  unknownPolicy: BotUnknownPolicy; // strict/normal/lenient → RAG 임계 가감
+  useStandardAnswers: boolean;
+  standardAnswerScope: BotStandardAnswerScope; // all | service
+  escalationThreshold: number; // hp_bot.escalation_threshold (0~1). 유효값이면 RAG 임계로 사용.
+};
+
+function toIntOrNull(v: unknown): number | null | "invalid" {
+  if (v === undefined || v === null) return null;
+  const n = Number(v);
+  if (!Number.isInteger(n)) return "invalid";
+  return n;
+}
+
+// RAG 자료 검색(내부 헬퍼) — /materials/search 와 동일 로직: q 임베딩(bge-m3) → Vectorize query → materialId 그룹핑.
+// 실패·미가용 시 { available:false } 로 graceful degrade(호출부가 escalate/db_only 로 폴백).
+async function chatRagSearchMaterials(
+  conn: Queryable,
+  env: Bindings,
+  q: string,
+  topK: number,
+): Promise<{
+  available: boolean;
+  results: Array<{ materialId: number; name: string; score: number; snippets: string[] }>;
+}> {
+  if (!vectorizeAvailable(env)) return { available: false, results: [] };
+  if (!(await materialTableExists(conn))) return { available: false, results: [] };
+  // 1) 질의 임베딩
+  let queryVec: number[];
+  try {
+    const out = (await env.AI.run(MATERIAL_EMBED_MODEL, { text: [q] })) as unknown as { data?: number[][] };
+    const v = out?.data?.[0];
+    if (!Array.isArray(v) || v.length === 0) throw new Error("임베딩 결과 없음");
+    queryVec = v;
+  } catch {
+    return { available: false, results: [] };
+  }
+  // 2) Vectorize 검색
+  let matches: VectorizeMatch[];
+  try {
+    const res = await env.VECTORIZE.query(queryVec, { topK, returnMetadata: "all" });
+    matches = res.matches ?? [];
+  } catch {
+    return { available: false, results: [] };
+  }
+  // 3) materialId 그룹핑(최고 score + 상위 스니펫)
+  const grouped = new Map<number, { score: number; snippets: string[] }>();
+  for (const m of matches) {
+    const md = (m.metadata ?? {}) as { materialId?: number | string; snippet?: unknown };
+    const mid = Number(md.materialId);
+    if (!Number.isFinite(mid) || mid <= 0) continue;
+    const g = grouped.get(mid) ?? { score: 0, snippets: [] };
+    if (typeof m.score === "number" && m.score > g.score) g.score = m.score;
+    if (typeof md.snippet === "string" && md.snippet && g.snippets.length < 3) g.snippets.push(md.snippet);
+    grouped.set(mid, g);
+  }
+  if (grouped.size === 0) return { available: true, results: [] };
+  // 4) hp_material 조회(status=1)로 정본 name 확보
+  const ids = [...grouped.keys()];
+  const placeholders = ids.map(() => "?").join(",");
+  const [rows] = await conn.query(
+    `SELECT id, name FROM hp_material WHERE status = 1 AND id IN (${placeholders})`,
+    ids,
+  );
+  const byId = new Map<number, string>();
+  for (const row of rows as { id: number; name: string }[]) byId.set(Number(row.id), row.name);
+  const results = ids
+    .map((mid) => {
+      const name = byId.get(mid);
+      const g = grouped.get(mid);
+      if (name == null || !g) return null;
+      return { materialId: mid, name, score: g.score, snippets: g.snippets };
+    })
+    .filter((x): x is { materialId: number; name: string; score: number; snippets: string[] } => x !== null)
+    .sort((a, b) => b.score - a.score);
+  return { available: true, results };
+}
+
+// unknown_policy → RAG 임계 가감(strict=엄격/더 자주 에스컬레이션, lenient=완화).
+function ragThresholdFor(policy: ChatBotPolicy | null): number {
+  let base = CHAT_RAG_THRESHOLD;
+  if (policy && policy.escalationThreshold > 0 && policy.escalationThreshold < 1) {
+    base = policy.escalationThreshold; // 봇 설정값 우선.
+  }
+  if (policy?.unknownPolicy === "strict") base += 0.1;
+  else if (policy?.unknownPolicy === "lenient") base -= 0.1;
+  return Math.min(0.95, Math.max(0.2, base));
+}
+
+app.post("/chat/answer", rateLimitLlm, async (c) =>
+  withConn(c, async (conn) => {
+    // ── 입력 검증(public → 신뢰 불가 데이터 가정) ──
+    const body = await c.req.json<ChatAnswerBody>().catch((): ChatAnswerBody => ({}));
+    const question = typeof body.question === "string" ? body.question.trim() : "";
+    if (!question) return c.json({ error: "question required" }, 400);
+    if (question.length > CHAT_QUESTION_MAX) {
+      return c.json({ error: `question too long (<=${CHAT_QUESTION_MAX})` }, 400);
+    }
+    const sidIn = toIntOrNull(body.serviceId);
+    if (sidIn === "invalid") return c.json({ error: "invalid serviceId" }, 400);
+    const botIn = toIntOrNull(body.botId);
+    if (botIn === "invalid") return c.json({ error: "invalid botId" }, 400);
+    const topicIn = toIntOrNull(body.topicId);
+    if (topicIn === "invalid") return c.json({ error: "invalid topicId" }, 400);
+
+    // ── 봇 정책 로드(botId 있을 때만; 실패는 graceful) ──
+    let policy: ChatBotPolicy | null = null;
+    if (botIn != null) {
+      try {
+        const [brows] = await conn.query(
+          `SELECT service_id, name, system_prompt, unknown_policy, escalation_threshold,
+                  use_standard_answers, standard_answer_scope
+             FROM hp_bot WHERE id = ? AND status = 1`,
+          [botIn],
+        );
+        const b = (brows as Array<{
+          service_id: number | null;
+          name: string | null;
+          system_prompt: string | null;
+          unknown_policy: BotUnknownPolicy;
+          escalation_threshold: string | number;
+          use_standard_answers: number;
+          standard_answer_scope: BotStandardAnswerScope;
+        }>)[0];
+        if (b) {
+          policy = {
+            serviceId: b.service_id,
+            name: b.name,
+            systemPrompt: b.system_prompt,
+            unknownPolicy: b.unknown_policy,
+            useStandardAnswers: b.use_standard_answers === 1,
+            standardAnswerScope: b.standard_answer_scope,
+            escalationThreshold: Number(b.escalation_threshold),
+          };
+        }
+      } catch {
+        policy = null; // 봇 로드 실패해도 파이프라인은 진행.
+      }
+    }
+    // 유효 서비스 범위: 입력 serviceId 우선, 없으면 봇의 service_id.
+    const effectiveServiceId: number | null = sidIn != null ? sidIn : policy?.serviceId ?? null;
+    const ragThreshold = ragThresholdFor(policy);
+
+    // ── ① 표준답변 우선(approved 강매칭) ──
+    // findSimilarStandardAnswers 는 status=1·pii 비차단만 반환(approval 무관) → approved 로 필터.
+    let similar: SaSimilar[] = [];
+    try {
+      similar = await findSimilarStandardAnswers(conn, {
+        question,
+        topicId: topicIn,
+        serviceId: effectiveServiceId,
+        limit: 5,
+      });
+    } catch {
+      similar = [];
+    }
+    const useSa = policy?.useStandardAnswers !== false; // 봇이 명시적으로 끈 경우만 제외.
+    let approved = useSa ? similar.filter((s) => s.approvalStatus === "approved") : [];
+    // 봇이 service 범위 제한이면 common(전역) 또는 해당 서비스 표준답변만 채택.
+    if (policy?.standardAnswerScope === "service" && effectiveServiceId != null) {
+      approved = approved.filter((s) => s.scope === "common" || s.serviceId === effectiveServiceId);
+    }
+    const topSa = approved[0] ?? null;
+
+    // approved 표준답변 본문 조회(라이브 재확인 — 조회 시점 approved·status=1). PII 텍스트 차단분 제외.
+    async function loadApprovedAnswer(id: number): Promise<string | null> {
+      try {
+        const [rows] = await conn.query(
+          `SELECT answer FROM hp_standard_answer
+             WHERE id = ? AND status = 1 AND approval_status = 'approved' AND pii_text_status <> 'blocked'`,
+          [id],
+        );
+        const r = (rows as Array<{ answer: string | null }>)[0];
+        const ans = (r?.answer ?? "").trim();
+        return ans || null;
+      } catch {
+        return null;
+      }
+    }
+
+    // 강매칭이면 표준답변 본문 그대로 반환(검증 완료본 → LLM 미경유, 최고 정확·일관).
+    if (topSa && topSa.score >= CHAT_STD_THRESHOLD) {
+      const answer = await loadApprovedAnswer(topSa.id);
+      if (answer) {
+        const resp: ChatAnswerResponse = {
+          answer,
+          mode: "standard",
+          confidence: Math.min(1, topSa.score),
+          sources: [{ kind: "standard_answer", id: topSa.id, title: topSa.label, score: topSa.score }],
+        };
+        return c.json(resp);
+      }
+      // 본문 유실 시 아래 RAG 로 진행(graceful).
+    }
+
+    // ── ② RAG(Vectorize 자료 청크) ──
+    const rag = await chatRagSearchMaterials(conn, c.env, question, CHAT_RAG_TOPK);
+    if (rag.available) {
+      const qualifying = rag.results.filter((r) => r.score >= ragThreshold);
+      if (qualifying.length > 0) {
+        // 컨텍스트: 상위 자료 청크(snippet). 중간점수 approved 표준답변 있으면 참고로 첨부.
+        const midSa = topSa && topSa.score < CHAT_STD_THRESHOLD ? topSa : null;
+        const contextParts: string[] = qualifying.map((r, i) => {
+          const snips = r.snippets.length ? r.snippets.join(" … ") : "(발췌 없음)";
+          return `[자료 ${i + 1}] 자료명: ${r.name}\n${snips}`;
+        });
+        let midSaAnswer: string | null = null;
+        if (midSa) midSaAnswer = await loadApprovedAnswer(midSa.id);
+        const persona = policy?.systemPrompt?.trim();
+        const system =
+          "너는 고객 상담 챗봇이다. 아래 규칙을 반드시 지켜라.\n" +
+          "1) 제공된 '근거 자료'에 있는 내용만 사용해 정확히 답한다.\n" +
+          "2) 근거에 없는 내용은 추측하거나 지어내지 말고, answer 대신 insufficient=true 로 표시한다.\n" +
+          "3) 답변의 각 핵심 사실 끝에 [출처: 자료명] 형태로 근거를 인용한다.\n" +
+          "4) 한국어로 정중하고 간결하게 답한다.\n" +
+          (persona ? `봇 페르소나: ${persona}\n` : "") +
+          '반드시 JSON 으로만 응답: {"answer": string, "insufficient": boolean}';
+        const user =
+          `고객 질문: ${question}\n\n근거 자료:\n${contextParts.join("\n\n")}` +
+          (midSaAnswer ? `\n\n(참고용 승인 표준답변 — 근거로 인용 가능):\n${midSaAnswer.slice(0, 1500)}` : "");
+
+        try {
+          const llm = await callOpenAiJson<{ answer?: string; insufficient?: boolean }>(c.env, {
+            system,
+            user,
+            maxTokens: 700,
+            temperature: 0.2,
+          });
+          const genAnswer = (llm.data.answer ?? "").trim();
+          const insufficient = llm.data.insufficient === true;
+          if (!insufficient && genAnswer) {
+            const topScore = qualifying[0].score;
+            const sources: ChatSource[] = qualifying.map((r) => ({
+              kind: "material",
+              id: r.materialId,
+              title: r.name,
+              snippet: r.snippets[0],
+              score: Number(r.score.toFixed(3)),
+            }));
+            const resp: ChatAnswerResponse = {
+              answer: genAnswer,
+              mode: "rag",
+              confidence: Math.min(1, Number(topScore.toFixed(3))),
+              sources,
+              usedChunks: qualifying.reduce((n, r) => n + r.snippets.length, 0),
+            };
+            return c.json(resp);
+          }
+          // insufficient → escalate 로 낙하.
+        } catch {
+          // LLM 실패 → escalate 로 낙하(graceful, 500 금지).
+        }
+      }
+    } else {
+      // ── RAG 불가(Vectorize/AI 다운) → db_only 폴백: 약하지만 approved 표준답변 있으면 사용 ──
+      if (topSa && topSa.score >= CHAT_STD_FALLBACK) {
+        const answer = await loadApprovedAnswer(topSa.id);
+        if (answer) {
+          const resp: ChatAnswerResponse = {
+            answer,
+            mode: "standard",
+            confidence: Math.min(1, topSa.score),
+            sources: [{ kind: "standard_answer", id: topSa.id, title: topSa.label, score: topSa.score }],
+          };
+          return c.json(resp);
+        }
+      }
+    }
+
+    // ── ③ 모르면 모른다 → escalate(추측 금지) ──
+    const bestScore = Math.max(topSa?.score ?? 0, rag.results[0]?.score ?? 0);
+    const resp: ChatAnswerResponse = {
+      answer: CHAT_ESCALATE_DEFAULT,
+      mode: "escalate",
+      confidence: Math.min(1, Number(bestScore.toFixed(3))),
+      sources: [],
+      usedChunks: 0,
+    };
+    return c.json(resp);
+  }),
+);
+
 export default app;
