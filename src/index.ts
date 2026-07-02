@@ -20,6 +20,7 @@ type Bindings = {
   HYPERDRIVE: Hyperdrive;
   AI: Ai;
   VECTORIZE: VectorizeIndex; // 학습 자료 청크 임베딩 인덱스(malgn-helper-material-vectors, 1024-dim cosine)
+  VECTORIZE_SA: VectorizeIndex; // 표준답변 임베딩 인덱스(malgn-helper-sa-vectors, 1024-dim cosine). SA 1건=벡터 1개. VECTORIZE(자료)와 별개.
   AI_GATEWAY_URL: string;
   AI_GATEWAY_TOKEN?: string;
   OPENAI_API_KEY: string;
@@ -2941,6 +2942,110 @@ async function findSimilarStandardAnswers(
   return scored.slice(0, limit);
 }
 
+// ── 표준답변 임베딩 색인(Vectorize: malgn-helper-sa-vectors) ──────────────────
+// 어휘 자카드 MVP 대비 의역·유사표현 강건. SA 1건 = 벡터 1개(청크 불필요).
+// 임베딩 대상 = label + "\n" + question(질문 중심; answer는 길어 제외). bge-m3(1024-dim cosine, 자료 RAG와 동일 모델).
+const SA_EMBED_MODEL = "@cf/baai/bge-m3"; // 자료(VECTORIZE)와 동일 모델·차원(1024) 일치.
+const SA_EMBED_TEXT_MAX = 2000; // 임베딩 입력 문자 상한(질문이 매우 길면 앞부분만).
+// 백필 일회용 엔드포인트 가드 — 원문 토큰의 SHA-256(원문은 호출자 별도 보유). 코드엔 해시만.
+const SA_BACKFILL_TOKEN_HASH = "564a2240a928642f5e2389dcadacff9b1c445e0c73f728fb034dda4a34b9f0ba";
+
+/** SA 임베딩·색인·필터에 필요한 최소 행 형상(라이브 조회 결과 매핑). */
+type SaVectorRow = {
+  id: number;
+  label: string;
+  question: string;
+  scope: SaScope;
+  serviceId: number | null;
+  topicId: number | null;
+};
+
+/** VECTORIZE_SA 바인딩 가용 여부 — 미바인딩/런타임 미주입 시 안전 스킵. */
+function vectorizeSaAvailable(env: Bindings): boolean {
+  const v = env.VECTORIZE_SA as unknown as
+    | { query?: unknown; upsert?: unknown; deleteByIds?: unknown }
+    | undefined;
+  return (
+    !!v &&
+    typeof v.upsert === "function" &&
+    typeof v.query === "function" &&
+    typeof v.deleteByIds === "function"
+  );
+}
+
+/** SA 벡터 id — sa-{id}. deleteByIds 로 단건 정리. */
+function saVectorId(id: number): string {
+  return `sa-${id}`;
+}
+
+/** 임베딩 입력 텍스트(label + question, 상한 절단). */
+function saEmbedText(label: string, question: string): string {
+  return `${label ?? ""}\n${question ?? ""}`.trim().slice(0, SA_EMBED_TEXT_MAX);
+}
+
+/** hex 문자열 상수시간 비교(토큰 해시 검증 — 타이밍 누출 방지). */
+function timingSafeEqualHex(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let r = 0;
+  for (let i = 0; i < a.length; i++) r |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return r === 0;
+}
+
+/**
+ * 표준답변 1건 임베딩 → VECTORIZE_SA upsert(id=sa-{id}). metadata: saId·scope·serviceId·topicId·label.
+ * Vectorize 미가용/임베딩·색인 실패는 try/catch 로 삼킴(색인 실패해도 본 흐름 진행, console.warn).
+ * metadata 는 Vectorize 제약상 string|number|boolean 만 — serviceId/topicId 는 null→0 으로 정규화.
+ */
+async function indexStandardAnswerVector(env: Bindings, saRow: SaVectorRow): Promise<void> {
+  if (!vectorizeSaAvailable(env)) return;
+  try {
+    const text = saEmbedText(saRow.label, saRow.question);
+    if (!text) return;
+    const out = (await env.AI.run(SA_EMBED_MODEL, { text: [text] })) as unknown as { data?: number[][] };
+    const values = out?.data?.[0];
+    if (!Array.isArray(values) || values.length === 0) throw new Error("임베딩 결과 없음");
+    await env.VECTORIZE_SA.upsert([
+      {
+        id: saVectorId(saRow.id),
+        values,
+        metadata: {
+          saId: saRow.id,
+          scope: saRow.scope,
+          serviceId: saRow.serviceId ?? 0,
+          topicId: saRow.topicId ?? 0,
+          label: (saRow.label ?? "").slice(0, 200),
+        },
+      },
+    ]);
+  } catch (e) {
+    console.warn(`[sa ${saRow.id}] 벡터 색인 실패: ${(e as Error).message}`.slice(0, 300));
+  }
+}
+
+/** 표준답변 벡터 제거(sa-{id}). 미가용/실패는 무시(로깅). */
+async function removeStandardAnswerVector(env: Bindings, id: number): Promise<void> {
+  if (!vectorizeSaAvailable(env)) return;
+  try {
+    await env.VECTORIZE_SA.deleteByIds([saVectorId(id)]);
+  } catch (e) {
+    console.warn(`[sa ${id}] 벡터 삭제 실패: ${(e as Error).message}`.slice(0, 300));
+  }
+}
+
+/** id 로 SA 벡터행 로드(라이프사이클 색인용). status/approval 무관 조회 — 색인 여부는 호출부 판단. */
+async function loadSaVectorRow(conn: Queryable, id: number): Promise<SaVectorRow | null> {
+  const [rows] = await conn.query(
+    `SELECT id, label, question, scope, service_id, topic_id FROM hp_standard_answer WHERE id = ? LIMIT 1`,
+    [id],
+  );
+  const r = (rows as Array<{
+    id: number; label: string; question: string; scope: SaScope;
+    service_id: number | null; topic_id: number | null;
+  }>)[0];
+  if (!r) return null;
+  return { id: r.id, label: r.label, question: r.question, scope: r.scope, serviceId: r.service_id, topicId: r.topic_id };
+}
+
 // ── 표준 답변 카탈로그 (hp_standard_answer) ────────────
 // QaEvalCard "표준답변으로 저장" 액션의 destination + 챗봇 응답 1순위 소스.
 //
@@ -3323,6 +3428,17 @@ app.patch("/standard-answers/:id", requireAuth, requireRole(ROLE_LEVEL.admin), a
       await reevaluateGateOnBodyChange(conn, "hp_standard_answer", id, newAnswer);
       gateReevaluated = true;
     }
+    // SA 임베딩 동기화 — 재평가 후 최종 상태 기준. approved 면 재색인, 아니면(강등 포함) 벡터 제거(idempotent).
+    const finalRow = await loadSaVectorRow(conn, id);
+    if (finalRow) {
+      const [statRows] = await conn.query(
+        `SELECT approval_status FROM hp_standard_answer WHERE id = ? AND status = 1 LIMIT 1`,
+        [id],
+      );
+      const approvalNow = (statRows as Array<{ approval_status: SaApproval }>)[0]?.approval_status ?? null;
+      if (approvalNow === "approved") await indexStandardAnswerVector(c.env, finalRow);
+      else await removeStandardAnswerVector(c.env, id);
+    }
     return c.json({ ok: true, affected: (result as any).affectedRows, changed: (result as any).changedRows, gateReevaluated });
   }),
 );
@@ -3335,6 +3451,8 @@ app.delete("/standard-answers/:id", requireAuth, requireRole(ROLE_LEVEL.admin), 
       `UPDATE hp_standard_answer SET status = -1 WHERE id = ?`,
       [id],
     );
+    // soft-delete → SA 벡터 제거(매칭 후보에서 즉시 배제).
+    await removeStandardAnswerVector(c.env, id);
     return c.json({ ok: true });
   }),
 );
@@ -3408,6 +3526,8 @@ app.patch("/standard-answers/:id/transition", requireAuth, requireRole(ROLE_LEVE
     }[])[0];
     if (!cur) return c.json({ error: "not found" }, 404);
     const from = cur.approval_status;
+    // SA 벡터 라이프사이클용 — from 이 이후 target 상관 흐름분석으로 좁혀지기 전 여기서 확정.
+    const wasApproved = from === "approved";
 
     // 전이 유효성 (§3-3 전이표). 같은 상태로의 no-op도 위반으로 막는다.
     if (!SA_TRANSITIONS[from]?.includes(target)) {
@@ -3525,6 +3645,10 @@ app.patch("/standard-answers/:id/transition", requireAuth, requireRole(ROLE_LEVE
         await (conn as { rollback(): Promise<void> }).rollback();
         throw txErr;
       }
+      // SA 임베딩 동기화: 신규본(approved) 색인 + 구본(archived) 벡터 제거.
+      const newRow = await loadSaVectorRow(conn, id);
+      if (newRow) await indexStandardAnswerVector(c.env, newRow);
+      await removeStandardAnswerVector(c.env, supersedesId);
       return c.json({ ok: true, id, from, to: target, gate, supersededId: supersedesId });
     }
 
@@ -3554,7 +3678,121 @@ app.patch("/standard-answers/:id/transition", requireAuth, requireRole(ROLE_LEVE
       `UPDATE hp_standard_answer SET ${sets.join(", ")} WHERE id = ? AND status = 1`,
       params,
     );
+    // SA 임베딩 라이프사이클: reviewing→approved 성공 시 색인, approved 이탈(archived 등) 시 제거.
+    if (target === "approved") {
+      const row = await loadSaVectorRow(conn, id);
+      if (row) await indexStandardAnswerVector(c.env, row);
+    } else if (wasApproved) {
+      // approved 이탈(archived 등) → 벡터 제거.
+      await removeStandardAnswerVector(c.env, id);
+    }
     return c.json({ ok: true, id, from, to: target, ...(target === "approved" ? { gate } : {}) });
+  }),
+);
+
+// ── 백필: status=1·approved 표준답변 전수 임베딩·색인(VECTORIZE_SA) ─────────────
+// 일회용 운영 엔드포인트 — 토큰 해시 가드(SA_BACKFILL_TOKEN_HASH). 원문 토큰은 호출자 보유.
+//   가드: X-Migrate-Token 헤더 또는 Authorization: Bearer <token>. SHA-256(token) === 하드코딩 해시.
+//   배치: ?limit=(1~200, 기본 100) &offset=(기본 0). id ASC 페이지네이션. 진행/누적 반환.
+//   사용: 최초 offset=0 호출 → 응답 nextOffset 을 다음 호출 offset 으로. done=true 면 완료.
+app.post("/admin/migrate/sa-vectors-backfill", async (c) =>
+  withConn(c, async (conn) => {
+    // ── 토큰 해시 가드 ──
+    const auth = c.req.header("Authorization") || c.req.header("authorization") || "";
+    const bearer = /^Bearer\s+/i.test(auth) ? auth.replace(/^Bearer\s+/i, "").trim() : "";
+    const token = (c.req.header("X-Migrate-Token") || bearer || "").trim();
+    if (!token) return c.json({ error: "unauthorized" }, 401);
+    const tokenHash = await sha256Hex(token);
+    if (!timingSafeEqualHex(tokenHash, SA_BACKFILL_TOKEN_HASH)) return c.json({ error: "unauthorized" }, 401);
+
+    if (!vectorizeSaAvailable(c.env)) return c.json({ error: "VECTORIZE_SA 미가용(바인딩 확인 필요)" }, 503);
+
+    const limit = Math.min(Math.max(parseInt(c.req.query("limit") ?? "100", 10) || 100, 1), 200);
+    const offset = Math.max(parseInt(c.req.query("offset") ?? "0", 10) || 0, 0);
+
+    // 대상 전수 카운트(진행률 표시용).
+    const [cntRows] = await conn.query(
+      `SELECT COUNT(*) AS total FROM hp_standard_answer WHERE status = 1 AND approval_status = 'approved'`,
+    );
+    const total = Number((cntRows as Array<{ total: number | string }>)[0]?.total ?? 0);
+
+    // 배치 조회(id ASC).
+    const [rows] = await conn.query(
+      `SELECT id, label, question, scope, service_id, topic_id
+         FROM hp_standard_answer
+        WHERE status = 1 AND approval_status = 'approved'
+        ORDER BY id ASC LIMIT ? OFFSET ?`,
+      [limit, offset],
+    );
+    const batch = rows as Array<{
+      id: number; label: string; question: string; scope: SaScope;
+      service_id: number | null; topic_id: number | null;
+    }>;
+
+    let indexed = 0;
+    let failed = 0;
+    if (batch.length > 0) {
+      // 임베딩 — bge-m3 입력 배열 상한(100) 단위 분할.
+      const texts = batch.map((r) => saEmbedText(r.label, r.question));
+      const embeddings: (number[] | null)[] = new Array(batch.length).fill(null);
+      const EMB_BATCH = 100;
+      for (let s = 0; s < texts.length; s += EMB_BATCH) {
+        const slice = texts.slice(s, s + EMB_BATCH);
+        try {
+          const out = (await c.env.AI.run(SA_EMBED_MODEL, { text: slice })) as unknown as { data?: number[][] };
+          const emb = out?.data ?? [];
+          for (let j = 0; j < slice.length; j++) {
+            const v = emb[j];
+            if (Array.isArray(v) && v.length > 0) embeddings[s + j] = v;
+          }
+        } catch (e) {
+          console.warn(`[sa-backfill] 임베딩 배치 실패(offset ${offset + s}): ${(e as Error).message}`.slice(0, 300));
+        }
+      }
+      // upsert 벡터 구성.
+      const vectors: VectorizeVector[] = [];
+      for (let i = 0; i < batch.length; i++) {
+        const values = embeddings[i];
+        const r = batch[i];
+        if (!values) { failed++; continue; }
+        vectors.push({
+          id: saVectorId(r.id),
+          values,
+          metadata: {
+            saId: r.id,
+            scope: r.scope,
+            serviceId: r.service_id ?? 0,
+            topicId: r.topic_id ?? 0,
+            label: (r.label ?? "").slice(0, 200),
+          },
+        });
+      }
+      if (vectors.length > 0) {
+        try {
+          await c.env.VECTORIZE_SA.upsert(vectors);
+          indexed = vectors.length;
+        } catch (e) {
+          failed += vectors.length;
+          return c.json({
+            error: `Vectorize upsert 실패: ${(e as Error).message}`.slice(0, 300),
+            batch: { limit, offset, count: batch.length },
+            total,
+          }, 502);
+        }
+      }
+    }
+
+    const processed = offset + batch.length;
+    return c.json({
+      ok: true,
+      batch: { limit, offset, count: batch.length },
+      indexed,
+      failed,
+      total,
+      processed,
+      nextOffset: processed,
+      done: processed >= total || batch.length === 0,
+    });
   }),
 );
 
@@ -7089,7 +7327,13 @@ app.get("/materials/:id", requireAuth, requireRole(ROLE_LEVEL.developer), async 
 // 원칙(CLAUDE.md): 정확성·일관성 · 표준답변 우선 · 근거+출처 인용 · "모르면 모른다"(추측 금지→상담사 에스컬레이션).
 // 흐름: ① approved 표준답변 강매칭 → standard(본문 그대로)  ② RAG(Vectorize 자료 청크 임계 이상) → rag(LLM, 근거만 사용)  ③ 그 외 → escalate.
 // 모든 외부 의존(Vectorize/AI/LLM)은 graceful — 실패 시 db_only(표준답변)·escalate 폴백, 절대 500 안 냄.
-const CHAT_STD_THRESHOLD = 0.5; // 표준답변 어휘 자카드 임계(top1 ≥ → 그대로 반환)
+const CHAT_STD_THRESHOLD = 0.5; // (폴백 전용) 표준답변 어휘 자카드 임계 — VECTORIZE_SA 미가용 시에만 사용.
+// 표준답변 임베딩(cosine) 강매칭 임계 — top1 ≥ 이면 해당 SA 본문 그대로 standard 모드 반환.
+// 봇 unknown_policy(strict/lenient)로 ±0.05 가감, 0.5~0.9 클램프(saMatchThresholdFor).
+const SA_MATCH_THRESHOLD = 0.68;
+// 강매칭 미만이지만 이 이상이면 그 SA 를 RAG 컨텍스트의 참고 근거로 넘김.
+const SA_MATCH_CONTEXT_MIN = 0.55;
+const SA_MATCH_TOPK = 5; // VECTORIZE_SA query top-K.
 const CHAT_RAG_THRESHOLD = 0.5; // 자료 청크 cosine 임계(top ≥ → RAG 답변). 봇 escalation_threshold 있으면 대체.
 const CHAT_STD_FALLBACK = 0.35; // RAG 불가(Vectorize/AI 다운) 시 db_only 폴백 허용 표준답변 최소 점수.
 const CHAT_QUESTION_MAX = 2000; // 질문 길이 상한.
@@ -7106,6 +7350,8 @@ type ChatSource = {
   score?: number;
 };
 type ChatMode = "standard" | "rag" | "escalate";
+// 표준답변 매칭 후보(임베딩 매칭 결과 또는 자카드 폴백 결과를 통일 표현).
+type SaCandidate = { id: number; label: string; score: number };
 type ChatAnswerResponse = {
   answer: string;
   mode: ChatMode;
@@ -7212,6 +7458,66 @@ function ragThresholdFor(policy: ChatBotPolicy | null): number {
   return Math.min(0.95, Math.max(0.2, base));
 }
 
+// unknown_policy → SA 임베딩 강매칭 임계 가감(strict=+0.05 더 엄격, lenient=-0.05 완화). 0.5~0.9 클램프.
+function saMatchThresholdFor(policy: ChatBotPolicy | null): number {
+  let base = SA_MATCH_THRESHOLD;
+  if (policy?.unknownPolicy === "strict") base += 0.05;
+  else if (policy?.unknownPolicy === "lenient") base -= 0.05;
+  return Math.min(0.9, Math.max(0.5, base));
+}
+
+// 표준답변 임베딩 매칭(내부 헬퍼) — 질의 임베딩(bge-m3) → VECTORIZE_SA.query(topK, returnMetadata:"all").
+//   scope='service' + serviceId 지정 시: metadata.scope='common' 또는 metadata.serviceId 일치만 채택(봇 서비스 범위).
+//   실패·미가용 시 { available:false } → 호출부가 자카드 폴백.
+async function chatQueryStandardAnswerVectors(
+  env: Bindings,
+  q: string,
+  opts: { scope: "all" | "service"; serviceId: number | null },
+): Promise<{
+  available: boolean;
+  matches: Array<{ saId: number; label: string; scope: SaScope; serviceId: number; topicId: number; score: number }>;
+}> {
+  if (!vectorizeSaAvailable(env)) return { available: false, matches: [] };
+  let queryVec: number[];
+  try {
+    const out = (await env.AI.run(SA_EMBED_MODEL, { text: [q] })) as unknown as { data?: number[][] };
+    const v = out?.data?.[0];
+    if (!Array.isArray(v) || v.length === 0) throw new Error("임베딩 결과 없음");
+    queryVec = v;
+  } catch {
+    return { available: false, matches: [] };
+  }
+  let raw: VectorizeMatch[];
+  try {
+    const res = await env.VECTORIZE_SA.query(queryVec, { topK: SA_MATCH_TOPK, returnMetadata: "all" });
+    raw = res.matches ?? [];
+  } catch {
+    return { available: false, matches: [] };
+  }
+  const matches = raw
+    .map((m) => {
+      const md = (m.metadata ?? {}) as {
+        saId?: number | string; scope?: string; serviceId?: number | string; topicId?: number | string; label?: unknown;
+      };
+      const saId = Number(md.saId);
+      if (!Number.isFinite(saId) || saId <= 0) return null;
+      const scope: SaScope = md.scope === "common" ? "common" : "service";
+      return {
+        saId,
+        label: typeof md.label === "string" ? md.label : "",
+        scope,
+        serviceId: Number(md.serviceId) || 0,
+        topicId: Number(md.topicId) || 0,
+        score: typeof m.score === "number" ? m.score : 0,
+      };
+    })
+    .filter((x): x is { saId: number; label: string; scope: SaScope; serviceId: number; topicId: number; score: number } => x !== null)
+    // 봇 service 범위: common 또는 해당 서비스만.
+    .filter((x) => !(opts.scope === "service" && opts.serviceId != null) || x.scope === "common" || x.serviceId === opts.serviceId)
+    .sort((a, b) => b.score - a.score);
+  return { available: true, matches };
+}
+
 app.post("/chat/answer", rateLimitLlm, async (c) =>
   withConn(c, async (conn) => {
     // ── 입력 검증(public → 신뢰 불가 데이터 가정) ──
@@ -7266,27 +7572,6 @@ app.post("/chat/answer", rateLimitLlm, async (c) =>
     const effectiveServiceId: number | null = sidIn != null ? sidIn : policy?.serviceId ?? null;
     const ragThreshold = ragThresholdFor(policy);
 
-    // ── ① 표준답변 우선(approved 강매칭) ──
-    // findSimilarStandardAnswers 는 status=1·pii 비차단만 반환(approval 무관) → approved 로 필터.
-    let similar: SaSimilar[] = [];
-    try {
-      similar = await findSimilarStandardAnswers(conn, {
-        question,
-        topicId: topicIn,
-        serviceId: effectiveServiceId,
-        limit: 5,
-      });
-    } catch {
-      similar = [];
-    }
-    const useSa = policy?.useStandardAnswers !== false; // 봇이 명시적으로 끈 경우만 제외.
-    let approved = useSa ? similar.filter((s) => s.approvalStatus === "approved") : [];
-    // 봇이 service 범위 제한이면 common(전역) 또는 해당 서비스 표준답변만 채택.
-    if (policy?.standardAnswerScope === "service" && effectiveServiceId != null) {
-      approved = approved.filter((s) => s.scope === "common" || s.serviceId === effectiveServiceId);
-    }
-    const topSa = approved[0] ?? null;
-
     // approved 표준답변 본문 조회(라이브 재확인 — 조회 시점 approved·status=1). PII 텍스트 차단분 제외.
     async function loadApprovedAnswer(id: number): Promise<string | null> {
       try {
@@ -7303,19 +7588,80 @@ app.post("/chat/answer", rateLimitLlm, async (c) =>
       }
     }
 
-    // 강매칭이면 표준답변 본문 그대로 반환(검증 완료본 → LLM 미경유, 최고 정확·일관).
-    if (topSa && topSa.score >= CHAT_STD_THRESHOLD) {
-      const answer = await loadApprovedAnswer(topSa.id);
-      if (answer) {
-        const resp: ChatAnswerResponse = {
-          answer,
-          mode: "standard",
-          confidence: Math.min(1, topSa.score),
-          sources: [{ kind: "standard_answer", id: topSa.id, title: topSa.label, score: topSa.score }],
-        };
-        return c.json(resp);
+    const useSa = policy?.useStandardAnswers !== false; // 봇이 명시적으로 끈 경우만 제외.
+    // RAG 컨텍스트 참고용(중간점수) SA + RAG 불가 시 db_only 폴백 후보. 둘 다 없으면 escalate.
+    let ragRefSa: SaCandidate | null = null;
+    let fallbackSa: SaCandidate | null = null;
+
+    // ── ① 표준답변 우선 — 임베딩(VECTORIZE_SA) 강매칭 → standard 모드(본문 그대로, LLM 미경유) ──
+    if (useSa) {
+      const saScopeMode: "all" | "service" = policy?.standardAnswerScope === "service" ? "service" : "all";
+      const saVec = await chatQueryStandardAnswerVectors(c.env, question, {
+        scope: saScopeMode,
+        serviceId: effectiveServiceId,
+      });
+
+      if (saVec.available) {
+        const saThreshold = saMatchThresholdFor(policy);
+        const top1 = saVec.matches[0] ?? null;
+        if (top1) {
+          if (top1.score >= saThreshold) {
+            // 강매칭 — 라이브 approved 본문 재확인 후 그대로 반환.
+            const answer = await loadApprovedAnswer(top1.saId);
+            if (answer) {
+              const resp: ChatAnswerResponse = {
+                answer,
+                mode: "standard",
+                confidence: Math.min(1, Number(top1.score.toFixed(3))),
+                sources: [{ kind: "standard_answer", id: top1.saId, title: top1.label, score: Number(top1.score.toFixed(3)) }],
+              };
+              return c.json(resp);
+            }
+            // 본문 유실(approved 이탈/차단) → 참고 근거로만 활용하고 RAG 진행.
+            ragRefSa = { id: top1.saId, label: top1.label, score: top1.score };
+          } else if (top1.score >= SA_MATCH_CONTEXT_MIN) {
+            // 준매칭 — RAG 컨텍스트 참고 근거로 첨부.
+            ragRefSa = { id: top1.saId, label: top1.label, score: top1.score };
+          }
+          // db_only 폴백 후보(임베딩 점수 그대로).
+          if (top1.score >= SA_MATCH_CONTEXT_MIN) fallbackSa = { id: top1.saId, label: top1.label, score: top1.score };
+        }
+      } else {
+        // ── 폴백: VECTORIZE_SA 미가용 → 기존 findSimilarStandardAnswers(자카드) ──
+        let similar: SaSimilar[] = [];
+        try {
+          similar = await findSimilarStandardAnswers(conn, {
+            question,
+            topicId: topicIn,
+            serviceId: effectiveServiceId,
+            limit: 5,
+          });
+        } catch {
+          similar = [];
+        }
+        let approved = similar.filter((s) => s.approvalStatus === "approved");
+        if (policy?.standardAnswerScope === "service" && effectiveServiceId != null) {
+          approved = approved.filter((s) => s.scope === "common" || s.serviceId === effectiveServiceId);
+        }
+        const topSa = approved[0] ?? null;
+        if (topSa) {
+          if (topSa.score >= CHAT_STD_THRESHOLD) {
+            const answer = await loadApprovedAnswer(topSa.id);
+            if (answer) {
+              const resp: ChatAnswerResponse = {
+                answer,
+                mode: "standard",
+                confidence: Math.min(1, topSa.score),
+                sources: [{ kind: "standard_answer", id: topSa.id, title: topSa.label, score: topSa.score }],
+              };
+              return c.json(resp);
+            }
+          }
+          // 중간점수 → RAG 참고 근거. 어느 경우든 db_only 폴백 후보로 보존.
+          if (topSa.score < CHAT_STD_THRESHOLD) ragRefSa = { id: topSa.id, label: topSa.label, score: topSa.score };
+          fallbackSa = { id: topSa.id, label: topSa.label, score: topSa.score };
+        }
       }
-      // 본문 유실 시 아래 RAG 로 진행(graceful).
     }
 
     // ── ② RAG(Vectorize 자료 청크) ──
@@ -7323,14 +7669,13 @@ app.post("/chat/answer", rateLimitLlm, async (c) =>
     if (rag.available) {
       const qualifying = rag.results.filter((r) => r.score >= ragThreshold);
       if (qualifying.length > 0) {
-        // 컨텍스트: 상위 자료 청크(snippet). 중간점수 approved 표준답변 있으면 참고로 첨부.
-        const midSa = topSa && topSa.score < CHAT_STD_THRESHOLD ? topSa : null;
+        // 컨텍스트: 상위 자료 청크(snippet). 준매칭 approved 표준답변 있으면 참고로 첨부.
         const contextParts: string[] = qualifying.map((r, i) => {
           const snips = r.snippets.length ? r.snippets.join(" … ") : "(발췌 없음)";
           return `[자료 ${i + 1}] 자료명: ${r.name}\n${snips}`;
         });
         let midSaAnswer: string | null = null;
-        if (midSa) midSaAnswer = await loadApprovedAnswer(midSa.id);
+        if (ragRefSa) midSaAnswer = await loadApprovedAnswer(ragRefSa.id);
         const persona = policy?.systemPrompt?.trim();
         const system =
           "너는 고객 상담 챗봇이다. 아래 규칙을 반드시 지켜라.\n" +
@@ -7378,14 +7723,14 @@ app.post("/chat/answer", rateLimitLlm, async (c) =>
       }
     } else {
       // ── RAG 불가(Vectorize/AI 다운) → db_only 폴백: 약하지만 approved 표준답변 있으면 사용 ──
-      if (topSa && topSa.score >= CHAT_STD_FALLBACK) {
-        const answer = await loadApprovedAnswer(topSa.id);
+      if (fallbackSa && fallbackSa.score >= CHAT_STD_FALLBACK) {
+        const answer = await loadApprovedAnswer(fallbackSa.id);
         if (answer) {
           const resp: ChatAnswerResponse = {
             answer,
             mode: "standard",
-            confidence: Math.min(1, topSa.score),
-            sources: [{ kind: "standard_answer", id: topSa.id, title: topSa.label, score: topSa.score }],
+            confidence: Math.min(1, fallbackSa.score),
+            sources: [{ kind: "standard_answer", id: fallbackSa.id, title: fallbackSa.label, score: fallbackSa.score }],
           };
           return c.json(resp);
         }
@@ -7393,7 +7738,7 @@ app.post("/chat/answer", rateLimitLlm, async (c) =>
     }
 
     // ── ③ 모르면 모른다 → escalate(추측 금지) ──
-    const bestScore = Math.max(topSa?.score ?? 0, rag.results[0]?.score ?? 0);
+    const bestScore = Math.max(fallbackSa?.score ?? 0, ragRefSa?.score ?? 0, rag.results[0]?.score ?? 0);
     const resp: ChatAnswerResponse = {
       answer: CHAT_ESCALATE_DEFAULT,
       mode: "escalate",

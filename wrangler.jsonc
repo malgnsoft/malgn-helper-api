@@ -21,7 +21,8 @@
 
   // Vectorize — 학습 자료(hp_material) 청크 임베딩 벡터 인덱스(RAG 의미검색). 1024-dim cosine(@cf/baai/bge-m3).
   "vectorize": [
-    { "binding": "VECTORIZE", "index_name": "malgn-helper-material-vectors" }
+    { "binding": "VECTORIZE", "index_name": "malgn-helper-material-vectors" },
+    { "binding": "VECTORIZE_SA", "index_name": "malgn-helper-sa-vectors" }
   ],
 
   // Workers AI binding — Cloudflare 자체 catalog (region 제한 없음, $10 크레딧 사용).
