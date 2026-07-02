@@ -5341,6 +5341,44 @@ app.get("/auth/pms-sso", async (c) =>
   }),
 );
 
+/** 일회용 — 파이프라인 시연용 표본 시드(토큰 가드, 사용자 승인). SA draft 승인 + 안내글→자료 색인. 시연 후 제거·복원. */
+app.post("/admin/inspect/demo-seed", async (c) =>
+  withConn(c, async (conn) => {
+    const token = c.req.query("token") ?? "";
+    const EXPECTED = "7c395087266dd54e8cf1e209d88f41909f7eeb52b9fd2fe81e37cab22eeb68a2";
+    if (!token || (await sha256Hex(token)) !== EXPECTED) return c.json({ error: "forbidden" }, 403);
+    const [saRows] = await conn.query(
+      "SELECT id, label, question FROM hp_standard_answer WHERE status=1 AND approval_status='draft' AND created_by IN ('ai-regen','ai-regen-rewrite') ORDER BY id LIMIT 8",
+    );
+    const saIds = (saRows as { id: number }[]).map((r) => r.id);
+    if (saIds.length) {
+      const ph = saIds.map(() => "?").join(",");
+      const lv = (await hasCol(conn, "hp_standard_answer", "last_verified_at")) ? ", last_verified_at=NOW()" : "";
+      await conn.query(
+        `UPDATE hp_standard_answer SET approval_status='approved', approved_by='ai-demo', approved_at=NOW()${lv} WHERE id IN (${ph})`,
+        saIds,
+      );
+    }
+    const [annRows] = await conn.query(
+      "SELECT id, title, body FROM hp_announce WHERE status=1 AND approval_status='approved' AND CHAR_LENGTH(body) BETWEEN 300 AND 5000 ORDER BY id LIMIT 2",
+    );
+    const mats: { id: number; name: string; chunks: number; vectorError: string | null }[] = [];
+    for (const a of annRows as { id: number; title: string; body: string }[]) {
+      const text = String(a.body || "").replace(/<[^>]+>/g, " ").replace(/&[a-z#0-9]+;/gi, " ").replace(/\s+/g, " ").trim();
+      if (text.length < 100) continue;
+      const [ins] = await conn.query(
+        "INSERT INTO hp_material (name, type, source, format, extracted_text, index_status, chunks, created_by, status) VALUES (?, 'text', ?, 'TXT', ?, 'indexed', 0, 'ai-demo', 1)",
+        [a.title.slice(0, 200), "안내글 #" + a.id, text.slice(0, 20000)],
+      );
+      const matId = (ins as { insertId: number }).insertId;
+      const idx = await indexMaterialVectors(c.env, matId, a.title, text.slice(0, 20000), 0);
+      await conn.query("UPDATE hp_material SET chunks=? WHERE id=?", [idx.chunks, matId]);
+      mats.push({ id: matId, name: a.title, chunks: idx.chunks, vectorError: idx.vectorError });
+    }
+    return c.json({ ok: true, approvedSA: saRows, materials: mats });
+  }),
+);
+
 /** POST /auth/logout — cookie 삭제 */
 app.post("/auth/logout", (c) => {
   deleteCookie(c, SESSION_COOKIE, { path: "/" });
