@@ -7330,7 +7330,7 @@ app.get("/materials/:id", requireAuth, requireRole(ROLE_LEVEL.developer), async 
 const CHAT_STD_THRESHOLD = 0.5; // (폴백 전용) 표준답변 어휘 자카드 임계 — VECTORIZE_SA 미가용 시에만 사용.
 // 표준답변 임베딩(cosine) 강매칭 임계 — top1 ≥ 이면 해당 SA 본문 그대로 standard 모드 반환.
 // 봇 unknown_policy(strict/lenient)로 ±0.05 가감, 0.5~0.9 클램프(saMatchThresholdFor).
-const SA_MATCH_THRESHOLD = 0.68;
+const SA_MATCH_THRESHOLD = 0.62;
 // 강매칭 미만이지만 이 이상이면 그 SA 를 RAG 컨텍스트의 참고 근거로 넘김.
 const SA_MATCH_CONTEXT_MIN = 0.55;
 const SA_MATCH_TOPK = 5; // VECTORIZE_SA query top-K.
@@ -7626,6 +7626,28 @@ app.post("/chat/answer", rateLimitLlm, async (c) =>
           // db_only 폴백 후보(임베딩 점수 그대로).
           if (top1.score >= SA_MATCH_CONTEXT_MIN) fallbackSa = { id: top1.saId, label: top1.label, score: top1.score };
         }
+        // 하이브리드 — 임베딩 강매칭 실패 시 어휘(자카드) 신호로 보강(동의어·표현차 대비).
+        try {
+          let jac = await findSimilarStandardAnswers(conn, { question, topicId: topicIn, serviceId: effectiveServiceId, limit: 5 });
+          jac = jac.filter((s) => s.approvalStatus === "approved");
+          if (policy?.standardAnswerScope === "service" && effectiveServiceId != null) {
+            jac = jac.filter((s) => s.scope === "common" || s.serviceId === effectiveServiceId);
+          }
+          const jtop = jac[0] ?? null;
+          if (jtop && jtop.score >= CHAT_STD_THRESHOLD) {
+            const answer = await loadApprovedAnswer(jtop.id);
+            if (answer) {
+              const resp: ChatAnswerResponse = {
+                answer,
+                mode: "standard",
+                confidence: Math.min(1, jtop.score),
+                sources: [{ kind: "standard_answer", id: jtop.id, title: jtop.label, score: jtop.score }],
+              };
+              return c.json(resp);
+            }
+          }
+          if (jtop && !fallbackSa) fallbackSa = { id: jtop.id, label: jtop.label, score: jtop.score };
+        } catch { /* 자카드 보강 실패는 무시 */ }
       } else {
         // ── 폴백: VECTORIZE_SA 미가용 → 기존 findSimilarStandardAnswers(자카드) ──
         let similar: SaSimilar[] = [];
