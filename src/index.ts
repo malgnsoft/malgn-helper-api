@@ -5340,46 +5340,6 @@ app.get("/auth/pms-sso", async (c) =>
   }),
 );
 
-/** 일회용 — 008 hp_material 테이블 생성(CREATE TABLE IF NOT EXISTS, 멱등). 토큰 해시 가드. 적용 후 제거. */
-app.post("/admin/migrate/material-008", async (c) =>
-  withConn(c, async (conn) => {
-    const token = c.req.query("token") ?? "";
-    const EXPECTED = "fc68347f4fee7b24e0b028ade4e49457d69e9d9756bd79ff5f4070bb1500c54b";
-    if (!token || (await sha256Hex(token)) !== EXPECTED) return c.json({ error: "forbidden" }, 403);
-    await conn.query(
-      "CREATE TABLE IF NOT EXISTS hp_material (" +
-        "id INT NOT NULL AUTO_INCREMENT," +
-        "name VARCHAR(200) NOT NULL," +
-        "type ENUM('file','url','text','qa') NOT NULL," +
-        "source VARCHAR(1000) NULL," +
-        "format VARCHAR(30) NULL," +
-        "r2_key VARCHAR(500) NULL," +
-        "mime VARCHAR(150) NULL," +
-        "size_bytes BIGINT NULL," +
-        "index_status ENUM('processing','indexed','stored','failed') NOT NULL DEFAULT 'processing'," +
-        "summary TEXT NULL," +
-        "extracted_text MEDIUMTEXT NULL," +
-        "chunks INT NOT NULL DEFAULT 0," +
-        "tags TEXT NULL," +
-        "services TEXT NULL," +
-        "error VARCHAR(500) NULL," +
-        "created_by VARCHAR(100) NULL," +
-        "status TINYINT NOT NULL DEFAULT 1," +
-        "created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP," +
-        "updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP," +
-        "PRIMARY KEY (id)," +
-        "KEY idx_status_type (status, type)," +
-        "KEY idx_status_index (status, index_status)," +
-        "KEY idx_created_at (created_at)" +
-        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
-    );
-    const [t] = await conn.query(
-      "SELECT COUNT(*) AS n FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='hp_material'",
-    );
-    return c.json({ ok: true, exists: Number((t as { n: number }[])[0]?.n ?? 0) === 1 });
-  }),
-);
-
 /** POST /auth/logout — cookie 삭제 */
 app.post("/auth/logout", (c) => {
   deleteCookie(c, SESSION_COOKIE, { path: "/" });
