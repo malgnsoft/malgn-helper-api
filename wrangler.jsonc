@@ -19,6 +19,11 @@
     { "binding": "HYPERDRIVE", "id": "aea36082dfd84125a0da2063d5b8e5e0" }
   ],
 
+  // Vectorize — 학습 자료(hp_material) 청크 임베딩 벡터 인덱스(RAG 의미검색). 1024-dim cosine(@cf/baai/bge-m3).
+  "vectorize": [
+    { "binding": "VECTORIZE", "index_name": "malgn-helper-material-vectors" }
+  ],
+
   // Workers AI binding — Cloudflare 자체 catalog (region 제한 없음, $10 크레딧 사용).
   // openai/o4-mini 등 OpenAI partner 모델도 binding으로 호출 가능.
   "ai": { "binding": "AI" },

@@ -19,6 +19,7 @@ type Bindings = {
   R2: R2Bucket;
   HYPERDRIVE: Hyperdrive;
   AI: Ai;
+  VECTORIZE: VectorizeIndex; // 학습 자료 청크 임베딩 인덱스(malgn-helper-material-vectors, 1024-dim cosine)
   AI_GATEWAY_URL: string;
   AI_GATEWAY_TOKEN?: string;
   OPENAI_API_KEY: string;
@@ -6343,6 +6344,160 @@ function buildMaterialExtraction(rawText: string): MaterialExtraction {
   };
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// RAG(의미검색) — 문서 본문 추출(toMarkdown) → 청크 임베딩(bge-m3) → Vectorize 색인.
+// ─────────────────────────────────────────────────────────────────────────────
+const MATERIAL_EMBED_MODEL = "@cf/baai/bge-m3"; // 1024-dim, 다국어(한국어 OK)
+const MATERIAL_CHUNK_SIZE = 800; // 청크 목표 길이(문자)
+const MATERIAL_CHUNK_OVERLAP = 100; // 인접 청크 겹침(문맥 보존)
+const MATERIAL_MAX_CHUNKS = 2000; // 자료당 벡터 상한(런어웨이 방어)
+const MATERIAL_EMBED_BATCH = 100; // bge-m3 입력 배열 1회 상한(초과 시 분할 호출)
+const MATERIAL_VECTOR_BATCH = 200; // Vectorize upsert/delete 1회 배치
+
+/** vector id — m{materialId}-{chunkIndex}. deleteByIds 로 자료 단위 정리. */
+function materialVectorId(materialId: number, chunk: number): string {
+  return `m${materialId}-${chunk}`;
+}
+
+/** Vectorize 바인딩 가용 여부 — 미바인딩/런타임 미주입 시 안전 스킵. */
+function vectorizeAvailable(env: Bindings): boolean {
+  const v = env.VECTORIZE as unknown as { query?: unknown; upsert?: unknown } | undefined;
+  return !!v && typeof v.upsert === "function" && typeof v.query === "function";
+}
+
+/**
+ * 본문 → ~800자 청크(문단 경계 우선, 100자 overlap). 긴 문단은 하드 분할.
+ * 최대 MATERIAL_MAX_CHUNKS 개까지만 생성(초과분 절단).
+ */
+function chunkText(text: string): string[] {
+  const clean = (text ?? "").replace(/\r\n/g, "\n").trim();
+  if (!clean) return [];
+  const paras = clean.split(/\n{2,}/).map((p) => p.trim()).filter(Boolean);
+  const size = MATERIAL_CHUNK_SIZE;
+  const overlap = MATERIAL_CHUNK_OVERLAP;
+  const chunks: string[] = [];
+  let cur = "";
+  const push = (s: string) => {
+    const t = s.trim();
+    if (t) chunks.push(t);
+  };
+  for (const p of paras) {
+    if (chunks.length >= MATERIAL_MAX_CHUNKS) break;
+    if (p.length > size) {
+      if (cur) { push(cur); cur = ""; }
+      // 긴 문단 하드 분할(overlap 유지).
+      for (let i = 0; i < p.length && chunks.length < MATERIAL_MAX_CHUNKS; i += size - overlap) {
+        push(p.slice(i, i + size));
+      }
+      continue;
+    }
+    if (cur && cur.length + 1 + p.length > size) {
+      push(cur);
+      const tail = cur.slice(Math.max(0, cur.length - overlap));
+      cur = `${tail}\n${p}`;
+    } else {
+      cur = cur ? `${cur}\n${p}` : p;
+    }
+  }
+  if (cur && chunks.length < MATERIAL_MAX_CHUNKS) push(cur);
+  return chunks.slice(0, MATERIAL_MAX_CHUNKS);
+}
+
+/**
+ * Workers AI toMarkdown 로 파일 본문 추출(pdf·docx·pptx·xlsx·이미지 등).
+ * 실패/미지원 mime 는 throw → 호출부에서 stored 로 폴백.
+ */
+async function extractViaToMarkdown(
+  env: Bindings,
+  filename: string,
+  buf: ArrayBuffer,
+  mime: string,
+): Promise<string> {
+  const ai = env.AI as unknown as { toMarkdown?: unknown };
+  if (!ai || typeof ai.toMarkdown !== "function") throw new Error("toMarkdown 미지원(AI 바인딩)");
+  const blob = new Blob([buf], { type: mime || "application/octet-stream" });
+  const name = safeMaterialFilename(filename) || "file";
+  const res = await env.AI.toMarkdown([{ name, blob }]);
+  const first = Array.isArray(res) ? res[0] : res;
+  if (!first) throw new Error("toMarkdown 응답 없음");
+  if (first.format === "error") throw new Error(first.error || "toMarkdown 변환 실패");
+  const data = typeof (first as { data?: unknown }).data === "string" ? (first as { data: string }).data : "";
+  if (!data.trim()) throw new Error("toMarkdown 결과 비어 있음");
+  return data;
+}
+
+/** 자료 벡터 삭제 — m{id}-0..count-1(배치). Vectorize 미가용/실패는 무시(로깅). */
+async function deleteMaterialVectors(env: Bindings, materialId: number, count: number): Promise<void> {
+  if (!vectorizeAvailable(env)) return;
+  const n = Math.max(0, Math.min(Number(count) || 0, MATERIAL_MAX_CHUNKS));
+  if (n === 0) return;
+  const ids: string[] = [];
+  for (let i = 0; i < n; i++) ids.push(materialVectorId(materialId, i));
+  try {
+    for (let s = 0; s < ids.length; s += MATERIAL_VECTOR_BATCH) {
+      await env.VECTORIZE.deleteByIds(ids.slice(s, s + MATERIAL_VECTOR_BATCH));
+    }
+  } catch (e) {
+    console.warn(`[material ${materialId}] 벡터 삭제 실패: ${(e as Error).message}`);
+  }
+}
+
+/**
+ * 본문 청크 임베딩 → Vectorize upsert. 재색인 시 이전 벡터(prevChunks 범위)를 먼저 정리.
+ * 반환 chunks = 실제 upsert 된 벡터 수. 임베딩/색인 실패는 vectorError 로만 보고(자료 저장은 성공 유지).
+ */
+async function indexMaterialVectors(
+  env: Bindings,
+  materialId: number,
+  name: string,
+  text: string,
+  prevChunks: number,
+): Promise<{ chunks: number; vectorError: string | null }> {
+  const pieces = chunkText(text);
+  if (!vectorizeAvailable(env)) {
+    return { chunks: pieces.length, vectorError: "Vectorize 미바인딩 — 색인 스킵" };
+  }
+  // 이전 벡터 정리(축소·재색인 대비): prev∪new 최대치 범위 삭제 후 재upsert.
+  await deleteMaterialVectors(env, materialId, Math.max(Number(prevChunks) || 0, pieces.length));
+  if (pieces.length === 0) return { chunks: 0, vectorError: null };
+
+  try {
+    const vectors: VectorizeVector[] = [];
+    for (let start = 0; start < pieces.length; start += MATERIAL_EMBED_BATCH) {
+      const batch = pieces.slice(start, start + MATERIAL_EMBED_BATCH);
+      const out = (await env.AI.run(MATERIAL_EMBED_MODEL, { text: batch })) as unknown as {
+        data?: number[][];
+      };
+      const emb = out?.data ?? [];
+      for (let j = 0; j < batch.length; j++) {
+        const values = emb[j];
+        if (!Array.isArray(values) || values.length === 0) continue;
+        const idx = start + j;
+        vectors.push({
+          id: materialVectorId(materialId, idx),
+          values,
+          metadata: {
+            materialId,
+            chunk: idx,
+            name: name.slice(0, 200),
+            snippet: batch[j].slice(0, 240),
+          },
+        });
+      }
+    }
+    if (vectors.length === 0) return { chunks: 0, vectorError: "임베딩 결과 없음" };
+    for (let s = 0; s < vectors.length; s += MATERIAL_VECTOR_BATCH) {
+      await env.VECTORIZE.upsert(vectors.slice(s, s + MATERIAL_VECTOR_BATCH));
+    }
+    return { chunks: vectors.length, vectorError: null };
+  } catch (e) {
+    const msg = `벡터 색인 실패: ${(e as Error).message}`.slice(0, 300);
+    console.warn(`[material ${materialId}] ${msg}`);
+    // 색인 실패해도 자료 저장 자체는 성공 — chunks 는 의도 청크 수 유지.
+    return { chunks: pieces.length, vectorError: msg };
+  }
+}
+
 /** tags/services 입력 정규화 — 배열/JSON 문자열/콤마 문자열 모두 허용 → 문자열 배열(최대 50). */
 function normalizeMaterialStringArray(input: unknown): string[] {
   const clamp = (arr: unknown[]): string[] =>
@@ -6483,8 +6638,19 @@ app.post("/materials", requireAuth, requireRole(ROLE_LEVEL.developer), async (c)
           summary = MATERIAL_STORED_SUMMARY;
         }
       } else {
-        indexStatus = "stored";
-        summary = MATERIAL_STORED_SUMMARY;
+        // pdf·docx·pptx·xlsx·이미지 등 — Workers AI toMarkdown 으로 본문 추출.
+        try {
+          const md = await extractViaToMarkdown(c.env, rawName, buf, mime);
+          const ext = buildMaterialExtraction(md);
+          extractedText = ext.extractedText;
+          summary = ext.summary;
+          chunks = ext.chunks;
+          indexStatus = ext.indexStatus;
+        } catch (e) {
+          indexStatus = "stored";
+          summary = MATERIAL_STORED_SUMMARY;
+          error = `본문 추출 실패(toMarkdown): ${(e as Error).message}`.slice(0, 500);
+        }
       }
     } else {
       // ── JSON (url | text | qa) ──
@@ -6582,6 +6748,20 @@ app.post("/materials", requireAuth, requireRole(ROLE_LEVEL.developer), async (c)
     );
     const id = Number((ins as unknown as { insertId: number }).insertId);
 
+    // 본문 추출 성공(indexed) 시 청크 임베딩 → Vectorize 색인. 실패해도 자료 저장은 성공(색인만 스킵).
+    if (indexStatus === "indexed" && extractedText) {
+      const rv = await indexMaterialVectors(c.env, id, name, extractedText, 0);
+      const mergedError = rv.vectorError ?? error;
+      if (rv.chunks !== chunks || mergedError !== error) {
+        chunks = rv.chunks;
+        error = mergedError;
+        await conn.query(
+          `UPDATE hp_material SET chunks = ?, error = ?, updated_at = NOW() WHERE id = ?`,
+          [chunks, error, id],
+        );
+      }
+    }
+
     return c.json({
       ok: true,
       id,
@@ -6677,7 +6857,7 @@ app.post("/materials/:id/reindex", requireAuth, requireRole(ROLE_LEVEL.developer
     const id = parseInt(c.req.param("id"), 10);
     if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
     const [rows] = await conn.query(
-      `SELECT id, name, type, source, r2_key, mime, extracted_text
+      `SELECT id, name, type, source, r2_key, mime, extracted_text, chunks
          FROM hp_material WHERE id = ? AND status = 1`,
       [id],
     );
@@ -6689,8 +6869,10 @@ app.post("/materials/:id/reindex", requireAuth, requireRole(ROLE_LEVEL.developer
       r2_key: string | null;
       mime: string | null;
       extracted_text: string | null;
+      chunks: number | null;
     }[])[0];
     if (!r) return c.json({ error: "not found" }, 404);
+    const prevChunks = Number(r.chunks ?? 0);
 
     let extractedText: string | null = r.extracted_text;
     let summary: string | null = null;
@@ -6712,8 +6894,15 @@ app.post("/materials/:id/reindex", requireAuth, requireRole(ROLE_LEVEL.developer
           chunks = ext.chunks;
           indexStatus = "indexed";
         } else {
-          indexStatus = "stored";
-          summary = MATERIAL_STORED_SUMMARY;
+          // pdf·docx·이미지 등 — R2 원본을 Workers AI toMarkdown 으로 재추출.
+          const obj = await c.env.R2.get(r.r2_key);
+          if (!obj) throw new Error("R2 오브젝트 없음");
+          const md = await extractViaToMarkdown(c.env, r.name || "file", await obj.arrayBuffer(), r.mime || "");
+          const ext = buildMaterialExtraction(md);
+          extractedText = ext.extractedText;
+          summary = ext.summary;
+          chunks = ext.chunks;
+          indexStatus = "indexed";
         }
       } else if (r.type === "url") {
         const url = String(r.source ?? "");
@@ -6743,6 +6932,15 @@ app.post("/materials/:id/reindex", requireAuth, requireRole(ROLE_LEVEL.developer
       error = `재색인 실패: ${(e as Error).message}`.slice(0, 500);
     }
 
+    // 벡터 색인 갱신: indexed → 이전 벡터 정리 후 재색인. 그 외 → 기존 벡터 제거.
+    if (indexStatus === "indexed" && extractedText) {
+      const rv = await indexMaterialVectors(c.env, id, r.name || "", extractedText, prevChunks);
+      chunks = rv.chunks;
+      if (rv.vectorError) error = error ? `${error}; ${rv.vectorError}`.slice(0, 500) : rv.vectorError;
+    } else {
+      await deleteMaterialVectors(c.env, id, prevChunks);
+    }
+
     await conn.query(
       `UPDATE hp_material
           SET index_status = ?, summary = ?, extracted_text = ?, chunks = ?, error = ?, updated_at = NOW()
@@ -6759,11 +6957,13 @@ app.delete("/materials/:id", requireAuth, requireRole(ROLE_LEVEL.developer), asy
     if (!(await materialTableExists(conn))) return c.json(MATERIAL_TABLE_MISSING, 503);
     const id = parseInt(c.req.param("id"), 10);
     if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
-    const [rows] = await conn.query(`SELECT r2_key FROM hp_material WHERE id = ? AND status = 1`, [id]);
-    const r = (rows as { r2_key: string | null }[])[0];
+    const [rows] = await conn.query(`SELECT r2_key, chunks FROM hp_material WHERE id = ? AND status = 1`, [id]);
+    const r = (rows as { r2_key: string | null; chunks: number | null }[])[0];
     if (!r) return c.json({ error: "not found" }, 404);
     const [res] = await conn.query(`UPDATE hp_material SET status = -1 WHERE id = ? AND status = 1`, [id]);
     if ((res as unknown as { affectedRows: number }).affectedRows === 0) return c.json({ error: "not found" }, 404);
+    // 자료 벡터 제거(m{id}-0..chunks-1). Vectorize 미가용/실패는 무시.
+    await deleteMaterialVectors(c.env, id, Number(r.chunks ?? 0));
     if (r.r2_key) {
       try {
         await c.env.R2.delete(r.r2_key);
@@ -6772,6 +6972,88 @@ app.delete("/materials/:id", requireAuth, requireRole(ROLE_LEVEL.developer), asy
       }
     }
     return c.json({ ok: true, id });
+  }),
+);
+
+// GET /materials/search — 의미검색(RAG). q 임베딩(bge-m3) → Vectorize query → materialId 그룹핑.
+//   응답: { results: [{ materialId, name, type, score, snippets: string[] }] }
+//   Vectorize/AI 미가용 시 { results: [], vectorizeUnavailable: true }(+error).
+//   ⚠ 정적 경로 /search 는 동적 /:id 보다 라우터 우선(RegExpRouter). 안전하게 :id 앞에 등록.
+app.get("/materials/search", requireAuth, requireRole(ROLE_LEVEL.developer), async (c) =>
+  withConn(c, async (conn) => {
+    if (!(await materialTableExists(conn))) return c.json(MATERIAL_TABLE_MISSING, 503);
+    const q = (c.req.query("q") ?? "").trim();
+    if (!q) return c.json({ error: "q(검색어)가 필요합니다." }, 400);
+    const topK = Math.min(Math.max(parseInt(c.req.query("topK") ?? "10", 10) || 10, 1), 50);
+
+    if (!vectorizeAvailable(c.env)) return c.json({ results: [], vectorizeUnavailable: true });
+
+    // 1) 질의 임베딩
+    let queryVec: number[];
+    try {
+      const out = (await c.env.AI.run(MATERIAL_EMBED_MODEL, { text: [q] })) as unknown as {
+        data?: number[][];
+      };
+      const v = out?.data?.[0];
+      if (!Array.isArray(v) || v.length === 0) throw new Error("임베딩 결과 없음");
+      queryVec = v;
+    } catch (e) {
+      return c.json({
+        results: [],
+        vectorizeUnavailable: true,
+        error: `질의 임베딩 실패: ${(e as Error).message}`.slice(0, 300),
+      });
+    }
+
+    // 2) Vectorize 검색
+    let matches: VectorizeMatch[];
+    try {
+      const res = await c.env.VECTORIZE.query(queryVec, { topK, returnMetadata: "all" });
+      matches = res.matches ?? [];
+    } catch (e) {
+      return c.json({
+        results: [],
+        vectorizeUnavailable: true,
+        error: `의미검색 실패: ${(e as Error).message}`.slice(0, 300),
+      });
+    }
+
+    // 3) materialId 그룹핑(최고 score + 상위 스니펫)
+    const grouped = new Map<number, { score: number; snippets: string[] }>();
+    for (const m of matches) {
+      const md = (m.metadata ?? {}) as { materialId?: number | string; snippet?: unknown };
+      const mid = Number(md.materialId);
+      if (!Number.isFinite(mid) || mid <= 0) continue;
+      const g = grouped.get(mid) ?? { score: 0, snippets: [] };
+      if (typeof m.score === "number" && m.score > g.score) g.score = m.score;
+      if (typeof md.snippet === "string" && md.snippet && g.snippets.length < 3) {
+        g.snippets.push(md.snippet);
+      }
+      grouped.set(mid, g);
+    }
+    if (grouped.size === 0) return c.json({ results: [] });
+
+    // 4) hp_material 조회(status=1 만) → 최종 결과(score desc)
+    const ids = [...grouped.keys()];
+    const placeholders = ids.map(() => "?").join(",");
+    const [rows] = await conn.query(
+      `SELECT id, name, type FROM hp_material WHERE status = 1 AND id IN (${placeholders})`,
+      ids,
+    );
+    const byId = new Map<number, { name: string; type: string }>();
+    for (const row of rows as { id: number; name: string; type: string }[]) {
+      byId.set(Number(row.id), { name: row.name, type: row.type });
+    }
+    const results = ids
+      .map((mid) => {
+        const info = byId.get(mid);
+        const g = grouped.get(mid);
+        if (!info || !g) return null;
+        return { materialId: mid, name: info.name, type: info.type, score: g.score, snippets: g.snippets };
+      })
+      .filter((x): x is { materialId: number; name: string; type: string; score: number; snippets: string[] } => x !== null)
+      .sort((a, b) => b.score - a.score);
+    return c.json({ results });
   }),
 );
 
