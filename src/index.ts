@@ -5340,6 +5340,46 @@ app.get("/auth/pms-sso", async (c) =>
   }),
 );
 
+/** 일회용 — 008 hp_material 테이블 생성(CREATE TABLE IF NOT EXISTS, 멱등). 토큰 해시 가드. 적용 후 제거. */
+app.post("/admin/migrate/material-008", async (c) =>
+  withConn(c, async (conn) => {
+    const token = c.req.query("token") ?? "";
+    const EXPECTED = "fc68347f4fee7b24e0b028ade4e49457d69e9d9756bd79ff5f4070bb1500c54b";
+    if (!token || (await sha256Hex(token)) !== EXPECTED) return c.json({ error: "forbidden" }, 403);
+    await conn.query(
+      "CREATE TABLE IF NOT EXISTS hp_material (" +
+        "id INT NOT NULL AUTO_INCREMENT," +
+        "name VARCHAR(200) NOT NULL," +
+        "type ENUM('file','url','text','qa') NOT NULL," +
+        "source VARCHAR(1000) NULL," +
+        "format VARCHAR(30) NULL," +
+        "r2_key VARCHAR(500) NULL," +
+        "mime VARCHAR(150) NULL," +
+        "size_bytes BIGINT NULL," +
+        "index_status ENUM('processing','indexed','stored','failed') NOT NULL DEFAULT 'processing'," +
+        "summary TEXT NULL," +
+        "extracted_text MEDIUMTEXT NULL," +
+        "chunks INT NOT NULL DEFAULT 0," +
+        "tags TEXT NULL," +
+        "services TEXT NULL," +
+        "error VARCHAR(500) NULL," +
+        "created_by VARCHAR(100) NULL," +
+        "status TINYINT NOT NULL DEFAULT 1," +
+        "created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP," +
+        "updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP," +
+        "PRIMARY KEY (id)," +
+        "KEY idx_status_type (status, type)," +
+        "KEY idx_status_index (status, index_status)," +
+        "KEY idx_created_at (created_at)" +
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+    );
+    const [t] = await conn.query(
+      "SELECT COUNT(*) AS n FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='hp_material'",
+    );
+    return c.json({ ok: true, exists: Number((t as { n: number }[])[0]?.n ?? 0) === 1 });
+  }),
+);
+
 /** POST /auth/logout — cookie 삭제 */
 app.post("/auth/logout", (c) => {
   deleteCookie(c, SESSION_COOKIE, { path: "/" });
@@ -6246,6 +6286,560 @@ app.delete("/admin/bots/:id", requireAuth, requireRole(ROLE_LEVEL.admin), async 
     const [res] = await conn.query(`UPDATE hp_bot SET status = -1 WHERE id = ? AND status = 1`, [id]);
     if ((res as unknown as { affectedRows: number }).affectedRows === 0) return c.json({ error: "not found" }, 404);
     return c.json({ ok: true, id });
+  }),
+);
+
+// ── 학습 자료 (hp_material · 008 마이그레이션) ──────────────────────────────
+// 정본: malgn-helper-mng/docs/HP-SCHEMA.md (학습 자료 절) + migrations/008_material.sql
+// 챗봇 지식 소스(파일/URL/텍스트/Q&A) 카탈로그. file 은 R2 원본 보관(r2_key), 본문은 extracted_text 에 추출.
+//
+// ⚠ OpenSearch/벡터 색인은 범위 밖(현 인프라 부재) — 여기서 "색인"=extracted_text 저장 + LIKE 검색(MVP).
+//    본문 추출 지원 형식(text/*·md·txt·csv·html·url·text·qa)만 indexed, 그 외(pdf/docx/이미지/영상)는 stored.
+//    → OpenSearch 전환 대상: extracted_text 를 BM25/벡터 색인으로 승격(향후 009+).
+//
+// ⚠ graceful degrade: 008 미적용(테이블 부재)이면 목록=빈 배열, 쓰기 계열=503(워커 500 금지).
+//    isolate 단위 lazy 캐시 — 첫 요청 시 INFORMATION_SCHEMA 로 1회 확인. 적용 후 재배포로 갱신.
+type MaterialType = "file" | "url" | "text" | "qa";
+type MaterialIndexStatus = "processing" | "indexed" | "stored" | "failed";
+const MATERIAL_TYPES: readonly MaterialType[] = ["file", "url", "text", "qa"];
+const MATERIAL_INDEX_STATUSES: readonly MaterialIndexStatus[] = ["processing", "indexed", "stored", "failed"];
+const isMaterialType = (s: string): s is MaterialType => (MATERIAL_TYPES as readonly string[]).includes(s);
+const isMaterialIndexStatus = (s: string): s is MaterialIndexStatus =>
+  (MATERIAL_INDEX_STATUSES as readonly string[]).includes(s);
+
+let _materialTableChecked = false;
+let _materialTableExists = false;
+async function materialTableExists(conn: Queryable): Promise<boolean> {
+  if (_materialTableChecked) return _materialTableExists;
+  try {
+    const [rows] = await conn.query(
+      `SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hp_material' LIMIT 1`,
+    );
+    _materialTableExists = (rows as unknown[]).length > 0;
+  } catch {
+    _materialTableExists = false; // 조회 실패 시에도 워커는 500 없이 degrade.
+  }
+  _materialTableChecked = true;
+  return _materialTableExists;
+}
+const MATERIAL_TABLE_MISSING = { error: "학습 자료 테이블 미적용(008)" } as const;
+const MATERIAL_STORED_SUMMARY = "(본문 추출 미지원 형식 — 저장됨)";
+const MATERIAL_MAX_EXTRACT = 5_000_000; // 추출 텍스트 상한 5MB(MEDIUMTEXT 16MB 이내 방어).
+const MATERIAL_PREVIEW_LEN = 20_000; // 상세 응답 extracted_text 프리뷰 길이.
+
+/** 안전 파일명 — 경로 구분자·제어문자 제거, 공백→_, 200자 제한. */
+function safeMaterialFilename(name: string): string {
+  const base = String(name ?? "").split(/[\\/]/).pop() ?? "";
+  const cleaned = base
+    // 제어문자 + 파일시스템/헤더 위험 문자 제거.
+    .replace(/[\u0000-\u001f<>:"|?*\\\/]+/g, "")
+    .replace(/\s+/g, "_")
+    .trim();
+  return (cleaned || "file").slice(0, 200);
+}
+
+/** R2 오브젝트 키 — materials/<timestamp>-<random>/<safe filename>. */
+function materialR2Key(filename: string): string {
+  const rand = Math.random().toString(36).slice(2, 10);
+  return `materials/${Date.now()}-${rand}/${safeMaterialFilename(filename)}`;
+}
+
+/** 본문 텍스트 추출 지원 여부 — mime text/* 또는 확장자 md/txt/csv/html. */
+function isTextExtractable(mime: string, filename: string): boolean {
+  const m = (mime || "").toLowerCase();
+  if (m.startsWith("text/")) return true;
+  const ext = (String(filename).split(".").pop() ?? "").toLowerCase();
+  return ["md", "markdown", "txt", "csv", "html", "htm"].includes(ext);
+}
+
+/** 표시용 포맷 도출 — 확장자 우선, 없으면 mime 계열. */
+function deriveFileFormat(filename: string, mime: string): string {
+  const ext = (String(filename).split(".").pop() ?? "").toLowerCase();
+  if (ext && ext.length <= 5 && /^[a-z0-9]+$/.test(ext)) return ext.toUpperCase();
+  const m = (mime || "").toLowerCase();
+  if (m.includes("pdf")) return "PDF";
+  if (m.startsWith("image/")) return (m.split("/")[1] ?? "image").toUpperCase();
+  if (m.startsWith("text/")) return "TXT";
+  return "FILE";
+}
+
+type MaterialExtraction = {
+  extractedText: string;
+  summary: string;
+  chunks: number;
+  indexStatus: MaterialIndexStatus;
+};
+
+/** 추출 본문 → summary(앞 300자)·chunks(≈len/1000)·indexed. 색인=extracted_text 저장(LIKE MVP). */
+function buildMaterialExtraction(rawText: string): MaterialExtraction {
+  const text = (rawText ?? "").slice(0, MATERIAL_MAX_EXTRACT);
+  const len = text.length;
+  return {
+    extractedText: text,
+    summary: text.slice(0, 300),
+    chunks: len > 0 ? Math.ceil(len / 1000) : 0,
+    indexStatus: "indexed",
+  };
+}
+
+/** tags/services 입력 정규화 — 배열/JSON 문자열/콤마 문자열 모두 허용 → 문자열 배열(최대 50). */
+function normalizeMaterialStringArray(input: unknown): string[] {
+  const clamp = (arr: unknown[]): string[] =>
+    arr.map((x) => String(x).trim()).filter(Boolean).slice(0, 50);
+  if (Array.isArray(input)) return clamp(input);
+  if (typeof input === "string" && input.trim()) {
+    const s = input.trim();
+    try {
+      const parsed: unknown = JSON.parse(s);
+      if (Array.isArray(parsed)) return clamp(parsed);
+    } catch {
+      /* JSON 아님 — 콤마 분할로 폴백 */
+    }
+    return clamp(s.split(","));
+  }
+  return [];
+}
+
+/** 문자열 배열 → DB 저장용 JSON 문자열(빈배열이면 null). */
+function materialArrayToJson(arr: string[]): string | null {
+  return arr.length ? JSON.stringify(arr) : null;
+}
+
+/** DB TEXT(JSON) → 문자열 배열(파싱 실패 시 빈배열). */
+function parseMaterialJsonArray(raw: unknown): string[] {
+  if (typeof raw !== "string" || !raw.trim()) return [];
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.map((x) => String(x)) : [];
+  } catch {
+    return [];
+  }
+}
+
+type MaterialRow = {
+  id: number;
+  name: string;
+  type: string;
+  source: string | null;
+  format: string | null;
+  r2_key: string | null;
+  mime: string | null;
+  size_bytes: number | string | null;
+  index_status: string;
+  summary: string | null;
+  extracted_text?: string | null;
+  chunks: number;
+  tags: string | null;
+  services: string | null;
+  error?: string | null;
+  created_by: string | null;
+  created_at: unknown;
+  updated_at?: unknown;
+};
+
+/** 목록/공통 DTO — admin 소비용 camelCase. extracted_text 는 제외(상세에서 프리뷰 제공). */
+function toMaterialListDto(r: MaterialRow) {
+  const id = Number(r.id);
+  return {
+    id,
+    name: r.name,
+    type: r.type,
+    source: r.source,
+    format: r.format,
+    mime: r.mime,
+    sizeBytes: r.size_bytes != null ? Number(r.size_bytes) : null,
+    indexStatus: r.index_status,
+    summary: r.summary,
+    chunks: Number(r.chunks ?? 0),
+    tags: parseMaterialJsonArray(r.tags),
+    services: parseMaterialJsonArray(r.services),
+    downloadPath: r.type === "file" && r.r2_key ? `/materials/${id}/download` : null,
+    createdBy: r.created_by,
+    createdAt: r.created_at,
+  };
+}
+
+// POST /materials — 자료 등록. multipart(file) 또는 JSON(url|text|qa).
+//   Hyperdrive SELECT 캐시로 등록 직후 GET 이 stale 일 수 있어 응답에 등록 행을 echo(재-GET 불필요).
+app.post("/materials", requireAuth, requireRole(ROLE_LEVEL.developer), async (c) =>
+  withConn(c, async (conn) => {
+    if (!(await materialTableExists(conn))) return c.json(MATERIAL_TABLE_MISSING, 503);
+    const createdBy = c.get("session")?.loginId ?? null;
+    const contentType = (c.req.header("content-type") || "").toLowerCase();
+
+    let name = "";
+    let type: MaterialType;
+    let source: string | null = null;
+    let format: string | null = null;
+    let r2Key: string | null = null;
+    let mime: string | null = null;
+    let sizeBytes: number | null = null;
+    let extractedText: string | null = null;
+    let summary: string | null = null;
+    let chunks = 0;
+    let indexStatus: MaterialIndexStatus = "processing";
+    let error: string | null = null;
+    let tags: string[] = [];
+    let services: string[] = [];
+
+    if (contentType.includes("multipart/form-data")) {
+      // ── 파일 업로드 ──
+      let body: Record<string, string | File | (string | File)[]>;
+      try {
+        body = await c.req.parseBody();
+      } catch {
+        return c.json({ error: "multipart 파싱 실패" }, 400);
+      }
+      const file = body["file"];
+      if (!(file instanceof File)) return c.json({ error: "file 필드(업로드 파일)가 필요합니다." }, 400);
+      type = "file";
+      const rawName = file.name || "file";
+      const nameField = body["name"];
+      const sourceField = body["source"];
+      name = (typeof nameField === "string" && nameField.trim()) || rawName;
+      source = (typeof sourceField === "string" && sourceField.trim()) || rawName;
+      mime = file.type || "application/octet-stream";
+      tags = normalizeMaterialStringArray(body["tags"]);
+      services = normalizeMaterialStringArray(body["services"]);
+      format = deriveFileFormat(rawName, mime);
+
+      const buf = await file.arrayBuffer();
+      sizeBytes = buf.byteLength;
+      r2Key = materialR2Key(rawName);
+      await c.env.R2.put(r2Key, buf, { httpMetadata: { contentType: mime } });
+
+      if (isTextExtractable(mime, rawName)) {
+        try {
+          const decoded = new TextDecoder().decode(buf);
+          const isHtml = /html/.test(mime) || /\.html?$/i.test(rawName);
+          const ext = buildMaterialExtraction(isHtml ? htmlToParagraphs(decoded) : decoded);
+          extractedText = ext.extractedText;
+          summary = ext.summary;
+          chunks = ext.chunks;
+          indexStatus = ext.indexStatus;
+        } catch {
+          indexStatus = "stored";
+          summary = MATERIAL_STORED_SUMMARY;
+        }
+      } else {
+        indexStatus = "stored";
+        summary = MATERIAL_STORED_SUMMARY;
+      }
+    } else {
+      // ── JSON (url | text | qa) ──
+      let body: Record<string, unknown>;
+      try {
+        body = (await c.req.json()) as Record<string, unknown>;
+      } catch {
+        return c.json({ error: "JSON 본문 파싱 실패" }, 400);
+      }
+      const t = String(body.type ?? "").trim();
+      if (t === "file" || !isMaterialType(t)) {
+        return c.json({ error: "type 은 url|text|qa 중 하나여야 합니다(file 은 multipart 업로드)." }, 400);
+      }
+      type = t;
+      tags = normalizeMaterialStringArray(body.tags);
+      services = normalizeMaterialStringArray(body.services);
+      const nameIn = typeof body.name === "string" ? body.name.trim() : "";
+      const sourceIn = typeof body.source === "string" ? body.source.trim() : "";
+
+      if (type === "url") {
+        const url = (typeof body.url === "string" ? body.url : sourceIn).trim();
+        if (!/^https?:\/\//i.test(url)) return c.json({ error: "유효한 url 이 필요합니다(http/https)." }, 400);
+        source = url;
+        format = "URL";
+        name = nameIn || url;
+        try {
+          const res = await fetch(url, {
+            headers: { "User-Agent": "malgn-helper-material/1.0" },
+            redirect: "follow",
+          });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const ext = buildMaterialExtraction(htmlToParagraphs(await res.text()));
+          extractedText = ext.extractedText;
+          summary = ext.summary;
+          chunks = ext.chunks;
+          indexStatus = ext.indexStatus;
+        } catch (e) {
+          indexStatus = "stored";
+          summary = "(URL 본문 추출 실패 — 출처만 저장됨)";
+          error = `fetch 실패: ${(e as Error).message}`.slice(0, 500);
+        }
+      } else if (type === "text") {
+        const text = String(body.text ?? body.content ?? "").trim();
+        if (!text) return c.json({ error: "text(본문)이 필요합니다." }, 400);
+        source = sourceIn || null;
+        format = "TEXT";
+        name = nameIn || text.slice(0, 40);
+        const ext = buildMaterialExtraction(text);
+        extractedText = ext.extractedText;
+        summary = ext.summary;
+        chunks = ext.chunks;
+        indexStatus = ext.indexStatus;
+      } else {
+        // qa — question/answer 결합, 없으면 text.
+        const question = String(body.question ?? "").trim();
+        const answer = String(body.answer ?? "").trim();
+        const combined =
+          question || answer ? `Q: ${question}\nA: ${answer}`.trim() : String(body.text ?? "").trim();
+        if (!combined) return c.json({ error: "question/answer 또는 text 가 필요합니다." }, 400);
+        source = sourceIn || null;
+        format = "Q&A";
+        name = nameIn || (question ? question.slice(0, 60) : combined.slice(0, 40));
+        const ext = buildMaterialExtraction(combined);
+        extractedText = ext.extractedText;
+        summary = ext.summary;
+        chunks = ext.chunks;
+        indexStatus = ext.indexStatus;
+      }
+    }
+
+    name = (name || "(제목 없음)").slice(0, 200);
+
+    const [ins] = await conn.query(
+      `INSERT INTO hp_material
+         (name, type, source, format, r2_key, mime, size_bytes, index_status,
+          summary, extracted_text, chunks, tags, services, error, created_by)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [
+        name,
+        type,
+        source,
+        format,
+        r2Key,
+        mime,
+        sizeBytes,
+        indexStatus,
+        summary,
+        extractedText,
+        chunks,
+        materialArrayToJson(tags),
+        materialArrayToJson(services),
+        error,
+        createdBy,
+      ],
+    );
+    const id = Number((ins as unknown as { insertId: number }).insertId);
+
+    return c.json({
+      ok: true,
+      id,
+      name,
+      type,
+      source,
+      format,
+      mime,
+      sizeBytes,
+      indexStatus,
+      summary,
+      chunks,
+      tags,
+      services,
+      error,
+      downloadPath: type === "file" && r2Key ? `/materials/${id}/download` : null,
+      createdBy,
+    });
+  }),
+);
+
+// GET /materials — 목록. 필터 type·indexStatus·search(name/source/extracted_text LIKE)·limit/offset. status=1.
+app.get("/materials", requireAuth, requireRole(ROLE_LEVEL.developer), async (c) =>
+  withConn(c, async (conn) => {
+    if (!(await materialTableExists(conn))) return c.json({ total: 0, limit: 0, offset: 0, rows: [] });
+    const limit = Math.min(parseInt(c.req.query("limit") ?? "30", 10) || 30, 200);
+    const offset = Math.max(parseInt(c.req.query("offset") ?? "0", 10) || 0, 0);
+    const search = (c.req.query("search") ?? "").trim();
+    const type = (c.req.query("type") ?? "").trim();
+    const indexStatus = (c.req.query("indexStatus") ?? "").trim();
+
+    const where: string[] = ["status = 1"];
+    const params: unknown[] = [];
+    if (isMaterialType(type)) {
+      where.push("type = ?");
+      params.push(type);
+    }
+    if (isMaterialIndexStatus(indexStatus)) {
+      where.push("index_status = ?");
+      params.push(indexStatus);
+    }
+    if (search) {
+      where.push("(name LIKE ? OR source LIKE ? OR extracted_text LIKE ?)");
+      const like = `%${search}%`;
+      params.push(like, like, like);
+    }
+    const whereSql = `WHERE ${where.join(" AND ")}`;
+
+    const [countRows] = await conn.query(`SELECT COUNT(*) AS total FROM hp_material ${whereSql}`, params);
+    const total = Number((countRows as { total: number }[])[0]?.total ?? 0);
+
+    const [rows] = await conn.query(
+      `SELECT id, name, type, source, format, r2_key, mime, size_bytes, index_status,
+              summary, chunks, tags, services, created_by, created_at
+         FROM hp_material ${whereSql}
+     ORDER BY created_at DESC, id DESC
+        LIMIT ${limit} OFFSET ${offset}`,
+      params,
+    );
+    return c.json({ total, limit, offset, rows: (rows as MaterialRow[]).map(toMaterialListDto) });
+  }),
+);
+
+// GET /materials/:id/download — R2 원본 스트리밍(권한 체크). <a href> 접근 대비 쿠키 세션 폴백 동작.
+app.get("/materials/:id/download", requireAuth, requireRole(ROLE_LEVEL.developer), async (c) =>
+  withConn(c, async (conn) => {
+    if (!(await materialTableExists(conn))) return c.json(MATERIAL_TABLE_MISSING, 503);
+    const id = parseInt(c.req.param("id"), 10);
+    if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
+    const [rows] = await conn.query(
+      `SELECT name, r2_key, mime FROM hp_material WHERE id = ? AND status = 1 AND type = 'file'`,
+      [id],
+    );
+    const r = (rows as { name: string; r2_key: string | null; mime: string | null }[])[0];
+    if (!r || !r.r2_key) return c.json({ error: "not found" }, 404);
+    const obj = await c.env.R2.get(r.r2_key);
+    if (!obj) return c.json({ error: "R2 object not found" }, 404);
+    const headers = new Headers();
+    obj.writeHttpMetadata(headers);
+    headers.set("Content-Type", r.mime || obj.httpMetadata?.contentType || "application/octet-stream");
+    headers.set("Content-Length", String(obj.size));
+    headers.set("Cache-Control", "private, no-store");
+    const filename = safeMaterialFilename(r.name || `material-${id}`);
+    headers.set("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`);
+    return new Response(obj.body, { headers });
+  }),
+);
+
+// POST /materials/:id/reindex — 저장 원본/URL/텍스트로 추출 재시도. index_status·summary·chunks 갱신.
+app.post("/materials/:id/reindex", requireAuth, requireRole(ROLE_LEVEL.developer), async (c) =>
+  withConn(c, async (conn) => {
+    if (!(await materialTableExists(conn))) return c.json(MATERIAL_TABLE_MISSING, 503);
+    const id = parseInt(c.req.param("id"), 10);
+    if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
+    const [rows] = await conn.query(
+      `SELECT id, name, type, source, r2_key, mime, extracted_text
+         FROM hp_material WHERE id = ? AND status = 1`,
+      [id],
+    );
+    const r = (rows as {
+      id: number;
+      name: string;
+      type: string;
+      source: string | null;
+      r2_key: string | null;
+      mime: string | null;
+      extracted_text: string | null;
+    }[])[0];
+    if (!r) return c.json({ error: "not found" }, 404);
+
+    let extractedText: string | null = r.extracted_text;
+    let summary: string | null = null;
+    let chunks = 0;
+    let indexStatus: MaterialIndexStatus = "processing";
+    let error: string | null = null;
+
+    try {
+      if (r.type === "file") {
+        if (!r.r2_key) throw new Error("R2 원본 없음");
+        if (isTextExtractable(r.mime || "", r.name || "")) {
+          const obj = await c.env.R2.get(r.r2_key);
+          if (!obj) throw new Error("R2 오브젝트 없음");
+          const decoded = new TextDecoder().decode(await obj.arrayBuffer());
+          const isHtml = /html/.test(r.mime || "") || /\.html?$/i.test(r.name || "");
+          const ext = buildMaterialExtraction(isHtml ? htmlToParagraphs(decoded) : decoded);
+          extractedText = ext.extractedText;
+          summary = ext.summary;
+          chunks = ext.chunks;
+          indexStatus = "indexed";
+        } else {
+          indexStatus = "stored";
+          summary = MATERIAL_STORED_SUMMARY;
+        }
+      } else if (r.type === "url") {
+        const url = String(r.source ?? "");
+        if (!/^https?:\/\//i.test(url)) throw new Error("유효한 URL 없음");
+        const res = await fetch(url, {
+          headers: { "User-Agent": "malgn-helper-material/1.0" },
+          redirect: "follow",
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const ext = buildMaterialExtraction(htmlToParagraphs(await res.text()));
+        extractedText = ext.extractedText;
+        summary = ext.summary;
+        chunks = ext.chunks;
+        indexStatus = "indexed";
+      } else {
+        // text/qa — 저장된 extracted_text 로 요약·청크 재계산.
+        const base = String(r.extracted_text ?? "");
+        if (!base) throw new Error("재색인할 본문 없음");
+        const ext = buildMaterialExtraction(base);
+        extractedText = ext.extractedText;
+        summary = ext.summary;
+        chunks = ext.chunks;
+        indexStatus = "indexed";
+      }
+    } catch (e) {
+      indexStatus = "failed";
+      error = `재색인 실패: ${(e as Error).message}`.slice(0, 500);
+    }
+
+    await conn.query(
+      `UPDATE hp_material
+          SET index_status = ?, summary = ?, extracted_text = ?, chunks = ?, error = ?, updated_at = NOW()
+        WHERE id = ? AND status = 1`,
+      [indexStatus, summary, extractedText, chunks, error, id],
+    );
+    return c.json({ ok: true, id, indexStatus, summary, chunks, error });
+  }),
+);
+
+// DELETE /materials/:id — soft delete(status=-1) + R2 원본 삭제(있으면).
+app.delete("/materials/:id", requireAuth, requireRole(ROLE_LEVEL.developer), async (c) =>
+  withConn(c, async (conn) => {
+    if (!(await materialTableExists(conn))) return c.json(MATERIAL_TABLE_MISSING, 503);
+    const id = parseInt(c.req.param("id"), 10);
+    if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
+    const [rows] = await conn.query(`SELECT r2_key FROM hp_material WHERE id = ? AND status = 1`, [id]);
+    const r = (rows as { r2_key: string | null }[])[0];
+    if (!r) return c.json({ error: "not found" }, 404);
+    const [res] = await conn.query(`UPDATE hp_material SET status = -1 WHERE id = ? AND status = 1`, [id]);
+    if ((res as unknown as { affectedRows: number }).affectedRows === 0) return c.json({ error: "not found" }, 404);
+    if (r.r2_key) {
+      try {
+        await c.env.R2.delete(r.r2_key);
+      } catch {
+        /* R2 삭제 실패는 무시 — 메타(status=-1)는 이미 반영. 고아 오브젝트는 별도 정리. */
+      }
+    }
+    return c.json({ ok: true, id });
+  }),
+);
+
+// GET /materials/:id — 상세. extracted_text 프리뷰(앞 20k) + file 이면 downloadPath.
+//   ⚠ /:id/download·/:id/reindex 는 세그먼트 수가 달라 라우팅 충돌 없음(등록 순서 무관).
+app.get("/materials/:id", requireAuth, requireRole(ROLE_LEVEL.developer), async (c) =>
+  withConn(c, async (conn) => {
+    if (!(await materialTableExists(conn))) return c.json(MATERIAL_TABLE_MISSING, 503);
+    const id = parseInt(c.req.param("id"), 10);
+    if (!Number.isFinite(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
+    const [rows] = await conn.query(
+      `SELECT id, name, type, source, format, r2_key, mime, size_bytes, index_status,
+              summary, extracted_text, chunks, tags, services, error, created_by, created_at, updated_at
+         FROM hp_material WHERE id = ? AND status = 1`,
+      [id],
+    );
+    const r = (rows as MaterialRow[])[0];
+    if (!r) return c.json({ error: "not found" }, 404);
+    const fullText = typeof r.extracted_text === "string" ? r.extracted_text : "";
+    return c.json({
+      ...toMaterialListDto(r),
+      error: r.error ?? null,
+      updatedAt: r.updated_at,
+      hasFile: r.type === "file" && !!r.r2_key,
+      extractedTextPreview: fullText.slice(0, MATERIAL_PREVIEW_LEN),
+      extractedTextLength: fullText.length,
+      extractedTextTruncated: fullText.length > MATERIAL_PREVIEW_LEN,
+    });
   }),
 );
 
